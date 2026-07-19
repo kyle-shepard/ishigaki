@@ -32,7 +32,9 @@ export const building = pgTable(
 			.notNull()
 			.references(() => buildingType.id)
 	},
-	(t) => [uniqueIndex('building_player_tile_idx').on(t.playerId, t.x, t.y)]
+	// A tile is a physical place, not a per-player slot: whoever builds there first holds it.
+	// Deliberately NOT scoped by player_id — that would let two players stack on one square.
+	(t) => [uniqueIndex('building_tile_idx').on(t.x, t.y)]
 );
 
 // (x, y) is the position when idle; during travel it is derived from the active operation.
@@ -46,6 +48,9 @@ export const character = pgTable('character', {
 	speed: real('speed').notNull()
 });
 
+export type OperationType = 'build';
+export type OperationStatus = 'in-progress' | 'completed';
+
 // ponytail: travel is a phase of the build operation rather than its own operation row.
 // `type` is carried now despite having one value — it's the discriminator the Movement
 // epic adds rows against, and backfilling a nullable column later costs more.
@@ -57,8 +62,11 @@ export const operation = pgTable('operation', {
 	characterId: integer('character_id')
 		.notNull()
 		.references(() => character.id),
-	type: text('type').notNull(),
-	status: text('status').notNull(),
+	// Typed unions, not bare text: a misspelled status would compile fine and strand the
+	// character busy forever, with no error to notice. Still `text` in Postgres so the
+	// Movement epic can add a type without a migration.
+	type: text('type').$type<OperationType>().notNull(),
+	status: text('status').$type<OperationStatus>().notNull(),
 	originX: integer('origin_x').notNull(),
 	originY: integer('origin_y').notNull(),
 	destX: integer('dest_x').notNull(),

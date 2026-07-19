@@ -76,10 +76,12 @@ export async function createBuildOrder(
 		const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
 		if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
 
+		// Occupancy is world-global, not per-player: these deliberately do not filter by
+		// playerId, or two players could stack buildings on the same square.
 		const [existing] = await tx
 			.select()
 			.from(building)
-			.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
+			.where(and(eq(building.x, x), eq(building.y, y)));
 		if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
 
 		// In-progress operations count as occupancy too, or two orders stack on one tile.
@@ -87,12 +89,7 @@ export async function createBuildOrder(
 			.select()
 			.from(operation)
 			.where(
-				and(
-					eq(operation.playerId, playerId),
-					eq(operation.status, 'in-progress'),
-					eq(operation.destX, x),
-					eq(operation.destY, y)
-				)
+				and(eq(operation.status, 'in-progress'), eq(operation.destX, x), eq(operation.destY, y))
 			);
 		if (pending) return { ok: false, reason: 'TILE_OCCUPIED' };
 

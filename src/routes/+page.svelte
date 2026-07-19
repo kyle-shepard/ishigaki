@@ -31,12 +31,23 @@
 		nowMs = Date.parse(payload.now);
 	}
 
+	// The server distinguishes "you broke a game rule" (400 with a reason) from "something
+	// went wrong" (anything else). The client has to keep that distinction visible instead of
+	// applying an error body as if it were a world.
+	const TROUBLE = 'Lost contact with the world. Retrying…';
+
 	let refreshing = false;
 	async function refresh() {
 		if (refreshing) return;
 		refreshing = true;
 		try {
-			apply(await (await fetch('/api/world')).json());
+			const res = await fetch('/api/world');
+			if (!res.ok) throw new Error(`world read failed: ${res.status}`);
+			apply(await res.json());
+			if (message === TROUBLE) message = '';
+		} catch (e) {
+			console.error(e);
+			message = TROUBLE;
 		} finally {
 			refreshing = false;
 		}
@@ -49,8 +60,15 @@
 	onMount(() => {
 		let frame: number;
 
+		// Recovery runs on a timer, not on rAF: a backgrounded tab suspends animation frames
+		// entirely, and reconnecting is not a rendering concern.
+		const retry = setInterval(() => {
+			if (message === TROUBLE) refresh();
+		}, 3000);
+
 		const tick = () => {
 			nowMs = Date.now() - clockOffset;
+
 			// One refetch when an operation comes due — the server resolves it on read. No
 			// polling loop: nothing else changes the world in a single-player tracer.
 			const due = world?.operations.filter(
@@ -68,25 +86,37 @@
 			frame = requestAnimationFrame(tick);
 		})();
 
-		return () => cancelAnimationFrame(frame);
+		return () => {
+			clearInterval(retry);
+			cancelAnimationFrame(frame);
+		};
 	});
 
 	async function order(x: number, y: number) {
 		const buildingTypeId = world?.buildingTypes[0]?.id;
 		if (buildingTypeId === undefined) return;
 
-		const res = await fetch('/api/orders', {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ x, y, buildingTypeId })
-		});
-		const body = await res.json();
+		try {
+			const res = await fetch('/api/orders', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ x, y, buildingTypeId })
+			});
 
-		if (res.ok) {
-			apply(body);
-			message = '';
-		} else {
-			message = REASON_TEXT[body.reason as OrderReason] ?? body.reason;
+			if (res.ok) {
+				apply(await res.json());
+				message = '';
+				return;
+			}
+			// A 400 is a game rule and always carries a reason. Any other status is a failure,
+			// not a rule, and must not be dressed up as one.
+			if (res.status !== 400) throw new Error(`order failed: ${res.status}`);
+
+			const { reason } = await res.json();
+			message = REASON_TEXT[reason as OrderReason] ?? reason;
+		} catch (e) {
+			console.error(e);
+			message = TROUBLE;
 		}
 	}
 
@@ -128,10 +158,11 @@
 			<div class="dot" style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"></div>
 		{/each}
 	</div>
-	{#if message}<p class="error">{message}</p>{/if}
 {:else}
 	<p>Loading…</p>
 {/if}
+
+{#if message}<p class="error">{message}</p>{/if}
 
 <style>
 	.grid {
