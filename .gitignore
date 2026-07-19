@@ -28,3 +28,12 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 *.db
+
+# SvelteKit / Vite
+/.svelte-kit
+.output
+.vercel
+.netlify
+.wrangler
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*

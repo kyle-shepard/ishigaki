@@ -36,6 +36,14 @@ for us; player-facing naming can differ.
 
 Settlement scale, title ladder, and resource model are all still open — see below.
 
+## Public repo hygiene
+
+This repo is headed for **public release**. Keep everything that ships — commit messages,
+code comments, doc prose, branch names, PR text — free of personal information (real
+names, emails, internal paths, employer/client references) and secrets. Write it as if a
+stranger will read it, because they will. Secrets live in gitignored `.env` files, never
+in tracked code or history; rotate any dev credential before going public.
+
 ## How we work here
 
 This project follows the QRSPI flow (see `C:\dev\victorylive\qrspi-flow.md`):
