@@ -1,8 +1,8 @@
 # Ishigaki — Core Vision
 
 The durable design charter. Epics are broken off from this document as GitHub issues;
-each epic then runs its own QRSPI cycle. This is the *what and why*, deliberately not the
-*how* — implementation detail belongs in each epic's research/design step, not here.
+each epic then runs its own QRSPI cycle. This is the _what and why_, deliberately not the
+_how_ — implementation detail belongs in each epic's research/design step, not here.
 
 Status: **Session 0 output** (architecture locked, mechanics shaped, hard parts parked).
 
@@ -11,11 +11,11 @@ Status: **Session 0 output** (architecture locked, mechanics shaped, hard parts 
 ## North star
 
 A persistent, browser-based, slow-real-time strategy game. Recognizably a
-[Lands of Lords](https://www.landsoflords.com/) clone in *feel* — a zoomable tile map,
+[Lands of Lords](https://www.landsoflords.com/) clone in _feel_ — a zoomable tile map,
 buildings, populations, timed actions that resolve over real-world hours — cloned closely
 enough to be familiar, then diverged from **deliberately**. The first deliberate divergence
 is already chosen: the builder/character system (see below). Feudal-Japan flavor is the
-*eventual* skin, not the build vocabulary (see "Setting & naming").
+_eventual_ skin, not the build vocabulary (see "Setting & naming").
 
 Single-player-first: we design and build for one player, but the schema is multiplayer-shaped
 from day one so multiplayer is a feature-add, not a rewrite.
@@ -27,10 +27,10 @@ from day one so multiplayer is a feature-add, not a rewrite.
 These were argued out and are settled. Change them only with a deliberate reversal.
 
 1. **Interaction model** — Async, page/tick-style. No live socket, no real-time client sync.
-   "Slowness" lives in *action timers*, not in the transport. A player loads the app, views
+   "Slowness" lives in _action timers_, not in the transport. A player loads the app, views
    state, issues orders, leaves, and comes back later to resolved outcomes.
 
-2. **Client shape** — A rich **SPA map client + JSON API**, *not* server-rendered pages. The
+2. **Client shape** — A rich **SPA map client + JSON API**, _not_ server-rendered pages. The
    zoomable multi-level map is a real interactive front-end.
 
 3. **Tech stack** — **TypeScript full-stack: SvelteKit + PostgreSQL + Drizzle.** One language
@@ -51,7 +51,7 @@ These were argued out and are settled. Change them only with a deliberate revers
    - **Commoner labor** — a fungible aggregate mass, counted in groups (starting ratio ≈ 1
      unit : 10 people, a tunable data value). Fills buildings, provides raw workforce. No
      individual stat sheets.
-   - **Skilled characters** — a much smaller set of *individual* actors with ability points
+   - **Skilled characters** — a much smaller set of _individual_ actors with ability points
      and skills that determine the **quality** of what they build/make. These are the entities
      the "restrict builders / pick specialties" filter selects among, and the ones you see when
      you click a tile.
@@ -63,7 +63,7 @@ These were argued out and are settled. Change them only with a deliberate revers
    - Optionally **restrict builders** and select required specialties/skills.
    - The system **auto-assigns** an eligible skilled character from the available pool.
    - The assigned character still **physically travels** to the tile (distance-based delay,
-     visible movement on the map) — we automate *who is picked and dispatched*, not the
+     visible movement on the map) — we automate _who is picked and dispatched_, not the
      movement itself.
    - Quality of the result is set by the assigned character's skills.
 
@@ -76,7 +76,7 @@ These were argued out and are settled. Change them only with a deliberate revers
 
 9. **Time / progression — lazy on read (working direction, pending R-step validation).**
    Operations resolve when next viewed: an operation with a completion time is integrated
-   forward on read. Idle players cost ~zero CPU. A light global tick is reserved *only* for
+   forward on read. Idle players cost ~zero CPU. A light global tick is reserved _only_ for
    genuinely world-wide events and is not built until a mechanic demands it. **Open:** exact
    resolution of the hard cases (offline↔offline interactions, concurrency, combat) — this is
    the top R-step research item and shapes the schema, so it is resolved before world-sim code.
@@ -104,7 +104,7 @@ These were argued out and are settled. Change them only with a deliberate revers
 **Build in neutral English domain terms** — Settlement, Building, Population, Character, Skill,
 Resource, Tile. The feudal-Japan flavor (village→*mura*, rice→*koku*, peasant→*heimin*, and the
 `石垣` foundation motif) is the **eventual reskin**, applied later as a data swap over the
-display-name columns — *not* the code vocabulary.
+display-name columns — _not_ the code vocabulary.
 
 > **Intentional deviation from `CLAUDE.md`.** That file says "prefer Japanese-flavored domain
 > terms." For the build phase we are overriding that on purpose: neutral terms in code, Japanese
@@ -117,7 +117,7 @@ display-name columns — *not* the code vocabulary.
 
 - **The map** — one shared finite tile grid, rendered as a zoomable client with level-of-detail
   tiers: continent → regional terrain (mountains, seas) → building tiles → individual character
-  dots. **Phased:** the *building-tile* zoom level (where the game is actually played) is built
+  dots. **Phased:** the _building-tile_ zoom level (where the game is actually played) is built
   first; continent/regional LOD and nation/city **borders** come later.
 - **Settlement hierarchy** — a growth ladder (village → town → castle-town, then domain/province
   scale) with thresholds and a political layer (vassalage, alliances, war, governance). Wanted,
@@ -154,12 +154,12 @@ the tracer, the deepening epics have no strict dependency order — prioritize b
 **Issue #1 — Setup** ([#1](https://github.com/kyle-shepard/ishigaki/issues/1), created): the
 empty running skeleton (SvelteKit + Postgres + Drizzle). No game logic.
 
-**Reminder — break the rest into GitHub issues *after* #1 lands.** The breakdown below is held
+**Reminder — break the rest into GitHub issues _after_ #1 lands.** The breakdown below is held
 here for that moment, not yet created as issues.
 
 ### Epic 2 — Tracer bullet (the thin vertical slice)
 
-The thinnest loop that is still recognizably *this game*:
+The thinnest loop that is still recognizably _this game_:
 
 > Load the app → see a small fixed tile grid with your hamlet and one character → click an empty
 > tile, order "build a house" → the character auto-dispatches and travels there (distance delay)
@@ -182,14 +182,14 @@ API, SvelteKit render-and-order, and the travel primitive.
    cancel/rush; requirements.
 4. **People depth** — two-tier model; commoner aggregate; individual skilled characters with
    abilities/skills → quality; auto-assign pool; multiple characters.
-5. **Economy & resources** — build costs, production chains, storage. *(turns the tracer into a
-   game fastest — thicken early)*
+5. **Economy & resources** — build costs, production chains, storage. _(turns the tracer into a
+   game fastest — thicken early)_
 6. **Time/progression hardening** — robust offline/concurrency resolution (the hard cases the
    tracer stubs); depends on the R-step time-model decision.
 7. **Map client depth** — zoom/LOD tiers, terrain rendering.
 8. **World generation** — the terrain map.
-9. **Premium currency & rush** — hard currency, rush-an-operation. *(small)*
-10. **Accounts & multiplayer shell** — auth, player identity. *(schema already ready)*
+9. **Premium currency & rush** — hard currency, rush-an-operation. _(small)_
+10. **Accounts & multiplayer shell** — auth, player identity. _(schema already ready)_
 11. **Settlement hierarchy & politics** — growth ladder, domains/provinces, vassalage, war.
 
 Recommended first thickenings: **Construction + Economy + People** — the trio that turns
