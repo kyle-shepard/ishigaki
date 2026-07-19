@@ -31,16 +31,40 @@
 		nowMs = Date.parse(payload.now);
 	}
 
+	let refreshing = false;
+	async function refresh() {
+		if (refreshing) return;
+		refreshing = true;
+		try {
+			apply(await (await fetch('/api/world')).json());
+		} finally {
+			refreshing = false;
+		}
+	}
+
+	// Operations we've already refetched for. Without this, an operation that came back still
+	// in-progress would re-request every frame — a fetch storm at 60fps.
+	const settled = new Set<number>();
+
 	onMount(() => {
 		let frame: number;
 
 		const tick = () => {
 			nowMs = Date.now() - clockOffset;
+			// One refetch when an operation comes due — the server resolves it on read. No
+			// polling loop: nothing else changes the world in a single-player tracer.
+			const due = world?.operations.filter(
+				(o) => Date.parse(o.completeAt) <= nowMs && !settled.has(o.id)
+			);
+			if (due?.length) {
+				for (const o of due) settled.add(o.id);
+				refresh();
+			}
 			frame = requestAnimationFrame(tick);
 		};
 
 		(async () => {
-			apply(await (await fetch('/api/world')).json());
+			await refresh();
 			frame = requestAnimationFrame(tick);
 		})();
 
@@ -93,6 +117,13 @@
 				{typeName(b.buildingTypeId).slice(0, 1)}
 			</div>
 		{/each}
+		<!-- Under construction is drawn from the operation: a building row only exists once
+		     built, so presence in `buildings` means finished. -->
+		{#each world.operations as o (o.id)}
+			<div class="site" style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)">
+				{typeName(o.buildingTypeId).slice(0, 1)}
+			</div>
+		{/each}
 		{#each world.characters as c (c.id)}
 			<div class="dot" style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"></div>
 		{/each}
@@ -124,6 +155,7 @@
 	/* Overlays are absolutely positioned and moved with transform: animating left/top would
 	   relayout all 256 cells every frame. */
 	.building,
+	.site,
 	.dot {
 		position: absolute;
 		top: 0;
@@ -138,6 +170,12 @@
 		background: #8b5a2b;
 		color: white;
 		font: bold 16px sans-serif;
+	}
+	.site {
+		border: 2px dashed #8b5a2b;
+		color: #8b5a2b;
+		font: bold 16px sans-serif;
+		opacity: 0.6;
 	}
 	.dot::after {
 		content: '';

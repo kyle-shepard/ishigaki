@@ -1,4 +1,4 @@
-import { and, eq, notInArray, sql } from 'drizzle-orm';
+import { and, eq, lte, notInArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { building, buildingType, character, operation } from '$lib/server/db/schema';
 import { GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
@@ -9,7 +9,46 @@ export const PLAYER_ID = 1;
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 export async function loadWorld(playerId: number): Promise<WorldPayload> {
-	return db.transaction((tx) => readWorld(tx, playerId));
+	return db.transaction(async (tx) => {
+		await resolveOperations(tx, playerId);
+		return readWorld(tx, playerId);
+	});
+}
+
+/**
+ * The single seam where the stored world catches up to now. Reads run through it, so a GET
+ * performs writes and what is stored always reflects reality — nothing is computed in memory
+ * and thrown away.
+ *
+ * ponytail: FOR UPDATE over the player's whole in-progress set is a coarse lock. Fine at one
+ * player; narrow it when contention is real.
+ */
+export async function resolveOperations(tx: Tx, playerId: number): Promise<void> {
+	const due = await tx
+		.select()
+		.from(operation)
+		.where(
+			and(
+				eq(operation.playerId, playerId),
+				eq(operation.status, 'in-progress'),
+				lte(operation.completeAt, sql`now()`)
+			)
+		)
+		.for('update');
+
+	for (const op of due) {
+		await tx.update(operation).set({ status: 'completed' }).where(eq(operation.id, op.id));
+		await tx.insert(building).values({
+			playerId,
+			x: op.destX,
+			y: op.destY,
+			buildingTypeId: op.buildingTypeId
+		});
+		await tx
+			.update(character)
+			.set({ x: op.destX, y: op.destY })
+			.where(eq(character.id, op.characterId));
+	}
 }
 
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
@@ -26,6 +65,10 @@ export async function createBuildOrder(
 	buildingTypeId: number
 ): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
+		// An order is a read-then-write: without this it could be rejected as NO_IDLE_CHARACTER
+		// by an operation that finished ten seconds ago.
+		await resolveOperations(tx, playerId);
+
 		if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
 		if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
 			return { ok: false, reason: 'OUT_OF_BOUNDS' };
