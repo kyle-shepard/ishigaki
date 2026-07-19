@@ -13,10 +13,10 @@ economy and player-run politics — closely enough to be a recognizable clone, t
 diverge deliberately from there. When a mechanic is undecided, "what would Lands of
 Lords do?" is a reasonable default question, not a mandate.
 
-**Setting:** feudal Japan is the *eventual* skin, applied later as a data swap over
+**Setting:** feudal Japan is the _eventual_ skin, applied later as a data swap over
 display-name columns (see [VISION.md](VISION.md)). For the current build phase, code and
 docs use **neutral English domain terms**, with medieval-European framing as the interim
-placeholder where flavor is needed. *Ishigaki* (石垣) — the fitted-stone foundation of a
+placeholder where flavor is needed. _Ishigaki_ (石垣) — the fitted-stone foundation of a
 Japanese castle — remains the project's name and motif.
 
 ## Ubiquitous language
@@ -27,16 +27,16 @@ below are **not** the current code vocabulary; they are the **future reskin data
 swapped 1:1 over display-name columns when we choose to flip the setting (per VISION.md).
 Do **not** name code identifiers in Japanese now.
 
-| Concept | Reskin term | Notes |
-|---|---|---|
-| The stone-wall foundation / the game itself | 石垣 *ishigaki* | Castle base wall |
-| Settlement ladder (small → large) | *mura* (village) → *machi* (town) → *jōkamachi* (castle town) | Growth stages |
-| Feudal domain / fief | *han* (藩) | Player's realm once large enough |
-| Province | *kuni* (国) | Region grouping domains |
-| Great lord / ruler | *daimyō* (大名) | Top-tier player title |
-| Warrior / retainer class | *samurai* / *bushi* | Military population |
-| Peasant / common labor | *heimin* / *hyakushō* | Economic population |
-| Rice as core resource/currency | *koku* (石) | Historical unit of land yield — note it's the same 石 as in ishigaki |
+| Concept                                     | Reskin term                                                   | Notes                                                                |
+| ------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------- |
+| The stone-wall foundation / the game itself | 石垣 _ishigaki_                                               | Castle base wall                                                     |
+| Settlement ladder (small → large)           | _mura_ (village) → _machi_ (town) → _jōkamachi_ (castle town) | Growth stages                                                        |
+| Feudal domain / fief                        | _han_ (藩)                                                    | Player's realm once large enough                                     |
+| Province                                    | _kuni_ (国)                                                   | Region grouping domains                                              |
+| Great lord / ruler                          | _daimyō_ (大名)                                               | Top-tier player title                                                |
+| Warrior / retainer class                    | _samurai_ / _bushi_                                           | Military population                                                  |
+| Peasant / common labor                      | _heimin_ / _hyakushō_                                         | Economic population                                                  |
+| Rice as core resource/currency              | _koku_ (石)                                                   | Historical unit of land yield — note it's the same 石 as in ishigaki |
 
 Settlement scale, title ladder, and resource model are all still open — see below.
 

@@ -7,7 +7,7 @@ It's map-driven and slow-real-time: a zoomable tile world, buildings and populat
 and timed actions that resolve over real-world hours. It draws inspiration from
 [Lands of Lords](https://www.landsoflords.com/), then goes its own way.
 
-The setting is **feudal Japan**. *Ishigaki* — the fitted-stone base of a Japanese
+The setting is **feudal Japan**. _Ishigaki_ — the fitted-stone base of a Japanese
 castle — is what everything is built on top of.
 
 ## Status
