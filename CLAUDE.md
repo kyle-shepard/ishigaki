@@ -13,17 +13,21 @@ economy and player-run politics — closely enough to be a recognizable clone, t
 diverge deliberately from there. When a mechanic is undecided, "what would Lands of
 Lords do?" is a reasonable default question, not a mandate.
 
-**Setting:** feudal Japan, not medieval Europe. This is the intended point of
-divergence and flavor. *Ishigaki* (石垣) is the fitted-stone foundation of a Japanese
-castle — the thing everything is built on top of.
+**Setting:** feudal Japan is the *eventual* skin, applied later as a data swap over
+display-name columns (see [VISION.md](VISION.md)). For the current build phase, code and
+docs use **neutral English domain terms**, with medieval-European framing as the interim
+placeholder where flavor is needed. *Ishigaki* (石垣) — the fitted-stone foundation of a
+Japanese castle — remains the project's name and motif.
 
-## Ubiquitous language (working draft)
+## Ubiquitous language
 
-Prefer Japanese-flavored domain terms over generic/European ones. This list is a
-starting point, not settled — refine it as the design firms up. The English gloss is
-for us; player-facing naming can differ.
+**Code vocabulary is neutral English** — Settlement, Building, Population, Character,
+Skill, Resource, Tile — medieval-European where interim flavor helps. The Japanese terms
+below are **not** the current code vocabulary; they are the **future reskin dataset**,
+swapped 1:1 over display-name columns when we choose to flip the setting (per VISION.md).
+Do **not** name code identifiers in Japanese now.
 
-| Concept | Term | Notes |
+| Concept | Reskin term | Notes |
 |---|---|---|
 | The stone-wall foundation / the game itself | 石垣 *ishigaki* | Castle base wall |
 | Settlement ladder (small → large) | *mura* (village) → *machi* (town) → *jōkamachi* (castle town) | Growth stages |
