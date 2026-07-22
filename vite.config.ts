@@ -1,4 +1,4 @@
-import adapter from '@sveltejs/adapter-auto';
+import adapter from '@sveltejs/adapter-vercel';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
@@ -11,9 +11,12 @@ export default defineConfig({
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
 
-			// adapter-auto only supports some environments, see https://svelte.dev/docs/kit/adapter-auto for a list.
-			// If your environment is not supported, or you settled on a specific environment, switch out the adapter.
-			// See https://svelte.dev/docs/kit/adapters for more information about adapters.
+			// Pinned to Vercel rather than adapter-auto: auto resolves the adapter by installing
+			// it mid-build, so the deployed build isn't the one reproducible locally.
+			//
+			// No `runtime` or `regions` on purpose — the Node serverless default is what
+			// postgres.js needs (edge has no TCP sockets), and Vercel's default region `iad1`
+			// already colocates with the Neon database in us-east-1. Set them if that changes.
 			adapter: adapter(),
 
 			typescript: {

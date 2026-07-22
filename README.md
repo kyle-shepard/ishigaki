@@ -12,14 +12,23 @@ castle — is what everything is built on top of.
 
 ## Status
 
-Scaffolding stage. Stack is locked (see [VISION.md](VISION.md)): **SvelteKit +
-PostgreSQL + Drizzle**, TypeScript full-stack. No game logic yet — this is the empty
-stage the tracer-bullet epic builds on.
+Early. Stack is locked (see [VISION.md](VISION.md)): **SvelteKit + PostgreSQL +
+Drizzle**, TypeScript full-stack. The tracer bullet works end to end — you can order a
+building, watch a character walk to the tile, and see it finish — on a featureless
+16×16 grid. Terrain is the epic in progress.
+
+> **There is no login, and there is no "your" hamlet.** `PLAYER_ID` is hardcoded to 1,
+> so everyone who opens the deployed site shares one world, one hamlet, and one
+> character. If two people click at once they are ordering the same character around.
+> That is a deliberate stage, not a bug: the shared persistent world is the premise,
+> and per-player identity is a later epic. Treat the live site as a sandbox to poke,
+> not a game to win.
 
 ## Running locally
 
-Prereqs: Node 20+ and a Postgres database (any — local, Docker, or a hosted one like
-[Neon](https://neon.tech)).
+Prereqs: **Node 24+** (the seed script and tests run TypeScript directly, relying on
+native type stripping) and a Postgres database — local, Docker, or hosted
+[Neon](https://neon.tech).
 
 ```sh
 npm install
@@ -28,8 +37,9 @@ npm run db:migrate            # applies migrations (creates health_check + seeds
 npm run dev                   # serves at http://localhost:5173
 ```
 
-> **Secrets:** `.env` holds a shared **dev** credential and is gitignored. Before this
-> repo/app goes public, rotate the DB credential and move it to a real secret store.
+> **Secrets:** `.env` is gitignored and has never been committed — it holds your
+> **development** branch credential only. The production credential lives in Vercel's
+> environment variables and never enters this repo.
 
 Verify the full app → Drizzle → Postgres path:
 
@@ -41,6 +51,31 @@ curl http://localhost:5173/health
 Useful scripts: `npm run check` (type-check), `npm run format` / `npm run lint`
 (prettier), `npm run db:generate` (new migration from schema changes),
 `npm run db:studio` (Drizzle Studio).
+
+## Deployment
+
+Hosted on Vercel, deployed from GitHub: every push to `main` builds and ships. Postgres
+is [Neon](https://neon.tech), on a **separate branch from local development** — so
+`npm run seed` on your machine can't wipe the live world.
+
+Vercel runs `npm run vercel-build`, which is `drizzle-kit migrate && vite build`. Schema
+changes therefore apply themselves on deploy; there is no "remember to migrate prod"
+step. A failing migration fails the build, which is the point — a broken migration
+should stop the deploy rather than leave the site serving against a schema that doesn't
+match the code.
+
+Configuration is one environment variable in the Vercel project: `DATABASE_URL`, the
+Neon **production** branch pooled connection string. Nothing else. If preview
+deployments start failing, give the Preview scope its own `DATABASE_URL` pointing at
+the development branch.
+
+Seeding is deliberately *not* part of the build — `npm run seed` truncates. The
+production branch gets seeded by hand, once, and again only when a schema change makes
+the old world invalid:
+
+```sh
+DATABASE_URL="<neon production branch url>" npm run seed
+```
 
 ## Project layout
 
