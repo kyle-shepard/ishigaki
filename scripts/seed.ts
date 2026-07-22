@@ -32,7 +32,7 @@ await db.execute(
 // make an orphan world nobody holds the cookie for.
 const [house] = await db
 	.insert(buildingType)
-	.values({ displayName: 'House', buildSeconds: 20 })
+	.values({ displayName: 'House', icon: 'house', buildSeconds: 20 })
 	.returning();
 
 const resources = await db
@@ -50,12 +50,24 @@ const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));
 // perceptible, not realistic. Deposits are buildable=true because a terrain-level false
 // would also block the future mine — so yes, a House can squat on an iron vein. That
 // friction is what motivates a per-(building_type, terrain_type) matrix later.
+// `icon` names a symbol in Sprites.svelte. Colour and icon are read together: the symbols draw
+// no background of their own, so a tile's colour is what its art sits on, and the two have to
+// contrast. Forest is the cautionary case — dark trees on a dark green tile were invisible,
+// which is why its colour is a mid green rather than the obvious forest one.
 const TERRAIN = [
-	{ char: '.', displayName: 'Meadow', color: '#a3c76d', buildable: true, movementCost: 1.0 },
+	{
+		char: '.',
+		displayName: 'Meadow',
+		color: '#a3c76d',
+		icon: 'meadow',
+		buildable: true,
+		movementCost: 1.0
+	},
 	{
 		char: 'f',
 		displayName: 'Forest',
-		color: '#2f6b34',
+		color: '#5c9448',
+		icon: 'forest',
 		buildable: true,
 		movementCost: 2.0,
 		yields: 'Wood'
@@ -64,6 +76,7 @@ const TERRAIN = [
 		char: 'c',
 		displayName: 'Clay pit',
 		color: '#d08b4f',
+		icon: 'clay',
 		buildable: true,
 		movementCost: 1.5,
 		yields: 'Clay'
@@ -72,6 +85,7 @@ const TERRAIN = [
 		char: 's',
 		displayName: 'Stone outcrop',
 		color: '#b0b3b8',
+		icon: 'stone',
 		buildable: true,
 		movementCost: 2.5,
 		yields: 'Stone'
@@ -80,12 +94,27 @@ const TERRAIN = [
 		char: 'i',
 		displayName: 'Iron vein',
 		color: '#7a3b2e',
+		icon: 'iron',
 		buildable: true,
 		movementCost: 2.5,
 		yields: 'Iron ore'
 	},
-	{ char: 'm', displayName: 'Mountain', color: '#6b6259', buildable: false, movementCost: 5.0 },
-	{ char: 'w', displayName: 'Water', color: '#2f6fb5', buildable: false, movementCost: 8.0 }
+	{
+		char: 'm',
+		displayName: 'Mountain',
+		color: '#6b6259',
+		icon: 'mountain',
+		buildable: false,
+		movementCost: 5.0
+	},
+	{
+		char: 'w',
+		displayName: 'Water',
+		color: '#2f6fb5',
+		icon: 'water',
+		buildable: false,
+		movementCost: 8.0
+	}
 ];
 
 const terrainRows = await db
@@ -94,6 +123,7 @@ const terrainRows = await db
 		TERRAIN.map((t) => ({
 			displayName: t.displayName,
 			color: t.color,
+			icon: t.icon,
 			buildable: t.buildable,
 			movementCost: t.movementCost,
 			yieldsResourceId: t.yields ? res[t.yields] : null

@@ -36,6 +36,13 @@
       "when": 1784728509813,
       "tag": "0004_wealthy_cobalt_man",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1784734030859,
+      "tag": "0005_quick_pet_avengers",
+      "breakpoints": true
     }
   ]
 }

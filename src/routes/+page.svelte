@@ -4,6 +4,7 @@
 	// when the deployed build changes. Rolling our own version field on the world payload
 	// would have been the same feature, written twice.
 	import { updated } from '$app/state';
+	import Sprites from '$lib/features/world/Sprites.svelte';
 	import {
 		GRID_SIZE,
 		positionAt,
@@ -170,16 +171,26 @@
 	const terrainById = $derived(new Map(world?.terrainTypes.map((t) => [t.id, t]) ?? []));
 	const resourceName = $derived(new Map(world?.resources.map((r) => [r.id, r.displayName]) ?? []));
 	const terrainAt = (i: number) => terrainById.get(world!.terrain[i]);
-	// 256 identical buttons to a screen reader today — terrain is the first thing that tells
-	// them apart.
+	const buildingTypeById = $derived(new Map(world?.buildingTypes.map((t) => [t.id, t]) ?? []));
+	// The art carries what's on a tile for everyone who can see it. The label is the same
+	// information for everyone who can't — so it names the building too, not just the ground.
 	function tileLabel(i: number, x: number, y: number) {
 		const t = terrainAt(i);
 		if (!t) return `Tile ${x}, ${y}`;
 		const yield_ = t.yieldsResourceId ? ` — yields ${resourceName.get(t.yieldsResourceId)}` : '';
-		return `Tile ${x}, ${y} — ${t.displayName}${yield_}`;
+		const built = world!.buildings.find((b) => b.x === x && b.y === y);
+		const site = world!.operations.find((o) => o.destX === x && o.destY === y);
+		const on = built
+			? ` — ${typeName(built.buildingTypeId)}`
+			: site
+				? ` — ${typeName(site.buildingTypeId)} under construction`
+				: '';
+		return `Tile ${x}, ${y} — ${t.displayName}${yield_}${on}`;
 	}
-	const typeName = (id: number) =>
-		world?.buildingTypes.find((t) => t.id === id)?.displayName ?? '?';
+	const typeName = (id: number) => buildingTypeById.get(id)?.displayName ?? '?';
+	// An unknown key resolves to no symbol and draws nothing — a tile missing its art, not a
+	// broken page.
+	const typeIcon = (id: number) => buildingTypeById.get(id)?.icon ?? '';
 	// A character with an in-progress operation is walking or building; its stored tile is
 	// where it left from, so the live position comes from the operation instead.
 	function at(c: { id: number; x: number; y: number }) {
@@ -207,6 +218,7 @@
 {/if}
 
 {#if world}
+	<Sprites />
 	<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
 		{#each tiles as t, i (t.x + ',' + t.y)}
 			<button
@@ -215,22 +227,47 @@
 				style="background: {terrainAt(i)?.color}"
 				onclick={() => order(t.x, t.y)}
 				aria-label={tileLabel(i, t.x, t.y)}
-			></button>
+			>
+				<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
+				     Parity of x+y rather than of the index, or the flips line up into stripes. -->
+				<svg
+					class="art"
+					viewBox="0 0 32 32"
+					style:transform={(t.x + t.y) % 2 ? 'scaleX(-1)' : null}
+				>
+					<use href="#i-{terrainAt(i)?.icon}" />
+				</svg>
+			</button>
 		{/each}
 		{#each world.buildings as b (b.id)}
-			<div class="building" style="transform: translate({b.x * CELL}px, {b.y * CELL}px)">
-				{typeName(b.buildingTypeId).slice(0, 1)}
-			</div>
+			<svg
+				class="over"
+				viewBox="0 0 32 32"
+				style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
+			>
+				<use href="#i-{typeIcon(b.buildingTypeId)}" />
+			</svg>
 		{/each}
 		<!-- Under construction is drawn from the operation: a building row only exists once
-		     built, so presence in `buildings` means finished. -->
+		     built, so presence in `buildings` means finished. Same art, ghosted and pegged out —
+		     what's coming is legible before it's there. -->
 		{#each world.operations as o (o.id)}
-			<div class="site" style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)">
-				{typeName(o.buildingTypeId).slice(0, 1)}
-			</div>
+			<svg
+				class="over site"
+				viewBox="0 0 32 32"
+				style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
+			>
+				<use href="#i-{typeIcon(o.buildingTypeId)}" />
+			</svg>
 		{/each}
 		{#each world.characters as c (c.id)}
-			<div class="dot" style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"></div>
+			<svg
+				class="over"
+				viewBox="0 0 32 32"
+				style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
+			>
+				<use href="#i-pawn" />
+			</svg>
 		{/each}
 	</div>
 {:else}
@@ -249,6 +286,9 @@
 		width: max-content;
 	}
 	.tile {
+		/* The containing block for .art — without it the art sizes against .grid and one tile's
+		   mountain covers the map. */
+		position: relative;
 		width: var(--cell);
 		height: var(--cell);
 		border: 1px solid rgba(0, 0, 0, 0.15);
@@ -265,37 +305,29 @@
 	.tile.blocked {
 		cursor: not-allowed;
 	}
+	/* Terrain art fills its tile and never eats the click — the whole cell stays the button. */
+	.art {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		pointer-events: none;
+	}
 	/* Overlays are absolutely positioned and moved with transform: animating left/top would
 	   relayout all 256 cells every frame. */
-	.building,
-	.site,
-	.dot {
+	.over {
 		position: absolute;
 		top: 0;
 		left: 0;
 		width: var(--cell);
 		height: var(--cell);
-		display: grid;
-		place-items: center;
 		pointer-events: none;
 	}
-	.building {
-		background: #8b5a2b;
-		color: white;
-		font: bold 16px sans-serif;
-	}
+	/* outline, not border: a border would sit inside the box and shrink the 32px art. */
 	.site {
-		border: 2px dashed #8b5a2b;
-		color: #8b5a2b;
-		font: bold 16px sans-serif;
-		opacity: 0.6;
-	}
-	.dot::after {
-		content: '';
-		width: 60%;
-		height: 60%;
-		border-radius: 50%;
-		background: #1d4ed8;
+		opacity: 0.45;
+		outline: 2px dashed #4a3520;
+		outline-offset: -2px;
 	}
 	.error {
 		color: #b91c1c;

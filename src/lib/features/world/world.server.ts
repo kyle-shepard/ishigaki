@@ -302,6 +302,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			id: t.id,
 			displayName: t.displayName,
 			color: t.color,
+			icon: t.icon,
 			buildable: t.buildable,
 			yieldsResourceId: t.yieldsResourceId
 		})),
@@ -310,6 +311,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		buildingTypes: types.map((t) => ({
 			id: t.id,
 			displayName: t.displayName,
+			icon: t.icon,
 			buildSeconds: t.buildSeconds
 		})),
 		buildings: buildings.map((b) => ({

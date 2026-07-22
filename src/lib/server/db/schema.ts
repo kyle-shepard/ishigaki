@@ -22,9 +22,14 @@ export const player = pgTable('player', {
 });
 
 // display_name is the future reskin column (VISION #10): swap the string, not the schema.
+// icon names a symbol in Sprites.svelte. The *choice* of art is content (a new building type
+// is a row, and it has to be able to say how it looks); the art itself is vector paths, so it
+// stays in code — a path string in a column would be undiffable and still need a deploy to
+// change. An unknown key renders nothing, which is a missing icon, not a broken tile.
 export const buildingType = pgTable('building_type', {
 	id: serial('id').primaryKey(),
 	displayName: text('display_name').notNull(),
+	icon: text('icon').notNull(),
 	buildSeconds: integer('build_seconds').notNull()
 });
 
@@ -65,6 +70,8 @@ export const terrainType = pgTable('terrain_type', {
 	id: serial('id').primaryKey(),
 	displayName: text('display_name').notNull(),
 	color: text('color').notNull(),
+	// Same deal as building_type.icon — the row picks the symbol, Sprites.svelte draws it.
+	icon: text('icon').notNull(),
 	buildable: boolean('buildable').notNull(),
 	movementCost: real('movement_cost').notNull(),
 	yieldsResourceId: integer('yields_resource_id').references(() => resource.id)

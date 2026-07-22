@@ -26,6 +26,8 @@ export type WorldPayload = {
 		id: number;
 		displayName: string;
 		color: string;
+		/** Symbol id in Sprites.svelte, minus the `i-` prefix. Unknown key ⇒ colour only. */
+		icon: string;
 		buildable: boolean;
 		yieldsResourceId: number | null;
 	}[];
@@ -34,7 +36,7 @@ export type WorldPayload = {
 	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
 	// client estimates travel.
 	terrain: number[];
-	buildingTypes: { id: number; displayName: string; buildSeconds: number }[];
+	buildingTypes: { id: number; displayName: string; icon: string; buildSeconds: number }[];
 	buildings: { id: number; x: number; y: number; buildingTypeId: number }[];
 	characters: { id: number; x: number; y: number; speed: number }[];
 	operations: {
