@@ -17,26 +17,34 @@ if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);
 const db = drizzle(client);
 
-// This script is the only thing in the codebase that destroys realms: `vercel-build` runs
-// migrations and nothing else, so deploying never touches a player. Wiping a database that
-// has players in it is therefore a deliberate act and has to be spelled as one — everyone
-// who had a world loses it, and is told so on their next visit (see ensurePlayer).
+// This script has two jobs, and only one of them is safe to run on a deploy.
+//
+// **The catalog** — building types, resources, costs, terrain, the tile grid — is content the
+// code depends on: `ensurePlayer` throws without a House and a Barn to hand out. It has to
+// arrive with the deploy that needs it, so it is written as upserts on each table's natural
+// key and is idempotent. `vercel-build` runs exactly this, and running it twice changes
+// nothing the second time.
+//
+// **Destroying realms** is the other job, and it happens only when asked for by name. Everyone
+// who had a world loses it and is told so on their next visit (see ensurePlayer), so it is
+// spelled as a flag rather than reached by default.
+//
+// These used to be one truncate-and-reseed, which was fine only while local development and
+// production shared a database — content reached production because seeding "dev" *was*
+// seeding prod. Splitting the Neon branches was right and severed that path; this is what
+// replaces it.
+const WIPE = process.argv.includes('--wipe');
 const [{ players }] = await db.select({ players: sql<number>`count(*)::int` }).from(player);
-if (players > 0 && !process.argv.includes('--wipe')) {
-	throw new Error(
-		`${players} player realm(s) exist and seeding destroys every one of them. ` +
-			'Re-run as `npm run seed -- --wipe` if that is what you mean.'
+
+if (WIPE) {
+	await db.execute(
+		sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
 	);
 }
 
-// ponytail: truncate-and-reseed, not idempotent upserts — no data worth keeping yet.
-await db.execute(
-	sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
-);
-
-// Only the global catalog is seeded now. Players, hamlets, and characters are created on
-// demand by ensurePlayer() when a visitor first hits the API — seeding one here would just
-// make an orphan world nobody holds the cookie for.
+// Players, hamlets, and characters are never seeded — ensurePlayer() creates them on demand
+// when a visitor first hits the API. Seeding one here would make an orphan world nobody holds
+// the cookie for.
 const buildingTypes = await db
 	.insert(buildingType)
 	.values([
@@ -50,6 +58,12 @@ const buildingTypes = await db
 		// first build that needs a resource you cannot simply walk out and pick up.
 		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90 }
 	])
+	// Keyed on the name, so re-running against a live world retunes the row a player's
+	// buildings already point at rather than making a second one beside it.
+	.onConflictDoUpdate({
+		target: buildingType.displayName,
+		set: { icon: sql`excluded.icon`, buildSeconds: sql`excluded.build_seconds` }
+	})
 	.returning();
 const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 
@@ -65,8 +79,23 @@ const resources = await db
 		{ displayName: 'Clay', unitsPerHour: 0 },
 		{ displayName: 'Iron ore', unitsPerHour: 0 }
 	])
+	.onConflictDoUpdate({
+		target: resource.displayName,
+		set: { unitsPerHour: sql`excluded.units_per_hour` }
+	})
 	.returning();
 const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));
+
+// Every settlement holds a row per resource, at zero if nothing else. `ensurePlayer` sets that
+// up at creation, which covers new realms and nothing else — so a resource added later would
+// leave every existing realm without a row for it. Accrual is an UPDATE, so it would match
+// nothing and the harvest would vanish without a word. One backfill, and the invariant that
+// "a settlement has a row per resource" holds for content added after the fact too.
+await db.execute(
+	sql`INSERT INTO stock (settlement_id, resource_id, quantity)
+	    SELECT s.id, r.id, 0 FROM settlement s CROSS JOIN resource r
+	    ON CONFLICT DO NOTHING`
+);
 
 // What a build costs. Rows, not constants: retuning this is an UPDATE against a live world,
 // no deploy (VISION #10).
@@ -78,12 +107,29 @@ const COSTS = [
 	{ building: 'Stone wall', resource: 'Stone', quantity: 8 },
 	{ building: 'Stone wall', resource: 'Wood', quantity: 4 }
 ];
-await db.insert(buildingCost).values(
-	COSTS.map((c) => ({
-		buildingTypeId: bt[c.building],
-		resourceId: res[c.resource],
-		quantity: c.quantity
-	}))
+await db
+	.insert(buildingCost)
+	.values(
+		COSTS.map((c) => ({
+			buildingTypeId: bt[c.building],
+			resourceId: res[c.resource],
+			quantity: c.quantity
+		}))
+	)
+	.onConflictDoUpdate({
+		target: [buildingCost.buildingTypeId, buildingCost.resourceId],
+		set: { quantity: sql`excluded.quantity` }
+	});
+
+// A cost dropped from COSTS has to actually stop being charged, or a price could only ever be
+// added to. Upserts alone would leave the old row behind and quietly keep taking it. Costs are
+// the one catalog table safe to delete from — nothing references a cost row, unlike a building
+// type someone has already built.
+await db.execute(
+	sql`DELETE FROM building_cost WHERE (building_type_id, resource_id) NOT IN (${sql.join(
+		COSTS.map((c) => sql`(${bt[c.building]}, ${res[c.resource]})`),
+		sql`, `
+	)})`
 );
 
 // Extracted, not gathered: for these the structure comes first. Everything absent from here
@@ -217,6 +263,17 @@ const terrainRows = await db
 			regrowSeconds: t.regrowSeconds ?? null
 		}))
 	)
+	.onConflictDoUpdate({
+		target: terrainType.displayName,
+		set: {
+			color: sql`excluded.color`,
+			icon: sql`excluded.icon`,
+			buildable: sql`excluded.buildable`,
+			movementCost: sql`excluded.movement_cost`,
+			yieldsResourceId: sql`excluded.yields_resource_id`,
+			regrowSeconds: sql`excluded.regrow_seconds`
+		}
+	})
 	.returning();
 const byChar = new Map(TERRAIN.map((t, i) => [t.char, terrainRows[i]]));
 
@@ -275,11 +332,20 @@ meadowAt(7, 8);
 meadowAt(8, 8);
 meadowAt(7, 9);
 
-await db.insert(tile).values(tiles);
+// Upserted, never truncated: `tile_stock` has a foreign key into this table, so deleting and
+// reinserting the grid would take every player's harvested-forest record with it.
+await db
+	.insert(tile)
+	.values(tiles)
+	.onConflictDoUpdate({
+		target: [tile.x, tile.y],
+		set: { terrainTypeId: sql`excluded.terrain_type_id`, quantity: sql`excluded.quantity` }
+	});
 
 console.log(
-	`seeded: ${buildingTypes.length} building types, ${resources.length} resources, ` +
-		`${terrainRows.length} terrain types, ${tiles.length} tiles; start tiles (7,8), (8,8) and (7,9) are Meadow. ` +
-		`Players self-create on first visit — no player rows.`
+	(WIPE ? `WIPED ${players} player realm(s), then ` : 'content only, no realms touched: ') +
+		`${buildingTypes.length} building types, ${resources.length} resources, ` +
+		`${terrainRows.length} terrain types, ${tiles.length} tiles` +
+		(WIPE ? '' : ` · ${players} existing realm(s) left alone`)
 );
 await client.end();

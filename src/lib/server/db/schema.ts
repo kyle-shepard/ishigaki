@@ -33,7 +33,10 @@ export const player = pgTable('player', {
 // change. An unknown key renders nothing, which is a missing icon, not a broken tile.
 export const buildingType = pgTable('building_type', {
 	id: serial('id').primaryKey(),
-	displayName: text('display_name').notNull(),
+	// Unique because it is the natural key: the seed upserts on it so a deploy can carry content
+	// forward without destroying realms, and `ensurePlayer` looks the hamlet up by it. Two rows
+	// called "House" would make both of those pick one arbitrarily.
+	displayName: text('display_name').notNull().unique(),
 	icon: text('icon').notNull(),
 	buildSeconds: integer('build_seconds').notNull()
 });
@@ -63,7 +66,8 @@ export const building = pgTable(
 // What a tile can produce.
 export const resource = pgTable('resource', {
 	id: serial('id').primaryKey(),
-	displayName: text('display_name').notNull(),
+	/** Natural key — see building_type.display_name. */
+	displayName: text('display_name').notNull().unique(),
 	// How fast one worker takes it, flat — skill-derived rates need skills, and a character
 	// carries only `speed` today. The seam is clean either way: the rate is a number.
 	// Zero means "seeded on the map but not yet wired"; assignment refuses those outright
@@ -140,7 +144,8 @@ export const stock = pgTable(
 // straight into the tile's background with no client-side lookup table to keep in sync.
 export const terrainType = pgTable('terrain_type', {
 	id: serial('id').primaryKey(),
-	displayName: text('display_name').notNull(),
+	/** Natural key — see building_type.display_name. */
+	displayName: text('display_name').notNull().unique(),
 	color: text('color').notNull(),
 	// Same deal as building_type.icon — the row picks the symbol, Sprites.svelte draws it.
 	icon: text('icon').notNull(),

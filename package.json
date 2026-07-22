@@ -3,10 +3,13 @@
 	"private": true,
 	"version": "0.0.1",
 	"type": "module",
+	"engines": {
+		"node": "24.x"
+	},
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build",
-		"vercel-build": "drizzle-kit migrate && vite build",
+		"vercel-build": "drizzle-kit migrate && node scripts/seed.ts && vite build",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",

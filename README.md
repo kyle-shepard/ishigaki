@@ -67,9 +67,10 @@ render a world with no ground under it.
 > your `.env` is pointed at production — stop. `.env` itself carries the current mapping and
 > how it was established; keep that comment true if you change branches.
 >
-> `npm run seed` truncates every realm, so it refuses to run when players exist unless you pass
-> `--wipe`. With the branches split that flag is now routine locally, and still the last thing
-> standing between a reseed and deleting everyone's world if `.env` is ever wrong.
+> `npm run seed` on its own is **not destructive** — it upserts the catalog and leaves realms
+> alone, which is what makes it safe for a deploy to run. `npm run seed -- --wipe` is the
+> destructive one, and that flag is the only thing standing between a reseed and deleting
+> everyone's world if `.env` is ever wrong.
 
 Verify the full app → Drizzle → Postgres path:
 
@@ -89,11 +90,23 @@ Hosted on Vercel, deployed from GitHub: every push to `main` builds and ships. P
 note above). A local `npm run seed -- --wipe` or `npm run db:migrate` therefore hits development
 only; production's schema changes when a deploy runs, not when you run a command.
 
-Vercel runs `npm run vercel-build`, which is `drizzle-kit migrate && vite build`. Schema
-changes therefore apply themselves on deploy; there is no "remember to migrate prod"
-step. A failing migration fails the build, which is the point — a broken migration
-should stop the deploy rather than leave the site serving against a schema that doesn't
-match the code.
+Vercel runs `npm run vercel-build`, which is `drizzle-kit migrate && node scripts/seed.ts &&
+vite build`. Schema _and_ content therefore apply themselves on deploy; there is no "remember
+to migrate prod" step and no "remember to seed prod" one either. A failure in either stage
+fails the build, which is the point — it should stop the deploy rather than leave the site
+serving against a schema or a catalog that doesn't match the code.
+
+**Content has to ship with the deploy, not after it**, because the code depends on it:
+`ensurePlayer` throws if there is no House and no Barn to hand out, so a deploy that migrated
+the schema and left the catalog behind serves 500s on every `/api/*` request while the page
+itself still renders. That is exactly what happened on 2026-07-22, the first deploy after the
+Neon branches were split — until then, content reached production because seeding "dev" _was_
+seeding prod. `npm run seed` without `--wipe` is idempotent for this reason; running it on
+every deploy is a no-op whenever the catalog already matches.
+
+Note that `vercel-build` runs on **preview** deployments too, against whatever `DATABASE_URL`
+is scoped to Preview. Scope that variable to the development branch, or a preview will migrate
+and reseed production.
 
 Configuration is one environment variable in the Vercel project: `DATABASE_URL`, the Neon
 pooled connection string for the **production** branch — not the one `.env` uses. Nothing else.
@@ -108,14 +121,17 @@ after setting it.
 If preview deployments start failing the same way, give the Preview scope its own
 `DATABASE_URL` pointing at the development branch.
 
-Seeding is deliberately _not_ part of the build — `npm run seed` truncates. It now seeds
-only the global building catalog; players, hamlets, and characters are created on demand
-when a visitor first hits the API. **Reseeding production drops every player**, so every
-tester's cookie stops resolving and they each get a fresh world on their next request.
-Seed by hand, once, and again only when a schema change makes the old worlds invalid:
+Seeding the catalog **is** part of the build, and is safe there because it upserts. Players,
+hamlets and characters are never seeded — they are created on demand when a visitor first
+hits the API.
+
+Wiping production is a separate, deliberate act, and there is no reason to do it except when
+a change genuinely cannot carry realms forward (see `ensurePlayer` on how that announces
+itself). **It drops every player**, so every tester's cookie stops resolving and they each get
+a fresh world on their next request:
 
 ```sh
-DATABASE_URL="<neon production branch url>" npm run seed
+DATABASE_URL="<neon production branch url>" node scripts/seed.ts --wipe
 ```
 
 ## Project layout
