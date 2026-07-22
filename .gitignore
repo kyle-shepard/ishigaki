@@ -37,3 +37,7 @@ Thumbs.db
 .wrangler
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Vercel CLI: project link (.vercel) and pulled env (.env.local).
+# .env* is already covered above; .vercel is not.
+.vercel
