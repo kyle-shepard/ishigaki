@@ -17,12 +17,18 @@ Drizzle**, TypeScript full-stack. The tracer bullet works end to end — you can
 building, watch a character walk to the tile, and see it finish — on a featureless
 16×16 grid. Terrain is the epic in progress.
 
-> **There is no login, and there is no "your" hamlet.** `PLAYER_ID` is hardcoded to 1,
-> so everyone who opens the deployed site shares one world, one hamlet, and one
-> character. If two people click at once they are ordering the same character around.
-> That is a deliberate stage, not a bug: the shared persistent world is the premise,
-> and per-player identity is a later epic. Treat the live site as a sandbox to poke,
-> not a game to win.
+> **Every visitor gets their own private world — for now.** There is no login. A cookie
+> holds a player id, and your first request to the API creates a hamlet and a character
+> for you at the same starting coordinates everyone else gets. You cannot see anyone
+> else's buildings and they cannot see yours, so two people can build on the same tile.
+>
+> This is a **temporary testing arrangement**, not the design. Ishigaki is meant to be
+> one shared map where players are neighbours; the isolation is there so testers can
+> play the loop without fighting over one character. See VISION #4 for the override and
+> how to reverse it.
+>
+> Practical consequence: **clear your cookies and your realm is gone.** So is everyone's
+> when the database is reseeded. Treat these worlds as disposable until accounts land.
 
 ## Running locally
 
@@ -77,9 +83,11 @@ after setting it.
 If preview deployments start failing the same way, give the Preview scope its own
 `DATABASE_URL` pointing at the development branch.
 
-Seeding is deliberately _not_ part of the build — `npm run seed` truncates. The
-production branch gets seeded by hand, once, and again only when a schema change makes
-the old world invalid:
+Seeding is deliberately _not_ part of the build — `npm run seed` truncates. It now seeds
+only the global building catalog; players, hamlets, and characters are created on demand
+when a visitor first hits the API. **Reseeding production drops every player**, so every
+tester's cookie stops resolving and they each get a fresh world on their next request.
+Seed by hand, once, and again only when a schema change makes the old worlds invalid:
 
 ```sh
 DATABASE_URL="<neon production branch url>" npm run seed

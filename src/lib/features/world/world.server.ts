@@ -1,12 +1,55 @@
 import { and, eq, lte, notInArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
-import { building, buildingType, character, operation } from '$lib/server/db/schema';
+import { building, buildingType, character, operation, player } from '$lib/server/db/schema';
 import { GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
 
-// One hardcoded player, no auth — mirrors what scripts/seed.ts inserts.
-export const PLAYER_ID = 1;
+// Where a new sandbox starts. Every player gets the same coordinates because they never
+// see each other (VISION #4 interim override) — the hamlet and its builder, nothing else.
+const START = { hamletX: 7, hamletY: 8, characterX: 7, characterY: 9, speed: 0.5 };
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Resolves the caller's sandbox, creating one on first visit. Returns the id to store in
+ * the cookie.
+ *
+ * `id` is whatever the cookie claimed, and is not trusted: a reseed drops every player, so
+ * a returning browser can hold an id that no longer exists. Verifying costs one primary-key
+ * lookup and turns that case into a fresh world instead of a silently empty one — no
+ * character, no hamlet, no error.
+ *
+ * ponytail: anyone holding a cookie can act as that player. There is no auth here at all;
+ * guessing another integer is the whole attack. That is acceptable while the world is
+ * disposable, and is what the accounts epic (VISION #10) replaces.
+ */
+export async function ensurePlayer(id: number | null): Promise<number> {
+	if (id !== null) {
+		const [found] = await db.select({ id: player.id }).from(player).where(eq(player.id, id));
+		if (found) return found.id;
+	}
+
+	return db.transaction(async (tx) => {
+		// The building catalog is global and seeded, not per-player. Without it there is no
+		// hamlet to hand out, which is a broken deploy rather than a new-player problem.
+		const [house] = await tx.select().from(buildingType).limit(1);
+		if (!house) throw new Error('no building_type rows — run `npm run seed` against this database');
+
+		const [p] = await tx.insert(player).values({}).returning();
+		await tx.insert(building).values({
+			playerId: p.id,
+			x: START.hamletX,
+			y: START.hamletY,
+			buildingTypeId: house.id
+		});
+		await tx.insert(character).values({
+			playerId: p.id,
+			x: START.characterX,
+			y: START.characterY,
+			speed: START.speed
+		});
+		return p.id;
+	});
+}
 
 export async function loadWorld(playerId: number): Promise<WorldPayload> {
 	return db.transaction(async (tx) => {
@@ -76,12 +119,13 @@ export async function createBuildOrder(
 		const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
 		if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
 
-		// Occupancy is world-global, not per-player: these deliberately do not filter by
-		// playerId, or two players could stack buildings on the same square.
+		// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
+		// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
+		// and building_tile_idx — to restore world-global tile ownership.
 		const [existing] = await tx
 			.select()
 			.from(building)
-			.where(and(eq(building.x, x), eq(building.y, y)));
+			.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
 		if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
 
 		// In-progress operations count as occupancy too, or two orders stack on one tile.
@@ -89,7 +133,12 @@ export async function createBuildOrder(
 			.select()
 			.from(operation)
 			.where(
-				and(eq(operation.status, 'in-progress'), eq(operation.destX, x), eq(operation.destY, y))
+				and(
+					eq(operation.playerId, playerId),
+					eq(operation.status, 'in-progress'),
+					eq(operation.destX, x),
+					eq(operation.destY, y)
+				)
 			);
 		if (pending) return { ok: false, reason: 'TILE_OCCUPIED' };
 

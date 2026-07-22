@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
-import { loadWorld, PLAYER_ID } from '$lib/features/world/world.server';
+import type { RequestHandler } from './$types';
+import { loadWorld } from '$lib/features/world/world.server';
 
-export async function GET() {
-	return json(await loadWorld(PLAYER_ID));
-}
+export const GET: RequestHandler = async ({ locals }) => {
+	return json(await loadWorld(locals.playerId));
+};

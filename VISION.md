@@ -39,9 +39,23 @@ These were argued out and are settled. Change them only with a deliberate revers
    database-bound and low-QPS by design — language runtime speed is a non-factor; the fix for
    any future hot path is set-based SQL or a compiled worker, not the web framework.
 
-4. **World model** — **One shared, finite, square-tile grid** with integer coordinates. In
-   single-player, only the player's starting hamlet is seeded; the rest of the grid exists but
-   is unclaimed. Not per-player sandboxes (would wall off multiplayer), not a region graph.
+4. **World model** — **One shared, finite, square-tile grid** with integer coordinates, and
+   not a region graph. The terrain map itself is shared, read-only data: every player plays
+   the same geography.
+
+   **Interim override (testing stage):** occupancy is currently scoped **per player**, so each
+   visitor gets an isolated sandbox on that shared map — their own hamlet at the same starting
+   coordinates, nobody else's buildings visible or in the way. This deliberately reverses the
+   "a tile is a physical place, whoever builds there first holds it" rule, which was the
+   original decision here and remains the intended end state. It exists so testers can play
+   the single-player loop without fighting over one character, and it is the smallest change
+   that achieves that — no tenant column, just `player_id` on the occupancy checks and the
+   tile uniqueness index.
+
+   **Reversal path:** drop `player_id` from the occupancy checks in `world.server.ts` and from
+   `building_tile_idx`, and the shared-world model is back. Do this when the multiplayer shell
+   (#10) lands and players are meant to see each other. Until then, treat any code that assumes
+   world-global tile ownership as wrong.
 
 5. **Multiplayer-readiness** — **Multi-tenant schema, zero multiplayer features.** Every
    ownable entity carries a `player_id` from day one. No auth, accounts, or politics yet —

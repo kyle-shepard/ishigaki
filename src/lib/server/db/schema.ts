@@ -32,9 +32,12 @@ export const building = pgTable(
 			.notNull()
 			.references(() => buildingType.id)
 	},
-	// A tile is a physical place, not a per-player slot: whoever builds there first holds it.
-	// Deliberately NOT scoped by player_id — that would let two players stack on one square.
-	(t) => [uniqueIndex('building_tile_idx').on(t.x, t.y)]
+	// ponytail: scoped by player_id so each visitor gets an isolated sandbox on the shared
+	// map — see VISION #4's interim override. This REVERSES the original rule (a tile is a
+	// physical place; whoever builds there first holds it), which is still the intended end
+	// state. Drop player_id from this index and from the occupancy checks in world.server.ts
+	// to restore it, once players are meant to see each other.
+	(t) => [uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y)]
 );
 
 // (x, y) is the position when idle; during travel it is derived from the active operation.
