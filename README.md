@@ -65,9 +65,17 @@ should stop the deploy rather than leave the site serving against a schema that 
 match the code.
 
 Configuration is one environment variable in the Vercel project: `DATABASE_URL`, the
-Neon **production** branch pooled connection string. Nothing else. If preview
-deployments start failing, give the Preview scope its own `DATABASE_URL` pointing at
-the development branch.
+Neon **production** branch pooled connection string. Nothing else.
+
+It must be ticked for the **Production** environment specifically, not just added. Because
+`vercel-build` migrates, the variable is read at **build** time, not only at runtime — so a
+missing or wrongly-scoped one fails the build outright with `DATABASE_URL is not set`
+before Vite ever runs. That is the intended failure: the alternative is a green deploy that
+500s on every request. Saving the variable does not rebuild on its own, either — redeploy
+after setting it.
+
+If preview deployments start failing the same way, give the Preview scope its own
+`DATABASE_URL` pointing at the development branch.
 
 Seeding is deliberately _not_ part of the build — `npm run seed` truncates. The
 production branch gets seeded by hand, once, and again only when a schema change makes
