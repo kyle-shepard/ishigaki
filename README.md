@@ -39,13 +39,30 @@ native type stripping) and a Postgres database — local, Docker, or hosted
 ```sh
 npm install
 cp .env.example .env          # then set DATABASE_URL to your Postgres connection string
-npm run db:migrate            # applies migrations (creates health_check + seeds a row)
+npm run db:migrate            # applies migrations (creates the tables)
+npm run seed                  # fills the global catalogs and the 16×16 terrain grid
 npm run dev                   # serves at http://localhost:5173
 ```
 
-> **Secrets:** `.env` is gitignored and has never been committed — it holds your
-> **development** branch credential only. The production credential lives in Vercel's
-> environment variables and never enters this repo.
+Seeding is not optional: the grid is 256 stored tiles, and `/api/world` throws rather than
+render a world with no ground under it.
+
+> **Secrets:** `.env` is gitignored and has never been committed.
+>
+> **`.env` and production currently point at the same Neon database.** There is no separate
+> development branch — earlier revisions of this file claimed there was, which is worse than
+> saying nothing, because it invites you to run destructive scripts without thinking. Assume
+> everything you do locally is live: migrations apply to production the moment you run them,
+> and ordinary play writes real rows.
+>
+> `npm run seed` truncates every realm, so it refuses to run when players exist unless you
+> pass `--wipe`. That flag is the only thing standing between a routine reseed and deleting
+> everyone's world.
+>
+> Splitting the two is real work rather than a second credential: `vercel-build` only runs
+> migrations, so a fresh production branch would serve 500s from `/api/world` until something
+> seeded it. Worth doing before the URL reaches a real player, or before the first migration
+> that drops anything.
 
 Verify the full app → Drizzle → Postgres path:
 
@@ -60,9 +77,10 @@ Useful scripts: `npm run check` (type-check), `npm run format` / `npm run lint`
 
 ## Deployment
 
-Hosted on Vercel, deployed from GitHub: every push to `main` builds and ships. Postgres
-is [Neon](https://neon.tech), on a **separate branch from local development** — so
-`npm run seed` on your machine can't wipe the live world.
+Hosted on Vercel, deployed from GitHub: every push to `main` builds and ships. Postgres is
+[Neon](https://neon.tech) — **the same database local development uses**, per the note above.
+`npm run seed -- --wipe` on your machine wipes the live world, and a local `npm run db:migrate`
+migrates production before the code using that schema has shipped.
 
 Vercel runs `npm run vercel-build`, which is `drizzle-kit migrate && vite build`. Schema
 changes therefore apply themselves on deploy; there is no "remember to migrate prod"
@@ -70,8 +88,8 @@ step. A failing migration fails the build, which is the point — a broken migra
 should stop the deploy rather than leave the site serving against a schema that doesn't
 match the code.
 
-Configuration is one environment variable in the Vercel project: `DATABASE_URL`, the
-Neon **production** branch pooled connection string. Nothing else.
+Configuration is one environment variable in the Vercel project: `DATABASE_URL`, the Neon
+pooled connection string — currently the same branch `.env` points at. Nothing else.
 
 It must be ticked for the **Production** environment specifically, not just added. Because
 `vercel-build` migrates, the variable is read at **build** time, not only at runtime — so a
