@@ -106,9 +106,35 @@ export async function resolveOperations(tx: Tx, playerId: number): Promise<void>
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
 
 /**
+ * The grid a build order is judged against: what every tile is made of, keyed the same
+ * row-major way the wire payload is. One 256-row read serves both the destination's
+ * buildability and (later) the cost of every tile the trip crosses — a point query plus a
+ * path query would be two reads for the same rows.
+ */
+async function loadGrid(
+	tx: Tx
+): Promise<Map<number, { buildable: boolean; movementCost: number }>> {
+	const rows = await tx
+		.select({
+			x: tile.x,
+			y: tile.y,
+			buildable: terrainType.buildable,
+			movementCost: terrainType.movementCost
+		})
+		.from(tile)
+		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id));
+	return new Map(
+		rows.map((r) => [
+			r.y * GRID_SIZE + r.x,
+			{ buildable: r.buildable, movementCost: r.movementCost }
+		])
+	);
+}
+
+/**
  * Rejections come back as a value, not an exception: a try/catch around the handler would
- * map a mid-transaction DB failure onto a 400 the player reads as a game rule. Only these
- * four reasons produce a 400; anything thrown stays thrown.
+ * map a mid-transaction DB failure onto a 400 the player reads as a game rule. Only an
+ * `OrderReason` produces a 400; anything thrown stays thrown.
  */
 export async function createBuildOrder(
 	playerId: number,
@@ -127,6 +153,16 @@ export async function createBuildOrder(
 
 		const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
 		if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
+
+		// Ground before what sits on it: bounds and building type ask "is this request
+		// coherent", terrain asks "is this place legal", occupancy asks "is this place free".
+		const grid = await loadGrid(tx);
+		const ground = grid.get(y * GRID_SIZE + x);
+		// A hole in the grid is a corrupt world, not a game rule. Without this, `undefined`
+		// reads as unbuildable and the player is told they can't build there — a DB fault
+		// dressed up as a rule, which is exactly what the docstring above forbids.
+		if (!ground) throw new Error(`no tile row at (${x}, ${y}) — run \`npm run seed\``);
+		if (!ground.buildable) return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
 
 		// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
 		// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —

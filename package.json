@@ -18,7 +18,8 @@
 		"db:migrate": "drizzle-kit migrate",
 		"db:studio": "drizzle-kit studio",
 		"seed": "node --env-file=.env scripts/seed.ts",
-		"test": "node --test src/**/*.test.ts"
+		"test": "node --test src/**/*.test.ts",
+		"check:rules": "node scripts/rules-check.ts"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-vercel": "^6.3.4",

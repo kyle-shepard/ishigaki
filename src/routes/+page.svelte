@@ -12,6 +12,7 @@
 	const REASON_TEXT: Record<OrderReason, string> = {
 		OUT_OF_BOUNDS: 'That tile is off the map.',
 		UNKNOWN_BUILDING_TYPE: "You can't build that.",
+		TILE_NOT_BUILDABLE: "You can't build on that ground.",
 		TILE_OCCUPIED: 'Something is already on that tile.',
 		NO_IDLE_CHARACTER: 'Everyone is busy.'
 	};
@@ -155,6 +156,7 @@
 		{#each tiles as t, i (t.x + ',' + t.y)}
 			<button
 				class="tile"
+				class:blocked={terrainAt(i)?.buildable === false}
 				style="background: {terrainAt(i)?.color}"
 				onclick={() => order(t.x, t.y)}
 				aria-label={tileLabel(i, t.x, t.y)}
@@ -200,6 +202,11 @@
 	/* Brightness, not a background: a hover colour would erase the terrain underneath. */
 	.tile:hover {
 		filter: brightness(1.12);
+	}
+	/* Hints, doesn't enforce — the button stays enabled on purpose. Letting the click reach
+	   the server and showing the server's own refusal is what proves the rule lives there. */
+	.tile.blocked {
+		cursor: not-allowed;
 	}
 	/* Overlays are absolutely positioned and moved with transform: animating left/top would
 	   relayout all 256 cells every frame. */

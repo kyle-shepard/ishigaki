@@ -3,7 +3,11 @@
 export const GRID_SIZE = 16;
 
 export type OrderReason =
-	'OUT_OF_BOUNDS' | 'UNKNOWN_BUILDING_TYPE' | 'TILE_OCCUPIED' | 'NO_IDLE_CHARACTER';
+	| 'OUT_OF_BOUNDS'
+	| 'UNKNOWN_BUILDING_TYPE'
+	| 'TILE_NOT_BUILDABLE'
+	| 'TILE_OCCUPIED'
+	| 'NO_IDLE_CHARACTER';
 
 export type OrderRequest = { x: number; y: number; buildingTypeId: number };
 
