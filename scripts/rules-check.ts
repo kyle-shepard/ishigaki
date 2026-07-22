@@ -50,13 +50,28 @@ const woodHeld = (w: {
 	return w.stock.find((s) => s.resourceId === wood)!.quantity;
 };
 
+// A realm now starts with nothing, so a costed building can't be used to assert anything
+// about *terrain* — every such order would be refused for want of Wood, and the check would
+// pass or fail for the wrong reason. The uncosted type is the one that isolates ground rules
+// from cost rules. Picked by having no cost rows rather than by name, so putting a price on
+// the Barn one day fails here loudly instead of quietly testing the wrong thing.
+const costed = new Set(
+	world.body.buildingCosts.map((c: { buildingTypeId: number }) => c.buildingTypeId)
+);
+const free = world.body.buildingTypes.find((t: { id: number }) => !costed.has(t.id))?.id;
+if (free === undefined)
+	throw new Error('every building type costs something — no free type to test terrain with');
+
+const assign = (x: number, y: number) =>
+	api('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
+
 // Terrain rules. The lake and mountain coordinates are the seed layout's; the accepted three
 // cover plain ground, forest, and a deposit — deposits are buildable by design.
 for (const [x, y, label] of [
 	[7, 5, 'lake'],
 	[0, 0, 'mountain']
 ] as const) {
-	const r = await order(x, y, house);
+	const r = await order(x, y, free);
 	check(`(${x},${y}) ${label} is refused`, [r.status, r.body.reason], [400, 'TILE_NOT_BUILDABLE']);
 }
 for (const [x, y, label] of [
@@ -68,16 +83,16 @@ for (const [x, y, label] of [
 	// out of what is meant to be a terrain assertion.
 	cookie = '';
 	await api('/api/world');
-	const r = await order(x, y, house);
+	const r = await order(x, y, free);
 	check(`(${x},${y}) ${label} is accepted`, r.status, 200);
 }
 
 // Unregressed: the rules that existed before terrain did.
 cookie = '';
 await api('/api/world');
-const oob = await order(99, 0, house);
+const oob = await order(99, 0, free);
 check('(99,0) is off the map', [oob.status, oob.body.reason], [400, 'OUT_OF_BOUNDS']);
-const occupied = await order(7, 8, house);
+const occupied = await order(7, 8, free);
 check('(7,8) holds the hamlet', [occupied.status, occupied.body.reason], [400, 'TILE_OCCUPIED']);
 
 // Terrain has to cost time, not just look different. Both legs are 7 tiles from the
@@ -92,7 +107,7 @@ for (const [x, y, label] of [
 	// A fresh sandbox per leg: the character must depart from (7,9) both times.
 	cookie = '';
 	await api('/api/world');
-	const r = await order(x, y, house);
+	const r = await order(x, y, free);
 	const op = r.body.operations?.[0];
 	if (!op) throw new Error(`order (${x},${y}) was refused: ${JSON.stringify(r.body)}`);
 	legs[label] = (Date.parse(op.travelDoneAt) - Date.parse(op.startedAt)) / 1000;
@@ -104,12 +119,17 @@ check(
 	true
 );
 
-// A build costs, and an order you can't pay for is refused without spending anything. Asserted
-// off the world payload's own stock rather than through psql — same rule as the travel legs,
-// and the cost is read from the payload too, so retuning the row doesn't break the check.
+// Cost. A realm starts with nothing, so the very first House is the refusal case — no setup
+// needed, and it is also the state a real new player is in. Asserted off the world payload's
+// own stock rather than through psql, same rule as the travel legs.
+//
+// The matching *success* case is deliberately absent: at the seeded rate, affording a House
+// is a couple of hours of gathering, and a check that waited that long would never be run.
+// Watching a build actually get paid for is the rate-cranked manual pass — set units_per_hour
+// high with one UPDATE, no deploy, and the economy runs in seconds. That the cost is a row is
+// what makes it testable at all.
 cookie = '';
 const fresh = await api('/api/world');
-const before = woodHeld(fresh.body);
 const woodId = fresh.body.resources.find(
 	(r: { displayName: string }) => r.displayName === 'Wood'
 ).id;
@@ -118,31 +138,49 @@ const houseCost = fresh.body.buildingCosts.find(
 		c.buildingTypeId === house && c.resourceId === woodId
 ).quantity;
 
-// On the character's own tile, so the trip is zero-length and only the build itself has to
-// elapse below.
-const bought = await order(7, 9, house);
-check('a House costs Wood', [bought.status, woodHeld(bought.body)], [200, before - houseCost]);
-
-// The idle check runs before the cost check, so seeing INSUFFICIENT_RESOURCES needs a realm
-// that is both broke *and* free — which means waiting out the build above rather than firing a
-// second order at a busy character. The wait is the build time; there is no shortcut that
-// doesn't test a different rule.
-const deadline = Date.now() + 60_000;
-while (Date.now() < deadline) {
-	const w = await api('/api/world');
-	if (w.body.operations.length === 0) break;
-	await new Promise((r) => setTimeout(r, 1000));
-}
+check('a new realm starts with nothing', woodHeld(fresh.body), 0);
 const refused = await order(9, 9, house);
 check(
-	`a House costing ${houseCost} Wood is refused on ${before - houseCost}`,
+	`a House costing ${houseCost} Wood is refused on 0`,
 	[refused.status, refused.body.reason],
 	[400, 'INSUFFICIENT_RESOURCES']
 );
+check('a refused order spends nothing', woodHeld((await api('/api/world')).body), 0);
+
+// Gathering. The refusals matter more than the acceptance: a tile that yields nothing must be
+// turned away at the writer, or a worker stands there forever earning nothing with no feedback.
+// The clay pit is the sharp case — it *does* name a resource, it just has no rate yet, so a
+// null-check alone would wave it through.
+for (const [x, y, label] of [
+	[0, 0, 'mountain — yields nothing'],
+	[12, 5, 'clay pit — yields a resource with no rate']
+] as const) {
+	const r = await assign(x, y);
+	check(`(${x},${y}) ${label} is refused`, [r.status, r.body.reason], [400, 'TILE_YIELDS_NOTHING']);
+}
+
+const gathering = await assign(11, 1);
+const gather = gathering.body.operations?.find((o: { type: string }) => o.type === 'gather');
 check(
-	'a refused order spends nothing',
-	woodHeld((await api('/api/world')).body),
-	before - houseCost
+	'(11,1) forest accepts a worker, on an operation that never completes by itself',
+	[gathering.status, gather?.type, gather?.completeAt, gather?.buildingTypeId],
+	[200, 'gather', null, null]
+);
+
+const recalled = await api(`/api/assignments/${gather.id}`, { method: 'DELETE' });
+check(
+	'recalling ends the assignment',
+	[
+		recalled.status,
+		recalled.body.operations.filter((o: { type: string }) => o.type === 'gather').length
+	],
+	[200, 0]
+);
+const again = await api(`/api/assignments/${gather.id}`, { method: 'DELETE' });
+check(
+	'recalling twice is refused, not silently repeated',
+	[again.status, again.body.reason],
+	[400, 'UNKNOWN_OPERATION']
 );
 
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');

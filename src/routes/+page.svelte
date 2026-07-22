@@ -20,8 +20,13 @@
 		TILE_NOT_BUILDABLE: "You can't build on that ground.",
 		TILE_OCCUPIED: 'Something is already on that tile.',
 		NO_IDLE_CHARACTER: 'Everyone is busy.',
-		INSUFFICIENT_RESOURCES: "You don't have the materials for that."
+		INSUFFICIENT_RESOURCES: "You don't have the materials for that.",
+		TILE_YIELDS_NOTHING: "There's nothing to take from that ground.",
+		UNKNOWN_OPERATION: 'Nobody is working there.'
 	};
+
+	// What a click on a tile means. Two verbs, one map.
+	let mode = $state<'build' | 'gather'>('build');
 
 	let world = $state<WorldPayload | null>(null);
 	let message = $state('');
@@ -93,10 +98,11 @@
 		const tick = () => {
 			nowMs = Date.now() - clockOffset;
 
-			// One refetch when an operation comes due — the server resolves it on read. No
-			// polling loop: nothing else changes the world in a single-player tracer.
+			// One refetch when a build comes due — the server resolves it on read. Gathers are
+			// excluded because they never come due; they are collected by the idle heartbeat
+			// above, which is also what keeps the resource bar creeping upward.
 			const due = world?.operations.filter(
-				(o) => Date.parse(o.completeAt) <= nowMs && !settled.has(o.id)
+				(o) => o.type === 'build' && Date.parse(o.completeAt!) <= nowMs && !settled.has(o.id)
 			);
 			if (due?.length) {
 				for (const o of due) settled.add(o.id);
@@ -116,15 +122,13 @@
 		};
 	});
 
-	async function order(x: number, y: number) {
-		const buildingTypeId = world?.buildingTypes[0]?.id;
-		if (buildingTypeId === undefined) return;
-
+	// Every rule-bearing request answers the same two ways — a world, or a reason — so they
+	// share one caller rather than three copies of the same try/catch.
+	async function act(path: string, init: RequestInit) {
 		try {
-			const res = await fetch('/api/orders', {
-				method: 'POST',
+			const res = await fetch(path, {
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ x, y, buildingTypeId })
+				...init
 			});
 
 			if (res.ok) {
@@ -134,7 +138,7 @@
 			}
 			// A 400 is a game rule and always carries a reason. Any other status is a failure,
 			// not a rule, and must not be dressed up as one.
-			if (res.status !== 400) throw new Error(`order failed: ${res.status}`);
+			if (res.status !== 400) throw new Error(`${path} failed: ${res.status}`);
 
 			const { reason } = await res.json();
 			message = REASON_TEXT[reason as OrderReason] ?? reason;
@@ -143,6 +147,18 @@
 			message = TROUBLE;
 		}
 	}
+
+	function clickTile(x: number, y: number) {
+		if (mode === 'gather') {
+			act('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
+			return;
+		}
+		const buildingTypeId = world?.buildingTypes[0]?.id;
+		if (buildingTypeId === undefined) return;
+		act('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId }) });
+	}
+
+	const recall = (id: number) => act(`/api/assignments/${id}`, { method: 'DELETE' });
 
 	async function newGame() {
 		// Native confirm, because this destroys a realm someone spent real time on and the
@@ -180,15 +196,22 @@
 		if (!t) return `Tile ${x}, ${y}`;
 		const yield_ = t.yieldsResourceId ? ` — yields ${resourceName.get(t.yieldsResourceId)}` : '';
 		const built = world!.buildings.find((b) => b.x === x && b.y === y);
-		const site = world!.operations.find((o) => o.destX === x && o.destY === y);
+		const site = world!.operations.find(
+			(o) => o.type === 'build' && o.destX === x && o.destY === y
+		);
 		const on = built
 			? ` — ${typeName(built.buildingTypeId)}`
 			: site
-				? ` — ${typeName(site.buildingTypeId)} under construction`
+				? ` — ${typeName(site.buildingTypeId!)} under construction`
 				: '';
 		return `Tile ${x}, ${y} — ${t.displayName}${yield_}${on}`;
 	}
 	const typeName = (id: number) => buildingTypeById.get(id)?.displayName ?? '?';
+	const gathering = $derived(world?.operations.filter((o) => o.type === 'gather') ?? []);
+	const resourceAt = (x: number, y: number) => {
+		const id = terrainById.get(world!.terrain[y * GRID_SIZE + x])?.yieldsResourceId;
+		return id ? resourceName.get(id) : 'nothing';
+	};
 	// An unknown key resolves to no symbol and draws nothing — a tile missing its art, not a
 	// broken page.
 	const typeIcon = (id: number) => buildingTypeById.get(id)?.icon ?? '';
@@ -201,7 +224,16 @@
 </script>
 
 <h1>石垣 Ishigaki</h1>
-<p>Click any empty tile to order a House.</p>
+
+<p class="modes">
+	<label><input type="radio" bind:group={mode} value="build" /> Build a House</label>
+	<label><input type="radio" bind:group={mode} value="gather" /> Send someone to gather</label>
+</p>
+<p>
+	{mode === 'build'
+		? 'Click an empty tile to order a House.'
+		: 'Click a forest, meadow or outcrop to put someone to work there.'}
+</p>
 
 {#if updated.current}
 	<p class="notice">
@@ -233,7 +265,7 @@
 				class="tile"
 				class:blocked={terrainAt(i)?.buildable === false}
 				style="background: {terrainAt(i)?.color}"
-				onclick={() => order(t.x, t.y)}
+				onclick={() => clickTile(t.x, t.y)}
 				aria-label={tileLabel(i, t.x, t.y)}
 			>
 				<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
@@ -258,14 +290,15 @@
 		{/each}
 		<!-- Under construction is drawn from the operation: a building row only exists once
 		     built, so presence in `buildings` means finished. Same art, ghosted and pegged out —
-		     what's coming is legible before it's there. -->
-		{#each world.operations as o (o.id)}
+		     what's coming is legible before it's there. Builds only: a gather has no building
+		     type, and would otherwise paint an empty dashed square wherever someone is working. -->
+		{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
 			<svg
 				class="over site"
 				viewBox="0 0 32 32"
 				style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
 			>
-				<use href="#i-{typeIcon(o.buildingTypeId)}" />
+				<use href="#i-{typeIcon(o.buildingTypeId!)}" />
 			</svg>
 		{/each}
 		{#each world.characters as c (c.id)}
@@ -280,6 +313,17 @@
 	</div>
 {:else}
 	<p>Loading…</p>
+{/if}
+
+{#if gathering.length}
+	<ul class="crew">
+		{#each gathering as o (o.id)}
+			<li>
+				Gathering {resourceAt(o.destX, o.destY)} at {o.destX}, {o.destY}
+				<button onclick={() => recall(o.id)}>Recall</button>
+			</li>
+		{/each}
+	</ul>
 {/if}
 
 {#if message}<p class="error">{message}</p>{/if}
@@ -341,6 +385,13 @@
 		display: flex;
 		gap: 1rem;
 		font-variant-numeric: tabular-nums;
+	}
+	.modes {
+		display: flex;
+		gap: 1rem;
+	}
+	.crew {
+		padding-left: 1.2rem;
 	}
 	.error {
 		color: #b91c1c;

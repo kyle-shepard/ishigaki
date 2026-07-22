@@ -1,7 +1,7 @@
 // Run: npm test  (node --test, no framework added)
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { positionAt, travelFraction, travelSeconds } from './world.ts';
+import { accrue, positionAt, travelFraction, travelSeconds } from './world.ts';
 
 const leg = (startedAt: string, travelDoneAt: string) => ({
 	originX: 0,
@@ -56,4 +56,45 @@ test('a trip costs the same in both directions', () => {
 
 test('a zero-length trip is 0 seconds, not NaN', () => {
 	assert.equal(travelSeconds(4, 4, 4, 4, 0.5, lake), 0);
+});
+
+// Accrual. This is the one mechanic that cannot be verified by watching it — the numbers it
+// gets wrong are the ones that only show up after a week away — so the arithmetic is pinned
+// here rather than in the browser.
+
+test('a worker takes their rate, prorated by the hour', () => {
+	assert.equal(accrue(3, 3600), 3);
+	assert.equal(accrue(3, 1200), 1);
+	assert.equal(accrue(12, 300), 1);
+});
+
+test('nothing has been earned before any time passes', () => {
+	assert.equal(accrue(3, 0), 0);
+});
+
+test('time that has not happened yet pays nothing, rather than owing', () => {
+	// `accrued_at` starts when the worker *arrives*, so every read during the walk asks about
+	// a negative interval. Answering with a negative number would drain stock on a refresh.
+	assert.equal(accrue(3, -600), 0);
+});
+
+test('a rate of zero is a tile that is on the map but not yet wired', () => {
+	assert.equal(accrue(0, 86_400), 0);
+});
+
+test('a week away equals a hundred visits — the property a tick would break', () => {
+	const week = 7 * 24 * 3600;
+	const away = accrue(3, week);
+
+	let watched = 0;
+	for (let i = 0; i < 100; i++) watched += accrue(3, week / 100);
+
+	// The model is resolution-independent — the integral is linear, so how often you look
+	// cannot change the total. What separates these two numbers is only the drift of adding
+	// a double a hundred times, and at 504 units it is a part in 10^15.
+	//
+	// The tolerance is the point of the test, not a concession: stock is stored fractional
+	// precisely so that this stays drift and never becomes truncation. If a future change
+	// rounds on each read, this gap goes to ~50 units and the assertion fails loudly.
+	assert.ok(Math.abs(watched - away) < 1e-9, `drifted by ${Math.abs(watched - away)}`);
 });

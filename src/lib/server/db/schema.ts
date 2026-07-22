@@ -1,4 +1,5 @@
 import { sql } from 'drizzle-orm';
+import type { OperationType as WireOperationType } from '$lib/features/world/world';
 import {
 	boolean,
 	check,
@@ -58,11 +59,15 @@ export const building = pgTable(
 	(t) => [uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y)]
 );
 
-// What a tile can produce. A type catalog only — no stock, no inventory; extraction is a
-// later epic and is the first thing that will read this.
+// What a tile can produce.
 export const resource = pgTable('resource', {
 	id: serial('id').primaryKey(),
-	displayName: text('display_name').notNull()
+	displayName: text('display_name').notNull(),
+	// How fast one worker takes it, flat — skill-derived rates need skills, and a character
+	// carries only `speed` today. The seam is clean either way: the rate is a number.
+	// Zero means "seeded on the map but not yet wired"; assignment refuses those outright
+	// rather than letting a worker stand in a clay pit earning nothing forever.
+	unitsPerHour: real('units_per_hour').notNull().default(0)
 });
 
 // What a building costs to order. Content, not code (VISION #10): retuning a cost is an
@@ -171,33 +176,54 @@ export const character = pgTable('character', {
 	speed: real('speed').notNull()
 });
 
-export type OperationType = 'build';
+// Defined next to the wire types rather than here: the client branches on it too, and two
+// copies of a union is one copy waiting to fall behind.
+export type { OperationType } from '$lib/features/world/world';
 export type OperationStatus = 'in-progress' | 'completed';
 
-// ponytail: travel is a phase of the build operation rather than its own operation row.
-// `type` is carried now despite having one value — it's the discriminator the Movement
-// epic adds rows against, and backfilling a nullable column later costs more.
-export const operation = pgTable('operation', {
-	id: serial('id').primaryKey(),
-	playerId: integer('player_id')
-		.notNull()
-		.references(() => player.id),
-	characterId: integer('character_id')
-		.notNull()
-		.references(() => character.id),
-	// Typed unions, not bare text: a misspelled status would compile fine and strand the
-	// character busy forever, with no error to notice. Still `text` in Postgres so the
-	// Movement epic can add a type without a migration.
-	type: text('type').$type<OperationType>().notNull(),
-	status: text('status').$type<OperationStatus>().notNull(),
-	originX: integer('origin_x').notNull(),
-	originY: integer('origin_y').notNull(),
-	destX: integer('dest_x').notNull(),
-	destY: integer('dest_y').notNull(),
-	buildingTypeId: integer('building_type_id')
-		.notNull()
-		.references(() => buildingType.id),
-	startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
-	travelDoneAt: timestamp('travel_done_at', { withTimezone: true }).notNull(),
-	completeAt: timestamp('complete_at', { withTimezone: true }).notNull()
-});
+// ponytail: travel is a phase of the operation rather than its own operation row.
+//
+// A gather is an operation, not a table of its own. Widening beats adding: the travel leg,
+// the "who is idle" derivation, and the client's position interpolation all keep working
+// because a gather row carries real origin/dest/travel columns. The cost is two columns
+// going nullable, and that cost is paid back by the CHECKs below.
+export const operation = pgTable(
+	'operation',
+	{
+		id: serial('id').primaryKey(),
+		playerId: integer('player_id')
+			.notNull()
+			.references(() => player.id),
+		characterId: integer('character_id')
+			.notNull()
+			.references(() => character.id),
+		// Typed unions, not bare text: a misspelled status would compile fine and strand the
+		// character busy forever, with no error to notice. Still `text` in Postgres so a new
+		// type costs no migration.
+		type: text('type').$type<WireOperationType>().notNull(),
+		status: text('status').$type<OperationStatus>().notNull(),
+		originX: integer('origin_x').notNull(),
+		originY: integer('origin_y').notNull(),
+		destX: integer('dest_x').notNull(),
+		destY: integer('dest_y').notNull(),
+		buildingTypeId: integer('building_type_id').references(() => buildingType.id),
+		startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+		travelDoneAt: timestamp('travel_done_at', { withTimezone: true }).notNull(),
+		// Null means "never finishes on its own" — a gather runs until it is recalled.
+		completeAt: timestamp('complete_at', { withTimezone: true }),
+		// How much of a gather has already been paid into stock. Starts at travel_done_at, so
+		// `now - accrued_at` is the *worked* interval and travel needs no special case: distance
+		// costs a trip, not a yield.
+		accruedAt: timestamp('accrued_at', { withTimezone: true })
+	},
+	(t) => [
+		// The two columns above went nullable so a gather row could exist, but the build path
+		// still dereferences both. Without these, a malformed build row would fail deep inside a
+		// transaction on somebody's read — the least debuggable place in this codebase.
+		check(
+			'operation_build_is_complete',
+			sql`${t.type} <> 'build' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
+		),
+		check('operation_gather_accrues', sql`${t.type} <> 'gather' OR ${t.accruedAt} IS NOT NULL`)
+	]
+);

@@ -13,7 +13,7 @@ import {
 	terrainType,
 	tile
 } from '$lib/server/db/schema';
-import { GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
+import { accrue, GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
 
 // Where a new sandbox starts. Every player gets the same coordinates because they never
 // see each other (VISION #4 interim override) — the hamlet, the barn beside it, and a builder.
@@ -27,11 +27,9 @@ const START = {
 	speed: 0.5
 };
 
-// A grubstake, so a fresh realm can afford its first House before there is any way to
-// gather one. Deliberate scaffolding: it goes to nothing the moment gathering exists.
-// ponytail: keyed by display name because resource ids are seeded serials and this constant
-// outlives none of them — it is deleted next slice.
-const STARTING_STOCK: Record<string, number> = { Wood: 10 };
+// How many people a realm starts with. An explicit placeholder for real population growth
+// (the People epic). One would mean every build order cancels your only gatherer.
+const STARTING_CHARACTERS = 3;
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -86,16 +84,14 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 			.insert(settlement)
 			.values({ playerId: p.id, x: START.hamletX, y: START.hamletY })
 			.returning();
-		// A row per resource, present from the start rather than created on first gain: the
-		// deduction is then an UPDATE that either matches a row or does not, with no upsert and
-		// no "is this a new resource or an empty one" question at the till.
-		await tx.insert(stock).values(
-			resources.map((r) => ({
-				settlementId: s.id,
-				resourceId: r.id,
-				quantity: STARTING_STOCK[r.displayName] ?? 0
-			}))
-		);
+		// A row per resource at zero, present from the start rather than created on first gain:
+		// the accrual and the deduction are then both an UPDATE that either matches a row or
+		// does not, with no upsert and no "is this new or merely empty" question at the till.
+		// Zero, and not a grubstake: a fresh realm can forage, so it is not stuck, and starting
+		// at nothing is the state the whole economy has to be winnable from.
+		await tx
+			.insert(stock)
+			.values(resources.map((r) => ({ settlementId: s.id, resourceId: r.id, quantity: 0 })));
 		await tx.insert(building).values([
 			{ playerId: p.id, x: START.hamletX, y: START.hamletY, buildingTypeId: house.id },
 			// The barn stores nothing yet and gates nothing — with no capacity there is nothing
@@ -103,12 +99,15 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 			// it is the row capacity will hang off when it arrives.
 			{ playerId: p.id, x: START.barnX, y: START.barnY, buildingTypeId: barn.id }
 		]);
-		await tx.insert(character).values({
-			playerId: p.id,
-			x: START.characterX,
-			y: START.characterY,
-			speed: START.speed
-		});
+		// Side by side along the row below the hamlet, so three pawns don't stack into one.
+		await tx.insert(character).values(
+			Array.from({ length: STARTING_CHARACTERS }, (_, i) => ({
+				playerId: p.id,
+				x: START.characterX + i - 1,
+				y: START.characterY,
+				speed: START.speed
+			}))
+		);
 		return p.id;
 	});
 
@@ -145,7 +144,7 @@ export async function deletePlayer(playerId: number): Promise<void> {
 
 export async function loadWorld(playerId: number): Promise<WorldPayload> {
 	return db.transaction(async (tx) => {
-		await resolveOperations(tx, playerId);
+		await resolveWorld(tx, playerId);
 		return readWorld(tx, playerId);
 	});
 }
@@ -155,45 +154,98 @@ export async function loadWorld(playerId: number): Promise<WorldPayload> {
  * performs writes and what is stored always reflects reality — nothing is computed in memory
  * and thrown away.
  *
+ * Two jobs, because there are two kinds of operation. A build is edge-triggered: it is due
+ * or it isn't. A gather is continuous, and is integrated from the time elapsed since it was
+ * last paid out. Neither is a tick — nothing here runs unless somebody looks.
+ *
  * ponytail: the settlement row is a per-player lock — coarse, and taken on reads as well as
  * writes. Narrow it when a settlement has more than one owner.
  */
-export async function resolveOperations(tx: Tx, playerId: number): Promise<void> {
+export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 	// Every read-modify-write for this player queues behind this one row. It cannot be the
-	// `FOR UPDATE` below instead: that one locks only operations already due, so with nothing
-	// due it names an empty set and Postgres locks nothing — two orders placed at the same
-	// moment would both read the same stock and both spend it.
-	await tx
+	// `FOR UPDATE` below instead: that one used to name only operations already due, so with
+	// nothing due it locked nothing and two orders placed at the same moment would both read
+	// the same stock and both spend it.
+	const [home] = await tx
 		.select({ id: settlement.id })
 		.from(settlement)
 		.where(eq(settlement.playerId, playerId))
 		.for('update');
 
-	const due = await tx
+	// Postgres freezes `now()` at the start of the transaction, so this instant is the same
+	// one the SQL below stamps with. Reading it into JS and writing `now()` back cannot drift
+	// apart and double-count a sliver of work.
+	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
+	const nowMs = new Date(now).getTime();
+
+	// Every in-progress operation, not just the ones past their completion time: a gather has
+	// no completion time at all and would never be selected by that predicate.
+	const active = await tx
 		.select()
 		.from(operation)
-		.where(
-			and(
-				eq(operation.playerId, playerId),
-				eq(operation.status, 'in-progress'),
-				lte(operation.completeAt, sql`now()`)
-			)
-		)
+		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')))
 		.for('update');
 
-	for (const op of due) {
+	const gathers = active.filter((op) => op.type === 'gather');
+	// One catalog read, and only when somebody is actually working.
+	const rates = gathers.length ? await tileRates(tx) : new Map();
+
+	for (const op of active) {
+		if (op.type === 'gather') {
+			const yielded = rates.get(op.destY * GRID_SIZE + op.destX);
+			// A tile whose terrain stopped yielding under a standing worker. Refusing at the
+			// writer means this shouldn't happen; paying nothing is the safe reading if it does.
+			if (!yielded) continue;
+			const taken = accrue(yielded.unitsPerHour, (nowMs - op.accruedAt!.getTime()) / 1000);
+			// Still walking, or read twice in the same instant. Leaving `accrued_at` alone is
+			// what keeps travel time from being quietly credited as work.
+			if (taken <= 0) continue;
+			await tx
+				.update(stock)
+				.set({ quantity: sql`${stock.quantity} + ${taken}` })
+				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, yielded.resourceId)));
+			await tx
+				.update(operation)
+				.set({ accruedAt: sql`now()` })
+				.where(eq(operation.id, op.id));
+			continue;
+		}
+
+		if (op.completeAt!.getTime() > nowMs) continue;
 		await tx.update(operation).set({ status: 'completed' }).where(eq(operation.id, op.id));
 		await tx.insert(building).values({
 			playerId,
 			x: op.destX,
 			y: op.destY,
-			buildingTypeId: op.buildingTypeId
+			buildingTypeId: op.buildingTypeId!
 		});
 		await tx
 			.update(character)
 			.set({ x: op.destX, y: op.destY })
 			.where(eq(character.id, op.characterId));
 	}
+}
+
+/** What each tile yields and how fast, keyed row-major like the wire payload. */
+async function tileRates(
+	tx: Tx
+): Promise<Map<number, { resourceId: number; unitsPerHour: number }>> {
+	const rows = await tx
+		.select({
+			x: tile.x,
+			y: tile.y,
+			resourceId: resource.id,
+			unitsPerHour: resource.unitsPerHour
+		})
+		.from(tile)
+		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
+		.innerJoin(resource, eq(terrainType.yieldsResourceId, resource.id));
+	return new Map(
+		rows.map((r) => [
+			r.y * GRID_SIZE + r.x,
+			{ resourceId: r.resourceId, unitsPerHour: r.unitsPerHour }
+		])
+	);
 }
 
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
@@ -237,8 +289,8 @@ export async function createBuildOrder(
 ): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
 		// An order is a read-then-write: without this it could be rejected as NO_IDLE_CHARACTER
-		// by an operation that finished ten seconds ago.
-		await resolveOperations(tx, playerId);
+		// by an operation that finished ten seconds ago, or judged against stale stock.
+		await resolveWorld(tx, playerId);
 
 		if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
 		if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
@@ -269,7 +321,9 @@ export async function createBuildOrder(
 			.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
 		if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
 
-		// In-progress operations count as occupancy too, or two orders stack on one tile.
+		// In-progress builds count as occupancy too, or two orders stack on one tile. Gathers
+		// don't: a worker standing on a tile is not a thing built on it, and refusing to build
+		// where someone happens to be foraging would be a rule nobody could guess.
 		const [pending] = await tx
 			.select()
 			.from(operation)
@@ -277,6 +331,7 @@ export async function createBuildOrder(
 				and(
 					eq(operation.playerId, playerId),
 					eq(operation.status, 'in-progress'),
+					eq(operation.type, 'build'),
 					eq(operation.destX, x),
 					eq(operation.destY, y)
 				)
@@ -346,6 +401,96 @@ export async function createBuildOrder(
 			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
 			completeAt: sql`now() + ${`${travel + type.buildSeconds} seconds`}::interval`
 		});
+
+		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
+/**
+ * Sends a worker to a tile to take what it yields. Unlike a build, this has no end: the
+ * operation runs until it is recalled, which is what a null `complete_at` means.
+ */
+export async function assignWorker(playerId: number, x: number, y: number): Promise<OrderResult> {
+	return db.transaction(async (tx): Promise<OrderResult> => {
+		await resolveWorld(tx, playerId);
+
+		if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
+		if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
+			return { ok: false, reason: 'OUT_OF_BOUNDS' };
+
+		// Refused here, before any row is written, so a tile that yields nothing can never
+		// acquire a worker — the invariant holds at the writer rather than by convention.
+		// The predicate is "yields something you can actually take", not merely "yields":
+		// clay pits and iron veins carry a resource but no rate yet, and a null-check alone
+		// would leave a worker standing in one forever, earning nothing, with no feedback.
+		const yielded = (await tileRates(tx)).get(y * GRID_SIZE + x);
+		if (!yielded || yielded.unitsPerHour <= 0) return { ok: false, reason: 'TILE_YIELDS_NOTHING' };
+
+		const busy = tx
+			.select({ id: operation.characterId })
+			.from(operation)
+			.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+		const [idle] = await tx
+			.select()
+			.from(character)
+			.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)))
+			.limit(1);
+		if (!idle) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+
+		const grid = await loadGrid(tx);
+		const travel = travelSeconds(idle.x, idle.y, x, y, idle.speed, (cx, cy) => {
+			const g = grid.get(cy * GRID_SIZE + cx);
+			if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
+			return g.movementCost;
+		});
+		await tx.insert(operation).values({
+			playerId,
+			characterId: idle.id,
+			type: 'gather',
+			status: 'in-progress',
+			originX: idle.x,
+			originY: idle.y,
+			destX: x,
+			destY: y,
+			buildingTypeId: null,
+			startedAt: sql`now()`,
+			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
+			// Never finishes on its own.
+			completeAt: null,
+			// Work starts on arrival. Distance therefore costs the trip and nothing else — two
+			// identical forests pay the same however far apart they are.
+			accruedAt: sql`now() + ${`${travel} seconds`}::interval`
+		});
+
+		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
+/** Ends an assignment. `resolveWorld` above has already paid out the final stretch. */
+export async function recallWorker(playerId: number, operationId: number): Promise<OrderResult> {
+	return db.transaction(async (tx): Promise<OrderResult> => {
+		await resolveWorld(tx, playerId);
+
+		const [op] = await tx
+			.select()
+			.from(operation)
+			.where(
+				and(
+					eq(operation.id, operationId),
+					eq(operation.playerId, playerId),
+					eq(operation.status, 'in-progress'),
+					eq(operation.type, 'gather')
+				)
+			);
+		if (!op) return { ok: false, reason: 'UNKNOWN_OPERATION' };
+
+		await tx.update(operation).set({ status: 'completed' }).where(eq(operation.id, op.id));
+		// They are left standing where they were working. Recalled mid-walk they arrive anyway,
+		// which is a shrug rather than a rule — there is nowhere else the model says they are.
+		await tx
+			.update(character)
+			.set({ x: op.destX, y: op.destY })
+			.where(eq(character.id, op.characterId));
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});
@@ -425,6 +570,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		operations: operations.map((o) => ({
 			id: o.id,
 			characterId: o.characterId,
+			type: o.type,
 			buildingTypeId: o.buildingTypeId,
 			originX: o.originX,
 			originY: o.originY,
@@ -432,7 +578,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			destY: o.destY,
 			startedAt: o.startedAt.toISOString(),
 			travelDoneAt: o.travelDoneAt.toISOString(),
-			completeAt: o.completeAt.toISOString()
+			// Null on a gather, and that is the wire's way of saying "this never ends by itself".
+			completeAt: o.completeAt?.toISOString() ?? null
 		}))
 	};
 }

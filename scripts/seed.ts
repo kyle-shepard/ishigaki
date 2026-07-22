@@ -48,22 +48,43 @@ const buildingTypes = await db
 	.returning();
 const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 
+// units_per_hour is per worker, flat. Food is fast because forage is the bootstrap floor —
+// it is what a realm with nothing can always do. Zero means seeded on the map but not yet
+// wired: assignment refuses those tiles outright rather than paying nothing in silence.
 const resources = await db
 	.insert(resource)
 	.values([
-		{ displayName: 'Wood' },
-		{ displayName: 'Stone' },
-		{ displayName: 'Clay' },
-		{ displayName: 'Iron ore' }
+		{ displayName: 'Food', unitsPerHour: 12 },
+		{ displayName: 'Wood', unitsPerHour: 3 },
+		{ displayName: 'Stone', unitsPerHour: 2 },
+		{ displayName: 'Clay', unitsPerHour: 0 },
+		{ displayName: 'Iron ore', unitsPerHour: 0 }
 	])
 	.returning();
 const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));
 
 // What a build costs. Rows, not constants: retuning this is an UPDATE against a live world,
 // no deploy (VISION #10).
-await db
-	.insert(buildingCost)
-	.values([{ buildingTypeId: bt['House'], resourceId: res['Wood'], quantity: 6 }]);
+const COSTS = [{ building: 'House', resource: 'Wood', quantity: 6 }];
+await db.insert(buildingCost).values(
+	COSTS.map((c) => ({
+		buildingTypeId: bt[c.building],
+		resourceId: res[c.resource],
+		quantity: c.quantity
+	}))
+);
+
+// A world starts with nothing, so the first rung of the ladder has to be reachable with
+// nothing — a building whose cost includes something you cannot yet take is unbuildable
+// forever, and the whole game deadlocks at rung one. Cheap to assert, silent to break, and a
+// future cost edit is exactly how it would break.
+const gatherable = new Set(resources.filter((r) => r.unitsPerHour > 0).map((r) => r.id));
+for (const c of COSTS) {
+	if (!gatherable.has(res[c.resource]))
+		throw new Error(
+			`${c.building} costs ${c.resource}, which has no way of being gathered — a fresh world could never build it`
+		);
+}
 
 // Movement costs are tuning data (VISION #10), not physics: the spread is chosen to be
 // perceptible, not realistic. Deposits are buildable=true because a terrain-level false
@@ -80,7 +101,10 @@ const TERRAIN = [
 		color: '#a3c76d',
 		icon: 'meadow',
 		buildable: true,
-		movementCost: 1.0
+		movementCost: 1.0,
+		// Forage, not farming. It is the one thing a realm with nothing can always do, which is
+		// what makes a zero-stock start playable rather than stuck.
+		yields: 'Food'
 	},
 	{
 		char: 'f',

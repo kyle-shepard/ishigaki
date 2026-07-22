@@ -8,7 +8,9 @@ export type OrderReason =
 	| 'TILE_NOT_BUILDABLE'
 	| 'TILE_OCCUPIED'
 	| 'NO_IDLE_CHARACTER'
-	| 'INSUFFICIENT_RESOURCES';
+	| 'INSUFFICIENT_RESOURCES'
+	| 'TILE_YIELDS_NOTHING'
+	| 'UNKNOWN_OPERATION';
 
 export type OrderRequest = { x: number; y: number; buildingTypeId: number };
 
@@ -48,16 +50,40 @@ export type WorldPayload = {
 	operations: {
 		id: number;
 		characterId: number;
-		buildingTypeId: number;
+		type: OperationType;
+		// Both null on a gather: it builds nothing, and it never finishes on its own.
+		buildingTypeId: number | null;
 		originX: number;
 		originY: number;
 		destX: number;
 		destY: number;
 		startedAt: string;
 		travelDoneAt: string;
-		completeAt: string;
+		completeAt: string | null;
 	}[];
 };
+
+export type OperationType = 'build' | 'gather';
+
+export type AssignRequest = { x: number; y: number };
+
+/**
+ * How much a worker has taken since they were last paid out. Pure and database-free, which
+ * is the point: continuous accrual is the one thing in this game that cannot be checked by
+ * watching it — a thirty-day regrowth is not a test you run — so the arithmetic lives
+ * somewhere `npm test` can reach it.
+ *
+ * Integrating elapsed time on read, rather than ticking, is what makes a week away come out
+ * the same as a hundred small visits. Nothing here depends on how often it is called.
+ *
+ * A negative interval is not an error to shout about: `accrued_at` starts at the moment the
+ * worker *arrives*, so every read while they are still walking asks about time that has not
+ * happened yet. The honest answer to that is zero.
+ */
+export function accrue(ratePerHour: number, elapsedSeconds: number): number {
+	if (elapsedSeconds <= 0) return 0;
+	return (ratePerHour * elapsedSeconds) / 3600;
+}
 
 export type TravelLeg = {
 	originX: number;
