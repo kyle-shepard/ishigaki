@@ -271,6 +271,8 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 type TileYield = {
 	resourceId: number;
 	unitsPerHour: number;
+	/** Null is gathered — a person is enough. Set means the structure comes first. */
+	requiresBuildingTypeId: number | null;
 	/** Both null together where the deposit is infinite — the seed holds that invariant. */
 	capacity: number | null;
 	regrowSeconds: number | null;
@@ -284,6 +286,7 @@ async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 			y: tile.y,
 			resourceId: resource.id,
 			unitsPerHour: resource.unitsPerHour,
+			requiresBuildingTypeId: resource.requiresBuildingTypeId,
 			capacity: tile.quantity,
 			regrowSeconds: terrainType.regrowSeconds
 		})
@@ -471,6 +474,25 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		const yielded = (await tileYields(tx)).get(y * GRID_SIZE + x);
 		if (!yielded || yielded.unitsPerHour <= 0) return { ok: false, reason: 'TILE_YIELDS_NOTHING' };
 
+		// Extracted goods need their structure standing on the tile being worked — stone comes
+		// out of a quarry, not out of an outcrop. Gathered ones have no requirement and skip
+		// this entirely. Refused here alongside the other two, so every way a tile can turn a
+		// worker away happens before a row exists.
+		if (yielded.requiresBuildingTypeId !== null) {
+			const [structure] = await tx
+				.select()
+				.from(building)
+				.where(
+					and(
+						eq(building.playerId, playerId),
+						eq(building.x, x),
+						eq(building.y, y),
+						eq(building.buildingTypeId, yielded.requiresBuildingTypeId)
+					)
+				);
+			if (!structure) return { ok: false, reason: 'MISSING_REQUIRED_BUILDING' };
+		}
+
 		const busy = tx
 			.select({ id: operation.characterId })
 			.from(operation)
@@ -555,7 +577,10 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		.select({ resourceId: stock.resourceId, quantity: stock.quantity })
 		.from(stock)
 		.innerJoin(settlement, eq(stock.settlementId, settlement.id))
-		.where(eq(settlement.playerId, playerId));
+		.where(eq(settlement.playerId, playerId))
+		// Ordered, because the resource bar is rendered in payload order and an unordered join
+		// is free to hand back a different one on every read — a bar that reshuffles itself.
+		.orderBy(asc(stock.resourceId));
 	const tiles = await tx.select().from(tile);
 	const deposits = await tileYields(tx);
 	const drawn = await tx.select().from(tileStock).where(eq(tileStock.playerId, playerId));

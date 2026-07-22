@@ -64,6 +64,13 @@
       "when": 1784751632624,
       "tag": "0008_clear_harpoon",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1784752126266,
+      "tag": "0009_fine_hedge_knight",
+      "breakpoints": true
     }
   ]
 }

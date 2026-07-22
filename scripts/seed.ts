@@ -3,7 +3,7 @@
 // same as drizzle.config.ts does.
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import {
 	buildingCost,
 	buildingType,
@@ -43,7 +43,12 @@ const buildingTypes = await db
 		{ displayName: 'House', icon: 'house', buildSeconds: 20 },
 		// Where stock is kept. Inert this epic — nothing reads it — but it makes "where your
 		// things are" a place on the map, and it is the row storage capacity will hang off.
-		{ displayName: 'Barn', icon: 'house', buildSeconds: 30 }
+		{ displayName: 'Barn', icon: 'barn', buildSeconds: 30 },
+		// The gate. Stone cannot be taken from an outcrop until one of these stands on it.
+		{ displayName: 'Quarry', icon: 'quarry', buildSeconds: 60 },
+		// The milestone, and the thing the project is named for: 石垣, fitted stone. It is the
+		// first build that needs a resource you cannot simply walk out and pick up.
+		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90 }
 	])
 	.returning();
 const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
@@ -65,7 +70,14 @@ const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));
 
 // What a build costs. Rows, not constants: retuning this is an UPDATE against a live world,
 // no deploy (VISION #10).
-const COSTS = [{ building: 'House', resource: 'Wood', quantity: 6 }];
+const COSTS = [
+	{ building: 'House', resource: 'Wood', quantity: 6 },
+	// The quarry is priced in wood alone on purpose: it is the rung that unlocks stone, so
+	// paying for it in stone would seal the ladder shut.
+	{ building: 'Quarry', resource: 'Wood', quantity: 12 },
+	{ building: 'Stone wall', resource: 'Stone', quantity: 8 },
+	{ building: 'Stone wall', resource: 'Wood', quantity: 4 }
+];
 await db.insert(buildingCost).values(
 	COSTS.map((c) => ({
 		buildingTypeId: bt[c.building],
@@ -74,17 +86,41 @@ await db.insert(buildingCost).values(
 	}))
 );
 
-// A world starts with nothing, so the first rung of the ladder has to be reachable with
-// nothing — a building whose cost includes something you cannot yet take is unbuildable
-// forever, and the whole game deadlocks at rung one. Cheap to assert, silent to break, and a
-// future cost edit is exactly how it would break.
-const gatherable = new Set(resources.filter((r) => r.unitsPerHour > 0).map((r) => r.id));
-for (const c of COSTS) {
-	if (!gatherable.has(res[c.resource]))
-		throw new Error(
-			`${c.building} costs ${c.resource}, which has no way of being gathered — a fresh world could never build it`
-		);
+// Extracted, not gathered: for these the structure comes first. Everything absent from here
+// needs a person and nothing else.
+const REQUIRES: Record<string, string> = { Stone: 'Quarry' };
+for (const [r, b] of Object.entries(REQUIRES)) {
+	await db
+		.update(resource)
+		.set({ requiresBuildingTypeId: bt[b] })
+		.where(eq(resource.displayName, r));
 }
+
+// A world starts with nothing, so every building has to be reachable *eventually* — not
+// necessarily at once. Walk the ladder: whatever can be gathered bare-handed is reachable,
+// anything payable from reachable resources is buildable, and any resource whose required
+// building is buildable becomes reachable in turn. A building left outside that closure can
+// never be built by anyone, which is a world that quietly cannot be won.
+//
+// Cheap to check, silent to break, and a future cost edit is exactly how it would break.
+const takeable = resources.filter((r) => r.unitsPerHour > 0).map((r) => r.displayName);
+const reachable = new Set(takeable.filter((r) => !REQUIRES[r]));
+const buildable = new Set<string>();
+// One pass per building type is enough to reach a fixed point: each pass adds at least one
+// rung, or the ladder has stopped and no further pass would change anything.
+for (let pass = 0; pass < buildingTypes.length; pass++) {
+	for (const t of buildingTypes) {
+		const needs = COSTS.filter((c) => c.building === t.displayName);
+		if (needs.every((c) => reachable.has(c.resource))) buildable.add(t.displayName);
+	}
+	for (const r of takeable) if (REQUIRES[r] && buildable.has(REQUIRES[r])) reachable.add(r);
+}
+const stranded = buildingTypes.filter((t) => !buildable.has(t.displayName));
+if (stranded.length > 0)
+	throw new Error(
+		`unbuildable from a fresh world: ${stranded.map((t) => t.displayName).join(', ')} — ` +
+			'the ladder is sealed shut and no player could ever climb it'
+	);
 
 // Movement costs are tuning data (VISION #10), not physics: the spread is chosen to be
 // perceptible, not realistic. Deposits are buildable=true because a terrain-level false

@@ -10,6 +10,7 @@ export type OrderReason =
 	| 'NO_IDLE_CHARACTER'
 	| 'INSUFFICIENT_RESOURCES'
 	| 'TILE_YIELDS_NOTHING'
+	| 'MISSING_REQUIRED_BUILDING'
 	| 'UNKNOWN_OPERATION';
 
 export type OrderRequest = { x: number; y: number; buildingTypeId: number };

@@ -206,5 +206,17 @@ check(
 	[null, null]
 );
 
+// The quarry gate. Wood and forage need a person; stone needs the structure first, and the
+// structure has to be on the tile being worked — not merely somewhere in the realm.
+cookie = '';
+await api('/api/world');
+const bare = await assign(15, 11);
+check(
+	'(15,11) a stone outcrop with no quarry on it is refused',
+	[bare.status, bare.body.reason],
+	[400, 'MISSING_REQUIRED_BUILDING']
+);
+check('(11,1) forest still needs no building at all', (await assign(11, 1)).status, 200);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

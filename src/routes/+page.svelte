@@ -22,11 +22,14 @@
 		NO_IDLE_CHARACTER: 'Everyone is busy.',
 		INSUFFICIENT_RESOURCES: "You don't have the materials for that.",
 		TILE_YIELDS_NOTHING: "There's nothing to take from that ground.",
+		MISSING_REQUIRED_BUILDING: 'That needs a building on the tile before anyone can work it.',
 		UNKNOWN_OPERATION: 'Nobody is working there.'
 	};
 
 	// What a click on a tile means. Two verbs, one map.
 	let mode = $state<'build' | 'gather'>('build');
+	// Which building. Null until the first world arrives, then the first type in the catalog.
+	let chosen = $state<number | null>(null);
 
 	let world = $state<WorldPayload | null>(null);
 	let message = $state('');
@@ -48,6 +51,9 @@
 		world = payload;
 		nowMs = Date.parse(payload.now);
 		lastReadMs = Date.now();
+		// Only until the player has picked for themselves — re-defaulting on every refresh
+		// would snatch their choice back twice a minute.
+		if (chosen === null) chosen = payload.buildingTypes[0]?.id ?? null;
 		if (payload.worldReset) worldReset = true;
 	}
 
@@ -153,9 +159,8 @@
 			act('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
 			return;
 		}
-		const buildingTypeId = world?.buildingTypes[0]?.id;
-		if (buildingTypeId === undefined) return;
-		act('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId }) });
+		if (chosen === null) return;
+		act('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId: chosen }) });
 	}
 
 	const recall = (id: number) => act(`/api/assignments/${id}`, { method: 'DELETE' });
@@ -215,6 +220,13 @@
 	}
 	const typeName = (id: number) => buildingTypeById.get(id)?.displayName ?? '?';
 	const gathering = $derived(world?.operations.filter((o) => o.type === 'gather') ?? []);
+	// A building with no cost rows is free, and says so rather than showing an empty bracket.
+	function priceOf(id: number) {
+		const parts = (world?.buildingCosts ?? [])
+			.filter((c) => c.buildingTypeId === id)
+			.map((c) => `${c.quantity} ${resourceName.get(c.resourceId)}`);
+		return parts.length ? parts.join(' + ') : 'free';
+	}
 	const resourceAt = (x: number, y: number) => {
 		const id = terrainById.get(world!.terrain[y * GRID_SIZE + x])?.yieldsResourceId;
 		return id ? resourceName.get(id) : 'nothing';
@@ -233,13 +245,26 @@
 <h1>石垣 Ishigaki</h1>
 
 <p class="modes">
-	<label><input type="radio" bind:group={mode} value="build" /> Build a House</label>
+	<label><input type="radio" bind:group={mode} value="build" /> Build</label>
 	<label><input type="radio" bind:group={mode} value="gather" /> Send someone to gather</label>
 </p>
+
+{#if world && mode === 'build'}
+	<p class="modes">
+		{#each world.buildingTypes as t (t.id)}
+			<label>
+				<input type="radio" bind:group={chosen} value={t.id} />
+				{t.displayName}
+				<span class="price">{priceOf(t.id)}</span>
+			</label>
+		{/each}
+	</p>
+{/if}
+
 <p>
 	{mode === 'build'
-		? 'Click an empty tile to order a House.'
-		: 'Click a forest, meadow or outcrop to put someone to work there.'}
+		? 'Click an empty tile to order it there.'
+		: 'Click ground that yields something to put someone to work on it.'}
 </p>
 
 {#if updated.current}
@@ -395,7 +420,11 @@
 	}
 	.modes {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 1rem;
+	}
+	.price {
+		color: #6b7280;
 	}
 	.crew {
 		padding-left: 1.2rem;

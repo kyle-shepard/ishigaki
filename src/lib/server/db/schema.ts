@@ -68,7 +68,12 @@ export const resource = pgTable('resource', {
 	// carries only `speed` today. The seam is clean either way: the rate is a number.
 	// Zero means "seeded on the map but not yet wired"; assignment refuses those outright
 	// rather than letting a worker stand in a clay pit earning nothing forever.
-	unitsPerHour: real('units_per_hour').notNull().default(0)
+	unitsPerHour: real('units_per_hour').notNull().default(0),
+	// What must already stand on the tile before this can be taken from it. Null is a gathered
+	// resource — wood and forage need a person and nothing else. Set means extracted: the
+	// structure comes first. Expressing it as a column makes "stone needs a quarry on the
+	// outcrop" one join rather than a rule written in code.
+	requiresBuildingTypeId: integer('requires_building_type_id').references(() => buildingType.id)
 });
 
 // What a building costs to order. Content, not code (VISION #10): retuning a cost is an

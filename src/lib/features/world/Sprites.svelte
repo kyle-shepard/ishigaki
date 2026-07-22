@@ -92,6 +92,34 @@
 			<rect x="6" y="27" width="20" height="1.6" fill="#00000022" />
 		</symbol>
 
+		<!-- A barn: one long roof, wide doors, no chimney — read as storage, not a dwelling. -->
+		<symbol id="i-barn" viewBox="0 0 32 32">
+			<rect x="5" y="14" width="22" height="14" fill="#a44a3a" />
+			<path d="M16 5 L29 15 H3 Z" fill="#7d3327" />
+			<rect x="11" y="18" width="10" height="10" fill="#e6d8bb" />
+			<path d="M11 18 L21 28 M21 18 L11 28" stroke="#a44a3a" stroke-width="1.4" />
+			<rect x="5" y="27" width="22" height="1.6" fill="#00000022" />
+		</symbol>
+
+		<!-- A quarry: cut steps into the rock, and the spoil below. -->
+		<symbol id="i-quarry" viewBox="0 0 32 32">
+			<path d="M4 26 H28 V21 H22 V16 H16 V11 H6 V26 Z" fill="#9aa0a6" />
+			<path d="M6 11 H16 V16 H22 V21 H28" fill="none" stroke="#6f757b" stroke-width="1.6" />
+			<circle cx="9" cy="24" r="1.8" fill="#c3c8cc" />
+			<circle cx="13.5" cy="25" r="1.2" fill="#c3c8cc" />
+			<rect x="4" y="26" width="24" height="1.6" fill="#00000022" />
+		</symbol>
+
+		<!-- The wall the project is named for: fitted stone, wider at the base. -->
+		<symbol id="i-wall" viewBox="0 0 32 32">
+			<path d="M3 28 L7 8 H25 L29 28 Z" fill="#b6bbc0" />
+			<g stroke="#7d8489" stroke-width="1.1" fill="none">
+				<path d="M6.2 13 H25.8 M5.2 18 H26.8 M4.2 23 H27.8" />
+				<path d="M13 8 V13 M19 8 V13 M10 13 V18 M16 13 V18 M22 13 V18 M13 18 V23 M19 18 V23" />
+			</g>
+			<rect x="3" y="27" width="26" height="1.6" fill="#00000022" />
+		</symbol>
+
 		<!-- A character. Pale outline so it stays legible crossing water, forest, or mountain. -->
 		<symbol id="i-pawn" viewBox="0 0 32 32">
 			<g stroke="#f2f4f8" stroke-width="1.4">
