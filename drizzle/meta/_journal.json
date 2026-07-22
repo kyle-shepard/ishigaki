@@ -57,6 +57,13 @@
       "when": 1784750756883,
       "tag": "0007_sloppy_karen_page",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1784751632624,
+      "tag": "0008_clear_harpoon",
+      "breakpoints": true
     }
   ]
 }

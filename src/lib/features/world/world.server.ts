@@ -11,7 +11,8 @@ import {
 	settlement,
 	stock,
 	terrainType,
-	tile
+	tile,
+	tileStock
 } from '$lib/server/db/schema';
 import { accrue, GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
 
@@ -137,6 +138,7 @@ export async function deletePlayer(playerId: number): Promise<void> {
 					tx.select({ id: settlement.id }).from(settlement).where(eq(settlement.playerId, playerId))
 				)
 			);
+		await tx.delete(tileStock).where(eq(tileStock.playerId, playerId));
 		await tx.delete(settlement).where(eq(settlement.playerId, playerId));
 		await tx.delete(player).where(eq(player.id, playerId));
 	});
@@ -188,22 +190,62 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 
 	const gathers = active.filter((op) => op.type === 'gather');
 	// One catalog read, and only when somebody is actually working.
-	const rates = gathers.length ? await tileRates(tx) : new Map();
+	const yields = gathers.length ? await tileYields(tx) : new Map();
+	// What this player has already drawn down. Only tiles they have actually worked have rows.
+	const drawn = gathers.length
+		? new Map(
+				(await tx.select().from(tileStock).where(eq(tileStock.playerId, playerId))).map((r) => [
+					r.y * GRID_SIZE + r.x,
+					r
+				])
+			)
+		: new Map();
 
 	for (const op of active) {
 		if (op.type === 'gather') {
-			const yielded = rates.get(op.destY * GRID_SIZE + op.destX);
+			const key = op.destY * GRID_SIZE + op.destX;
+			const yielded = yields.get(key);
 			// A tile whose terrain stopped yielding under a standing worker. Refusing at the
 			// writer means this shouldn't happen; paying nothing is the safe reading if it does.
 			if (!yielded) continue;
-			const taken = accrue(yielded.unitsPerHour, (nowMs - op.accruedAt!.getTime()) / 1000);
+
+			// No row means untouched, and untouched means full. Two workers on one tile need no
+			// special case: they resolve in id order, and the second finds whatever the first
+			// left — including nothing.
+			const held = drawn.get(key);
+			const finite =
+				yielded.regrowSeconds !== null && yielded.capacity !== null
+					? {
+							quantity: held ? held.quantity : yielded.capacity,
+							capacity: yielded.capacity,
+							regrowSeconds: yielded.regrowSeconds,
+							agedSeconds: held ? (nowMs - held.asOf.getTime()) / 1000 : 0
+						}
+					: null;
+			const { harvested, quantity } = accrue(
+				yielded.unitsPerHour,
+				(nowMs - op.accruedAt!.getTime()) / 1000,
+				finite
+			);
 			// Still walking, or read twice in the same instant. Leaving `accrued_at` alone is
 			// what keeps travel time from being quietly credited as work.
-			if (taken <= 0) continue;
+			if (harvested <= 0) continue;
+
 			await tx
 				.update(stock)
-				.set({ quantity: sql`${stock.quantity} + ${taken}` })
+				.set({ quantity: sql`${stock.quantity} + ${harvested}` })
 				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, yielded.resourceId)));
+			if (quantity !== null) {
+				await tx
+					.insert(tileStock)
+					.values({ playerId, x: op.destX, y: op.destY, quantity, asOf: sql`now()` })
+					.onConflictDoUpdate({
+						target: [tileStock.playerId, tileStock.x, tileStock.y],
+						set: { quantity, asOf: sql`now()` }
+					});
+				// So a second worker on the same tile this pass sees what the first one left.
+				drawn.set(key, { playerId, x: op.destX, y: op.destY, quantity, asOf: new Date(nowMs) });
+			}
 			await tx
 				.update(operation)
 				.set({ accruedAt: sql`now()` })
@@ -226,26 +268,29 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 	}
 }
 
-/** What each tile yields and how fast, keyed row-major like the wire payload. */
-async function tileRates(
-	tx: Tx
-): Promise<Map<number, { resourceId: number; unitsPerHour: number }>> {
+type TileYield = {
+	resourceId: number;
+	unitsPerHour: number;
+	/** Both null together where the deposit is infinite — the seed holds that invariant. */
+	capacity: number | null;
+	regrowSeconds: number | null;
+};
+
+/** What each tile yields, how fast, and how much of it there is, keyed row-major. */
+async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 	const rows = await tx
 		.select({
 			x: tile.x,
 			y: tile.y,
 			resourceId: resource.id,
-			unitsPerHour: resource.unitsPerHour
+			unitsPerHour: resource.unitsPerHour,
+			capacity: tile.quantity,
+			regrowSeconds: terrainType.regrowSeconds
 		})
 		.from(tile)
 		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
 		.innerJoin(resource, eq(terrainType.yieldsResourceId, resource.id));
-	return new Map(
-		rows.map((r) => [
-			r.y * GRID_SIZE + r.x,
-			{ resourceId: r.resourceId, unitsPerHour: r.unitsPerHour }
-		])
-	);
+	return new Map(rows.map((r) => [r.y * GRID_SIZE + r.x, r]));
 }
 
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
@@ -423,7 +468,7 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		// The predicate is "yields something you can actually take", not merely "yields":
 		// clay pits and iron veins carry a resource but no rate yet, and a null-check alone
 		// would leave a worker standing in one forever, earning nothing, with no feedback.
-		const yielded = (await tileRates(tx)).get(y * GRID_SIZE + x);
+		const yielded = (await tileYields(tx)).get(y * GRID_SIZE + x);
 		if (!yielded || yielded.unitsPerHour <= 0) return { ok: false, reason: 'TILE_YIELDS_NOTHING' };
 
 		const busy = tx
@@ -512,6 +557,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		.innerJoin(settlement, eq(stock.settlementId, settlement.id))
 		.where(eq(settlement.playerId, playerId));
 	const tiles = await tx.select().from(tile);
+	const deposits = await tileYields(tx);
+	const drawn = await tx.select().from(tileStock).where(eq(tileStock.playerId, playerId));
 	const buildings = await tx.select().from(building).where(eq(building.playerId, playerId));
 	const characters = await tx.select().from(character).where(eq(character.playerId, playerId));
 	const operations = await tx
@@ -535,9 +582,39 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		);
 	}
 
+	// A tile nobody is standing on still recovers, and only the gather branch writes — so a
+	// forest you clear-cut and walked away from has a stored `0` that nothing advances. Shipping
+	// that number would show an empty forest for a month while the model says it is coming back,
+	// which is exactly the "numbers that disagree with elapsed time" this design exists to avoid.
+	// So the read path runs the same function with no worker on it, and writes nothing.
+	const nowMs = new Date(now).getTime();
+	const live = new Map(
+		drawn.map((r) => {
+			const d = deposits.get(r.y * GRID_SIZE + r.x);
+			if (!d?.capacity || d.regrowSeconds === null) return [r.y * GRID_SIZE + r.x, r.quantity];
+			const { quantity } = accrue(0, 0, {
+				quantity: r.quantity,
+				capacity: d.capacity,
+				regrowSeconds: d.regrowSeconds,
+				agedSeconds: (nowMs - r.asOf.getTime()) / 1000
+			});
+			return [r.y * GRID_SIZE + r.x, quantity!];
+		})
+	);
+	const tileCapacity: (number | null)[] = new Array(GRID_SIZE * GRID_SIZE).fill(null);
+	const tileQuantity: (number | null)[] = new Array(GRID_SIZE * GRID_SIZE).fill(null);
+	for (const [i, d] of deposits) {
+		// Only finite deposits get a number. An infinite one has nothing to count down.
+		if (d.capacity === null || d.regrowSeconds === null) continue;
+		tileCapacity[i] = d.capacity;
+		tileQuantity[i] = live.get(i) ?? d.capacity;
+	}
+
 	return {
 		now: new Date(now).toISOString(),
 		gridSize: GRID_SIZE,
+		tileQuantity,
+		tileCapacity,
 		terrainTypes: terrainTypes.map((t) => ({
 			id: t.id,
 			displayName: t.displayName,

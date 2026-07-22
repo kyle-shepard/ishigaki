@@ -44,6 +44,13 @@ export type WorldPayload = {
 	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
 	// client estimates travel.
 	terrain: number[];
+	// Row-major like `terrain`. How much this tile still holds, and how much it holds when
+	// full; null on both where the deposit is infinite or the ground yields nothing. Dense
+	// rather than a sparse list of the tiles you have touched — a sparse one would have made
+	// the client learn capacity in order to fill in the gaps, which is the same ~700 B of
+	// information arranged so that it can be got wrong.
+	tileQuantity: (number | null)[];
+	tileCapacity: (number | null)[];
 	buildingTypes: { id: number; displayName: string; icon: string; buildSeconds: number }[];
 	buildings: { id: number; x: number; y: number; buildingTypeId: number }[];
 	characters: { id: number; x: number; y: number; speed: number }[];
@@ -79,10 +86,37 @@ export type AssignRequest = { x: number; y: number };
  * A negative interval is not an error to shout about: `accrued_at` starts at the moment the
  * worker *arrives*, so every read while they are still walking asks about time that has not
  * happened yet. The honest answer to that is zero.
+ *
+ * Two clocks, because there genuinely are two. `workedSeconds` is how long *this worker* has
+ * gone unpaid; `agedSeconds` is how long the *tile* has gone unmeasured. They are equal while
+ * one person works one tile without pause, and they come apart the moment a tile is abandoned
+ * and later returned to — a forest keeps growing whether or not anybody is standing in it.
  */
-export function accrue(ratePerHour: number, elapsedSeconds: number): number {
-	if (elapsedSeconds <= 0) return 0;
-	return (ratePerHour * elapsedSeconds) / 3600;
+export function accrue(
+	ratePerHour: number,
+	workedSeconds: number,
+	// null is an infinite deposit — stone, clay, iron, forage. No capacity, no clamp, no floor
+	// to run into: the worker simply takes their rate.
+	deposit: {
+		quantity: number;
+		capacity: number;
+		regrowSeconds: number;
+		agedSeconds: number;
+	} | null
+): { harvested: number; quantity: number | null } {
+	const wanted = workedSeconds > 0 ? (ratePerHour * workedSeconds) / 3600 : 0;
+	if (!deposit) return { harvested: wanted, quantity: null };
+
+	const grown =
+		deposit.agedSeconds > 0 ? (deposit.capacity / deposit.regrowSeconds) * deposit.agedSeconds : 0;
+	// You cannot take more than is there, and what regrew during the interval is there to be
+	// taken. At an emptied tile this is what the worker is left with — the regrowth itself,
+	// which at ~1 tree per 29 hours against 1 per 20 minutes reads as "this forest is
+	// finished" without needing a special case that says so.
+	const harvested = Math.min(wanted, deposit.quantity + grown);
+	// Clamped at both ends: a tile cannot go below empty, and cannot regrow past full.
+	const quantity = Math.min(Math.max(deposit.quantity + grown - harvested, 0), deposit.capacity);
+	return { harvested, quantity };
 }
 
 export type TravelLeg = {

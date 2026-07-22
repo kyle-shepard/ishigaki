@@ -183,5 +183,28 @@ check(
 	[400, 'UNKNOWN_OPERATION']
 );
 
+// Deposits. Which tiles carry a countdown at all is the assertion worth pinning: a finite
+// deposit must report both numbers, and an infinite one must report neither, or the client
+// would render "0 of null" on a quarry. Watching a forest actually thin is the rate-cranked
+// manual pass — at 3 Wood an hour it takes eight hours, which is the mechanic working.
+cookie = '';
+const map = await api('/api/world');
+const at = (x: number, y: number) => y * map.body.gridSize + x;
+check(
+	'an untouched forest tile reports full',
+	[map.body.tileQuantity[at(11, 1)], map.body.tileCapacity[at(11, 1)]],
+	[25, 25]
+);
+check(
+	'a stone outcrop never runs down, so it counts nothing',
+	[map.body.tileQuantity[at(14, 3)], map.body.tileCapacity[at(14, 3)]],
+	[null, null]
+);
+check(
+	'ground that yields nothing counts nothing',
+	[map.body.tileQuantity[at(0, 0)], map.body.tileCapacity[at(0, 0)]],
+	[null, null]
+);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

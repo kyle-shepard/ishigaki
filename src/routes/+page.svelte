@@ -194,7 +194,14 @@
 	function tileLabel(i: number, x: number, y: number) {
 		const t = terrainAt(i);
 		if (!t) return `Tile ${x}, ${y}`;
-		const yield_ = t.yieldsResourceId ? ` — yields ${resourceName.get(t.yieldsResourceId)}` : '';
+		// Floored, so a tile reading "1 of 25" always has a whole unit in it and one reading
+		// "0 of 25" really is stripped.
+		const left = world!.tileQuantity[i];
+		const full = world!.tileCapacity[i];
+		const yield_ = t.yieldsResourceId
+			? ` — yields ${resourceName.get(t.yieldsResourceId)}` +
+				(left !== null && full !== null ? ` (${Math.floor(left)} of ${full} left)` : '')
+			: '';
 		const built = world!.buildings.find((b) => b.x === x && b.y === y);
 		const site = world!.operations.find(
 			(o) => o.type === 'build' && o.destX === x && o.destY === y

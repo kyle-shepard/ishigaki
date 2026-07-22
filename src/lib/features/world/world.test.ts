@@ -58,36 +58,49 @@ test('a zero-length trip is 0 seconds, not NaN', () => {
 	assert.equal(travelSeconds(4, 4, 4, 4, 0.5, lake), 0);
 });
 
-// Accrual. This is the one mechanic that cannot be verified by watching it — the numbers it
-// gets wrong are the ones that only show up after a week away — so the arithmetic is pinned
-// here rather than in the browser.
+// Accrual. This is the one mechanic that cannot be verified by watching it — a thirty-day
+// regrowth is not a test anyone runs — so the arithmetic is pinned here rather than in the
+// browser. `accrue` is pure and takes no database, which is what makes that possible.
 
-test('a worker takes their rate, prorated by the hour', () => {
-	assert.equal(accrue(3, 3600), 3);
-	assert.equal(accrue(3, 1200), 1);
-	assert.equal(accrue(12, 300), 1);
+const HOUR = 3600;
+const DAY = 24 * HOUR;
+// A forest tile as seeded: 25 trees, back to full in thirty days.
+const forest = (quantity: number, agedSeconds: number) => ({
+	quantity,
+	capacity: 25,
+	regrowSeconds: 30 * DAY,
+	agedSeconds
+});
+
+test('an infinite deposit just pays the rate, prorated by the hour', () => {
+	assert.equal(accrue(3, HOUR, null).harvested, 3);
+	assert.equal(accrue(3, 1200, null).harvested, 1);
+	assert.equal(accrue(12, 300, null).harvested, 1);
+	// Nothing to count down, so nothing to report.
+	assert.equal(accrue(3, HOUR, null).quantity, null);
 });
 
 test('nothing has been earned before any time passes', () => {
-	assert.equal(accrue(3, 0), 0);
+	assert.equal(accrue(3, 0, null).harvested, 0);
 });
 
 test('time that has not happened yet pays nothing, rather than owing', () => {
 	// `accrued_at` starts when the worker *arrives*, so every read during the walk asks about
 	// a negative interval. Answering with a negative number would drain stock on a refresh.
-	assert.equal(accrue(3, -600), 0);
+	assert.equal(accrue(3, -600, null).harvested, 0);
+	assert.equal(accrue(3, -600, forest(25, -600)).quantity, 25);
 });
 
 test('a rate of zero is a tile that is on the map but not yet wired', () => {
-	assert.equal(accrue(0, 86_400), 0);
+	assert.equal(accrue(0, DAY, null).harvested, 0);
 });
 
 test('a week away equals a hundred visits — the property a tick would break', () => {
-	const week = 7 * 24 * 3600;
-	const away = accrue(3, week);
+	const week = 7 * DAY;
+	const away = accrue(3, week, null).harvested;
 
 	let watched = 0;
-	for (let i = 0; i < 100; i++) watched += accrue(3, week / 100);
+	for (let i = 0; i < 100; i++) watched += accrue(3, week / 100, null).harvested;
 
 	// The model is resolution-independent — the integral is linear, so how often you look
 	// cannot change the total. What separates these two numbers is only the drift of adding
@@ -97,4 +110,63 @@ test('a week away equals a hundred visits — the property a tick would break', 
 	// precisely so that this stays drift and never becomes truncation. If a future change
 	// rounds on each read, this gap goes to ~50 units and the assertion fails loudly.
 	assert.ok(Math.abs(watched - away) < 1e-9, `drifted by ${Math.abs(watched - away)}`);
+});
+
+test('a worked forest thins, and stops at exactly zero rather than going below', () => {
+	// Eight hours at 3/h is 24 of the 25 trees, less the trickle that grew back meanwhile.
+	const eight = accrue(3, 8 * HOUR, forest(25, 8 * HOUR));
+	assert.ok(eight.quantity! > 0 && eight.quantity! < 2, `left ${eight.quantity}`);
+
+	// A month of chopping cannot take more than the tile ever held plus what grew.
+	const month = accrue(3, 30 * DAY, forest(25, 30 * DAY));
+	assert.equal(month.quantity, 0);
+	assert.equal(month.harvested, 25 + 25, 'everything that was there plus one full regrowth');
+});
+
+test('an emptied tile still yields the regrowth, and only that', () => {
+	// The trickle, kept deliberately: the worker is cutting saplings. At 1 tree per 29 hours
+	// against 1 per 20 minutes it reads as "this forest is finished" without a special case
+	// that says so — and killing it would mean pausing regrowth under a standing worker,
+	// making a tile's recovery depend on whether somebody happens to be there.
+	const hour = accrue(3, HOUR, forest(0, HOUR));
+	assert.equal(hour.quantity, 0);
+	assert.equal(hour.harvested, 25 / (30 * 24), 'exactly what grew');
+	assert.ok(hour.harvested < 3 / 80, 'and under an eightieth of the full rate');
+});
+
+test('an abandoned tile regrows to exactly full, and no further', () => {
+	// Nobody on it: rate zero, no worked time, only the tile's own clock running.
+	assert.equal(accrue(0, 0, forest(0, 15 * DAY)).quantity, 12.5);
+	assert.equal(accrue(0, 0, forest(0, 30 * DAY)).quantity, 25);
+	assert.equal(accrue(0, 0, forest(0, 300 * DAY)).quantity, 25, 'clamped at capacity');
+	assert.equal(accrue(0, 0, forest(25, 300 * DAY)).quantity, 25);
+});
+
+test('the display path and the work path agree over the same interval', () => {
+	// `readWorld` projects an abandoned tile forward with no worker on it and writes nothing.
+	// If it disagreed with the branch that does write, a forest would read one number and be
+	// stored as another.
+	const displayed = accrue(0, 0, forest(4, 3 * DAY));
+	const worked = accrue(0, 3 * DAY, forest(4, 3 * DAY));
+	assert.equal(displayed.quantity, worked.quantity);
+});
+
+test('a week away on a finite tile equals many visits', () => {
+	const week = 7 * DAY;
+	const away = accrue(3, week, forest(25, week));
+
+	let q = 25;
+	let taken = 0;
+	for (let i = 0; i < 200; i++) {
+		const step = accrue(3, week / 200, forest(q, week / 200));
+		taken += step.harvested;
+		q = step.quantity!;
+	}
+	// Conservation is why this holds even though the tile empties partway through: whatever
+	// route you take, the total taken is what was there plus what grew, minus what is left.
+	assert.ok(
+		Math.abs(taken - away.harvested) < 1e-9,
+		`harvest drifted by ${taken - away.harvested}`
+	);
+	assert.ok(Math.abs(q - away.quantity!) < 1e-9, `stock drifted by ${q - away.quantity!}`);
 });

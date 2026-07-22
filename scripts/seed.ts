@@ -31,7 +31,7 @@ if (players > 0 && !process.argv.includes('--wipe')) {
 
 // ponytail: truncate-and-reseed, not idempotent upserts — no data worth keeping yet.
 await db.execute(
-	sql`TRUNCATE operation, building, character, building_cost, building_type, stock, settlement, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
+	sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
 );
 
 // Only the global catalog is seeded now. Players, hamlets, and characters are created on
@@ -113,7 +113,15 @@ const TERRAIN = [
 		icon: 'forest',
 		buildable: true,
 		movementCost: 2.0,
-		yields: 'Wood'
+		yields: 'Wood',
+		// A tile is about 20 m square — it fits a house — so ~400 m², or 0.04 ha. At roughly
+		// 600 mature stems per hectare that is ~25 trees, and one tree is one Wood.
+		//
+		// At 3 Wood an hour a tile is stripped in about eight hours; it comes back in thirty
+		// days. That ~90x gap is the whole mechanic: clear-cutting is a mistake you feel for a
+		// month, and it is what pushes you outward to new ground.
+		capacity: 25,
+		regrowSeconds: 30 * 24 * 3600
 	},
 	{
 		char: 'c',
@@ -169,7 +177,8 @@ const terrainRows = await db
 			icon: t.icon,
 			buildable: t.buildable,
 			movementCost: t.movementCost,
-			yieldsResourceId: t.yields ? res[t.yields] : null
+			yieldsResourceId: t.yields ? res[t.yields] : null,
+			regrowSeconds: t.regrowSeconds ?? null
 		}))
 	)
 	.returning();
@@ -202,9 +211,6 @@ const LAYOUT = [
 	'..........immmmm'
 ];
 
-// How much a fresh deposit holds. Tuning value, one number, no reader yet.
-const DEPOSIT_QUANTITY = 1000;
-
 // A typo must fail the seed, not quietly produce a 255-tile world.
 if (LAYOUT.length !== 16) throw new Error(`LAYOUT has ${LAYOUT.length} rows, expected 16`);
 const tiles = LAYOUT.flatMap((row, y) => {
@@ -212,14 +218,13 @@ const tiles = LAYOUT.flatMap((row, y) => {
 	return [...row].map((char, x) => {
 		const t = byChar.get(char);
 		if (!t) throw new Error(`LAYOUT (${x}, ${y}): unknown terrain char '${char}'`);
-		return {
-			x,
-			y,
-			terrainTypeId: t.id,
-			// The invariant "yields ⇒ quantity" is held here by construction. A cross-table CHECK
-			// can't express it without denormalizing, and this is the only writer.
-			quantity: t.yieldsResourceId ? DEPOSIT_QUANTITY : null
-		};
+		const spec = TERRAIN.find((s) => s.char === char)!;
+		// The invariant is "finite ⇔ regrow_seconds is set ⇔ quantity is set". A cross-table
+		// CHECK can't express it without denormalizing, and this is the only writer, so it is
+		// held here by construction — a terrain with one and not the other cannot be written.
+		if ((spec.capacity === undefined) !== (spec.regrowSeconds === undefined))
+			throw new Error(`${spec.displayName}: capacity and regrowSeconds must be set together`);
+		return { x, y, terrainTypeId: t.id, quantity: spec.capacity ?? null };
 	});
 });
 

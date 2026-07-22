@@ -4,6 +4,7 @@ import {
 	boolean,
 	check,
 	doublePrecision,
+	foreignKey,
 	integer,
 	pgTable,
 	primaryKey,
@@ -140,7 +141,11 @@ export const terrainType = pgTable('terrain_type', {
 	icon: text('icon').notNull(),
 	buildable: boolean('buildable').notNull(),
 	movementCost: real('movement_cost').notNull(),
-	yieldsResourceId: integer('yields_resource_id').references(() => resource.id)
+	yieldsResourceId: integer('yields_resource_id').references(() => resource.id),
+	// How long an emptied deposit takes to come back to full. Null means it never empties —
+	// a quarry does not run out on this timescale, a forest does. One nullable column rather
+	// than a flag plus a duration, so "infinite" cannot disagree with "regrows in 0s".
+	regrowSeconds: integer('regrow_seconds')
 });
 
 // Natural key, unlike `building`'s serial + unique index. The rule: surrogate key for rows
@@ -156,13 +161,43 @@ export const tile = pgTable(
 		terrainTypeId: integer('terrain_type_id')
 			.notNull()
 			.references(() => terrainType.id),
-		// ponytail: written by the seed, read by nothing until extraction exists. Carried now
-		// because how much a vein holds is a tuning value (VISION #10) and the seed is where
-		// tuning values are recorded — not because backfilling would be expensive, since tile
-		// is truncate-and-reseeded derived data.
+		// Capacity — how much this deposit holds when full. Global, seeded, and never written
+		// at runtime; the live amount is per-player and lives in `tile_stock`. Null where the
+		// deposit is infinite or the ground yields nothing at all.
 		quantity: integer('quantity')
 	},
 	(t) => [primaryKey({ columns: [t.x, t.y] })]
+);
+
+// How much of a finite deposit *this player* has left. Per-player and not a column on `tile`
+// for the same reason `building` is player-scoped: the grid is shared but the sandboxes are
+// not (VISION #4 interim override), and one player's clear-cut must not thin another's
+// forest. Scarcity here is against the map, not against a neighbour.
+//
+// Rows are created lazily on first harvest — no row means the tile is untouched and therefore
+// full, so 256 rows per player never materialise.
+export const tileStock = pgTable(
+	'tile_stock',
+	{
+		playerId: integer('player_id')
+			.notNull()
+			.references(() => player.id),
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		quantity: doublePrecision('quantity').notNull(),
+		/** When `quantity` was last measured. Regrowth is integrated from here. */
+		asOf: timestamp('as_of', { withTimezone: true }).notNull()
+	},
+	(t) => [
+		primaryKey({ columns: [t.playerId, t.x, t.y] }),
+		// Free, since tile's primary key is already (x, y) — and without it a typo'd coordinate
+		// would quietly create stock on a tile that does not exist.
+		foreignKey({ columns: [t.x, t.y], foreignColumns: [tile.x, tile.y] }),
+		// "A forest tile yields below zero trees" is a stated failure. The upper bound cannot be
+		// a CHECK — capacity lives on another table — so the clamp in `accrue` is the only guard
+		// there, and its test carries that weight.
+		check('tile_stock_non_negative', sql`${t.quantity} >= 0`)
+	]
 );
 
 // (x, y) is the position when idle; during travel it is derived from the active operation.
