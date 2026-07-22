@@ -1,33 +1,162 @@
 // Run: npm run seed   (Node 24 strips TS natively, so this needs no build step.)
-// $lib/server/db is unimportable outside Vite ($env alias), so build our own handle —
+// $lib/server/db is unimportable outside Vite ($env alias), so build our own handle â€”
 // same as drizzle.config.ts does.
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { sql } from 'drizzle-orm';
-import { buildingType } from '../src/lib/server/db/schema.ts';
+import { buildingType, resource, terrainType, tile } from '../src/lib/server/db/schema.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);
 const db = drizzle(client);
 
-// ponytail: truncate-and-reseed, not idempotent upserts — no data worth keeping yet.
+// ponytail: truncate-and-reseed, not idempotent upserts â€” no data worth keeping yet.
 //
 // Note this drops every player, so it invalidates every visitor's cookie: everyone who had
 // a world gets a brand-new one on their next request. Harmless while worlds are disposable,
 // and the reason ensurePlayer() verifies the cookie's id rather than trusting it.
 await db.execute(
-	sql`TRUNCATE operation, building, character, building_type, player RESTART IDENTITY CASCADE`
+	sql`TRUNCATE operation, building, character, building_type, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
 );
 
 // Only the global catalog is seeded now. Players, hamlets, and characters are created on
-// demand by ensurePlayer() when a visitor first hits the API — seeding one here would just
+// demand by ensurePlayer() when a visitor first hits the API â€” seeding one here would just
 // make an orphan world nobody holds the cookie for.
 const [house] = await db
 	.insert(buildingType)
 	.values({ displayName: 'House', buildSeconds: 20 })
 	.returning();
 
+const resources = await db
+	.insert(resource)
+	.values([
+		{ displayName: 'Wood' },
+		{ displayName: 'Stone' },
+		{ displayName: 'Clay' },
+		{ displayName: 'Iron ore' }
+	])
+	.returning();
+const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));
+
+// Movement costs are tuning data (VISION #10), not physics: the spread is chosen to be
+// perceptible, not realistic. Deposits are buildable=true because a terrain-level false
+// would also block the future mine â€” so yes, a House can squat on an iron vein. That
+// friction is what motivates a per-(building_type, terrain_type) matrix later.
+const TERRAIN = [
+	{ char: '.', displayName: 'Meadow', color: '#a3c76d', buildable: true, movementCost: 1.0 },
+	{
+		char: 'f',
+		displayName: 'Forest',
+		color: '#2f6b34',
+		buildable: true,
+		movementCost: 2.0,
+		yields: 'Wood'
+	},
+	{
+		char: 'c',
+		displayName: 'Clay pit',
+		color: '#d08b4f',
+		buildable: true,
+		movementCost: 1.5,
+		yields: 'Clay'
+	},
+	{
+		char: 's',
+		displayName: 'Stone outcrop',
+		color: '#b0b3b8',
+		buildable: true,
+		movementCost: 2.5,
+		yields: 'Stone'
+	},
+	{
+		char: 'i',
+		displayName: 'Iron vein',
+		color: '#7a3b2e',
+		buildable: true,
+		movementCost: 2.5,
+		yields: 'Iron ore'
+	},
+	{ char: 'm', displayName: 'Mountain', color: '#6b6259', buildable: false, movementCost: 5.0 },
+	{ char: 'w', displayName: 'Water', color: '#2f6fb5', buildable: false, movementCost: 8.0 }
+];
+
+const terrainRows = await db
+	.insert(terrainType)
+	.values(
+		TERRAIN.map((t) => ({
+			displayName: t.displayName,
+			color: t.color,
+			buildable: t.buildable,
+			movementCost: t.movementCost,
+			yieldsResourceId: t.yields ? res[t.yields] : null
+		}))
+	)
+	.returning();
+const byChar = new Map(TERRAIN.map((t, i) => [t.char, terrainRows[i]]));
+
+// Hand-authored, one char per terrain â€” diffable in a PR and editable in place. A 16-line
+// string block is easy enough to iterate on that a generator would be inventing a problem;
+// real world generation belongs to the world-gen epic, at a size where this actually fails.
+//
+// Load-bearing: from the character's start tile (7,9) this gives two equal-distance (7 tile)
+// orders to buildable destinations â€” (14,9) across open meadow, and (7,2) through five tiles
+// of lake. That pair is what demonstrates terrain slowing travel. Editing the lake or the
+// row-9 corridor invalidates it.
+const LAYOUT = [
+	'mmmmmm....fff..m',
+	'mmimm....ffff..m',
+	'mmmm.....fff....',
+	'.mm..www...f..s.',
+	'....wwwww.......',
+	'...wwwwwww..c...',
+	'...wwwwww.......',
+	'....wwww........',
+	'................',
+	'................',
+	'..ff............',
+	'.ffff..........s',
+	'.fffff..........',
+	'..fff..........m',
+	'c..f........mmm.',
+	'..........immmmm'
+];
+
+// How much a fresh deposit holds. Tuning value, one number, no reader yet.
+const DEPOSIT_QUANTITY = 1000;
+
+// A typo must fail the seed, not quietly produce a 255-tile world.
+if (LAYOUT.length !== 16) throw new Error(`LAYOUT has ${LAYOUT.length} rows, expected 16`);
+const tiles = LAYOUT.flatMap((row, y) => {
+	if (row.length !== 16) throw new Error(`LAYOUT row ${y} is ${row.length} chars, expected 16`);
+	return [...row].map((char, x) => {
+		const t = byChar.get(char);
+		if (!t) throw new Error(`LAYOUT (${x}, ${y}): unknown terrain char '${char}'`);
+		return {
+			x,
+			y,
+			terrainTypeId: t.id,
+			// The invariant "yields â‡’ quantity" is held here by construction. A cross-table CHECK
+			// can't express it without denormalizing, and this is the only writer.
+			quantity: t.yieldsResourceId ? DEPOSIT_QUANTITY : null
+		};
+	});
+});
+
+// Every new player's hamlet and character land on these tiles (START in world.server.ts), so
+// the layout is authored around them. A one-character typo could put someone in a lake.
+const meadowAt = (x: number, y: number) => {
+	const name = terrainRows.find((t) => t.id === tiles[y * 16 + x].terrainTypeId)!.displayName;
+	if (name !== 'Meadow') throw new Error(`start tile (${x}, ${y}) is ${name}, must be Meadow`);
+	return name;
+};
+meadowAt(7, 8);
+meadowAt(7, 9);
+
+await db.insert(tile).values(tiles);
+
 console.log(
-	`seeded: building type ${house.id} (House). Players self-create on first visit — no player rows.`
+	`seeded: building type ${house.id} (House), ${resources.length} resources, ` +
+		`${terrainRows.length} terrain types, ${tiles.length} tiles; start tiles (7,8) and (7,9) are Meadow. ` +
+		`Players self-create on first visit â€” no player rows.`
 );
 await client.end();

@@ -1,6 +1,15 @@
 import { and, eq, lte, notInArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
-import { building, buildingType, character, operation, player } from '$lib/server/db/schema';
+import {
+	building,
+	buildingType,
+	character,
+	operation,
+	player,
+	resource,
+	terrainType,
+	tile
+} from '$lib/server/db/schema';
 import { GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
 
 // Where a new sandbox starts. Every player gets the same coordinates because they never
@@ -179,6 +188,11 @@ export async function createBuildOrder(
 export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload> {
 	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
 	const types = await tx.select().from(buildingType);
+	// Terrain and resources are global catalogs, unfiltered by player — same split as
+	// buildingTypes. The ground is the world's, not yours.
+	const terrainTypes = await tx.select().from(terrainType);
+	const resources = await tx.select().from(resource);
+	const tiles = await tx.select().from(tile);
 	const buildings = await tx.select().from(building).where(eq(building.playerId, playerId));
 	const characters = await tx.select().from(character).where(eq(character.playerId, playerId));
 	const operations = await tx
@@ -186,9 +200,34 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		.from(operation)
 		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
 
+	// Built by index, not by sort order: `terrain` is positional, so one missing row would
+	// shift every tile after it and render a wrong-but-plausible map. The check is that the
+	// array we send is dense — a row *count* would pass on 256 rows with out-of-range
+	// coordinates and still leave holes. A hole is a corrupt world, not a game rule, so it
+	// throws rather than degrading.
+	const terrain: number[] = new Array(GRID_SIZE * GRID_SIZE);
+	for (const t of tiles) terrain[t.y * GRID_SIZE + t.x] = t.terrainTypeId;
+	for (let i = 0; i < terrain.length; i++) {
+		if (terrain[i] !== undefined) continue;
+		throw new Error(
+			tiles.length === 0
+				? 'no tile rows — the grid is unseeded; run `npm run seed` against this database'
+				: `tile grid has a hole at (${i % GRID_SIZE}, ${Math.floor(i / GRID_SIZE)})`
+		);
+	}
+
 	return {
 		now: new Date(now).toISOString(),
 		gridSize: GRID_SIZE,
+		terrainTypes: terrainTypes.map((t) => ({
+			id: t.id,
+			displayName: t.displayName,
+			color: t.color,
+			buildable: t.buildable,
+			yieldsResourceId: t.yieldsResourceId
+		})),
+		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName })),
+		terrain,
 		buildingTypes: types.map((t) => ({
 			id: t.id,
 			displayName: t.displayName,

@@ -1,4 +1,14 @@
-import { integer, pgTable, real, serial, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+import {
+	boolean,
+	integer,
+	pgTable,
+	primaryKey,
+	real,
+	serial,
+	text,
+	timestamp,
+	uniqueIndex
+} from 'drizzle-orm/pg-core';
 
 // Infrastructure-only table proving the app→Drizzle→Postgres path. Not a game entity.
 export const healthCheck = pgTable('health_check', {
@@ -38,6 +48,48 @@ export const building = pgTable(
 	// state. Drop player_id from this index and from the occupancy checks in world.server.ts
 	// to restore it, once players are meant to see each other.
 	(t) => [uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y)]
+);
+
+// What a tile can produce. A type catalog only — no stock, no inventory; extraction is a
+// later epic and is the first thing that will read this.
+export const resource = pgTable('resource', {
+	id: serial('id').primaryKey(),
+	displayName: text('display_name').notNull()
+});
+
+// A deposit is a terrain type, not an overlay on one: "iron vein" is a row with a yield,
+// meadow is a row without. One table until something needs iron to sit *on* mountain.
+// color is presentation data on the type row, same as display_name (VISION #10) — it goes
+// straight into the tile's background with no client-side lookup table to keep in sync.
+export const terrainType = pgTable('terrain_type', {
+	id: serial('id').primaryKey(),
+	displayName: text('display_name').notNull(),
+	color: text('color').notNull(),
+	buildable: boolean('buildable').notNull(),
+	movementCost: real('movement_cost').notNull(),
+	yieldsResourceId: integer('yields_resource_id').references(() => resource.id)
+});
+
+// Natural key, unlike `building`'s serial + unique index. The rule: surrogate key for rows
+// that get created and destroyed and referenced by id; natural key for a fixed exhaustive
+// set. There are exactly GRID_SIZE² tiles forever, (x, y) *is* the identity, and nothing
+// references a tile — a serial would be a second identity with no reader. The composite PK
+// is also exactly the index the buildable lookup wants, so it costs one index fewer.
+export const tile = pgTable(
+	'tile',
+	{
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		terrainTypeId: integer('terrain_type_id')
+			.notNull()
+			.references(() => terrainType.id),
+		// ponytail: written by the seed, read by nothing until extraction exists. Carried now
+		// because how much a vein holds is a tuning value (VISION #10) and the seed is where
+		// tuning values are recorded — not because backfilling would be expensive, since tile
+		// is truncate-and-reseeded derived data.
+		quantity: integer('quantity')
+	},
+	(t) => [primaryKey({ columns: [t.x, t.y] })]
 );
 
 // (x, y) is the position when idle; during travel it is derived from the active operation.

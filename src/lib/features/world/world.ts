@@ -7,11 +7,25 @@ export type OrderReason =
 
 export type OrderRequest = { x: number; y: number; buildingTypeId: number };
 
-// ponytail: the whole world, every read — 16×16 with one character is under 2 KB, smaller
-// than a diff protocol's own HTTP headers. Viewport culling belongs to the map-client epic.
+// ponytail: the whole world, every read. Terrain now dominates the payload — 256 small ints
+// row-major is ~700 B, so a full read is ~1.3 KB, still smaller than a diff protocol's own
+// HTTP headers. (An array of 256 tile *objects* would have been ~10 KB; that's why it isn't.)
+// Viewport culling belongs to the map-client epic.
 export type WorldPayload = {
 	now: string;
 	gridSize: number;
+	terrainTypes: {
+		id: number;
+		displayName: string;
+		color: string;
+		buildable: boolean;
+		yieldsResourceId: number | null;
+	}[];
+	resources: { id: number; displayName: string }[];
+	// Row-major, index = y * gridSize + x, value = terrainTypeId — the same flat indexing the
+	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
+	// client estimates travel.
+	terrain: number[];
 	buildingTypes: { id: number; displayName: string; buildSeconds: number }[];
 	buildings: { id: number; x: number; y: number; buildingTypeId: number }[];
 	characters: { id: number; x: number; y: number; speed: number }[];

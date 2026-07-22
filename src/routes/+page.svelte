@@ -124,6 +124,19 @@
 		x: i % GRID_SIZE,
 		y: Math.floor(i / GRID_SIZE)
 	}));
+	// `terrain` is row-major over the same index this array was built from, so tiles[i] and
+	// terrain[i] line up with no second indexing concept.
+	const terrainById = $derived(new Map(world?.terrainTypes.map((t) => [t.id, t]) ?? []));
+	const resourceName = $derived(new Map(world?.resources.map((r) => [r.id, r.displayName]) ?? []));
+	const terrainAt = (i: number) => terrainById.get(world!.terrain[i]);
+	// 256 identical buttons to a screen reader today — terrain is the first thing that tells
+	// them apart.
+	function tileLabel(i: number, x: number, y: number) {
+		const t = terrainAt(i);
+		if (!t) return `Tile ${x}, ${y}`;
+		const yield_ = t.yieldsResourceId ? ` — yields ${resourceName.get(t.yieldsResourceId)}` : '';
+		return `Tile ${x}, ${y} — ${t.displayName}${yield_}`;
+	}
 	const typeName = (id: number) =>
 		world?.buildingTypes.find((t) => t.id === id)?.displayName ?? '?';
 	// A character with an in-progress operation is walking or building; its stored tile is
@@ -139,8 +152,13 @@
 
 {#if world}
 	<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
-		{#each tiles as t (t.x + ',' + t.y)}
-			<button class="tile" onclick={() => order(t.x, t.y)} aria-label="Tile {t.x}, {t.y}"></button>
+		{#each tiles as t, i (t.x + ',' + t.y)}
+			<button
+				class="tile"
+				style="background: {terrainAt(i)?.color}"
+				onclick={() => order(t.x, t.y)}
+				aria-label={tileLabel(i, t.x, t.y)}
+			></button>
 		{/each}
 		{#each world.buildings as b (b.id)}
 			<div class="building" style="transform: translate({b.x * CELL}px, {b.y * CELL}px)">
@@ -174,14 +192,14 @@
 	.tile {
 		width: var(--cell);
 		height: var(--cell);
-		border: 1px solid #ddd;
+		border: 1px solid rgba(0, 0, 0, 0.15);
 		box-sizing: border-box;
-		background: none;
 		padding: 0;
 		cursor: pointer;
 	}
+	/* Brightness, not a background: a hover colour would erase the terrain underneath. */
 	.tile:hover {
-		background: #eef;
+		filter: brightness(1.12);
 	}
 	/* Overlays are absolutely positioned and moved with transform: animating left/top would
 	   relayout all 256 cells every frame. */
