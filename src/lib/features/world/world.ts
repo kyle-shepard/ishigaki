@@ -75,12 +75,45 @@ export function positionAt(op: TravelLeg, nowMs: number): { x: number; y: number
 	};
 }
 
+/**
+ * How long the trip takes, weighted by what it crosses. `cost` takes *integer tile
+ * coordinates* and returns that tile's movement cost; it is required rather than defaulted,
+ * because a default of 1 would hand terrain-free timings back to a caller that forgot to
+ * pass terrain, silently.
+ *
+ * Sampling is the midpoint rule — sample points sit at the centres of n equal sub-segments,
+ * never at the endpoints. Two properties fall out for free: the sample set is invariant
+ * under t → 1−t, so A→B and B→A always agree; and an all-cost-1 path reduces exactly to the
+ * old `ceil(dist / speed)`. Neither endpoint is special-cased — the character stands *on*
+ * its origin tile, so counting half of it is right.
+ *
+ * Rounding (not flooring) each sample to a tile makes integer coordinates tile *centres*,
+ * which is what that half-tile claim means. Flooring would put the character on a corner and
+ * give the origin tile no samples at all when it departs along an axis.
+ *
+ * ponytail: uniform resolution, ~4 samples per tile. Fine at 16×16; a much larger map could
+ * slip a one-tile-wide river between samples, and that is when this needs revisiting.
+ */
 export function travelSeconds(
 	originX: number,
 	originY: number,
 	destX: number,
 	destY: number,
-	speed: number
+	speed: number,
+	cost: (x: number, y: number) => number
 ): number {
-	return Math.ceil(Math.hypot(destX - originX, destY - originY) / speed);
+	const dist = Math.hypot(destX - originX, destY - originY);
+	// Ordering a build on the character's own tile — same case travelFraction guards.
+	if (dist === 0) return 0;
+
+	const n = Math.ceil(dist * 4);
+	let total = 0;
+	for (let i = 0; i < n; i++) {
+		const t = (i + 0.5) / n;
+		total += cost(
+			Math.round(originX + (destX - originX) * t),
+			Math.round(originY + (destY - originY) * t)
+		);
+	}
+	return Math.ceil((dist * (total / n)) / speed);
 }

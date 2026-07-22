@@ -68,5 +68,29 @@ check('(99,0) is off the map', [oob.status, oob.body.reason], [400, 'OUT_OF_BOUN
 const occupied = await order(7, 8, house);
 check('(7,8) holds the hamlet', [occupied.status, occupied.body.reason], [400, 'TILE_OCCUPIED']);
 
+// Terrain has to cost time, not just look different. Both legs are 7 tiles from the
+// character's start tile, so distance is held constant and only the ground differs. The
+// durations come off the public payload — asserting through psql what the wire already
+// exposes would be testing round the back.
+const legs: Record<string, number> = {};
+for (const [x, y, label] of [
+	[14, 9, 'dry'],
+	[7, 2, 'wet']
+] as const) {
+	// A fresh sandbox per leg: the character must depart from (7,9) both times.
+	cookie = '';
+	await api('/api/world');
+	const r = await order(x, y, house);
+	const op = r.body.operations?.[0];
+	if (!op) throw new Error(`order (${x},${y}) was refused: ${JSON.stringify(r.body)}`);
+	legs[label] = (Date.parse(op.travelDoneAt) - Date.parse(op.startedAt)) / 1000;
+}
+// A ratio, not the literals — the spread survives future cost tuning, the numbers wouldn't.
+check(
+	`7 tiles of lake (${legs.wet}s) costs 3x+ the same distance of meadow (${legs.dry}s)`,
+	legs.wet > legs.dry * 3,
+	true
+);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

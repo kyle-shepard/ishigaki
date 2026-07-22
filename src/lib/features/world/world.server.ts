@@ -108,8 +108,8 @@ export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reaso
 /**
  * The grid a build order is judged against: what every tile is made of, keyed the same
  * row-major way the wire payload is. One 256-row read serves both the destination's
- * buildability and (later) the cost of every tile the trip crosses — a point query plus a
- * path query would be two reads for the same rows.
+ * buildability and the cost of every tile the trip crosses — a point query plus a path query
+ * would be two reads over the same rows.
  */
 async function loadGrid(
 	tx: Tx
@@ -157,12 +157,15 @@ export async function createBuildOrder(
 		// Ground before what sits on it: bounds and building type ask "is this request
 		// coherent", terrain asks "is this place legal", occupancy asks "is this place free".
 		const grid = await loadGrid(tx);
-		const ground = grid.get(y * GRID_SIZE + x);
-		// A hole in the grid is a corrupt world, not a game rule. Without this, `undefined`
-		// reads as unbuildable and the player is told they can't build there — a DB fault
-		// dressed up as a rule, which is exactly what the docstring above forbids.
-		if (!ground) throw new Error(`no tile row at (${x}, ${y}) — run \`npm run seed\``);
-		if (!ground.buildable) return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
+		// A hole in the grid is a corrupt world, not a game rule. Falling back to `undefined`
+		// would tell the player they can't build there (a DB fault dressed as a rule, which
+		// the docstring above forbids) and would feed NaN into the travel time.
+		const groundAt = (gx: number, gy: number) => {
+			const g = grid.get(gy * GRID_SIZE + gx);
+			if (!g) throw new Error(`no tile row at (${gx}, ${gy}) — run \`npm run seed\``);
+			return g;
+		};
+		if (!groundAt(x, y).buildable) return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
 
 		// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
 		// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
@@ -200,7 +203,16 @@ export async function createBuildOrder(
 
 		// Every timestamp is computed by Postgres in this one statement. Node's clock never
 		// stamps anything, so the client's interpolation is exact by construction.
-		const travel = travelSeconds(idle.x, idle.y, x, y, idle.speed);
+		// The grid loaded for the buildable check is the same one the path is priced against —
+		// one read, two uses.
+		const travel = travelSeconds(
+			idle.x,
+			idle.y,
+			x,
+			y,
+			idle.speed,
+			(cx, cy) => groundAt(cx, cy).movementCost
+		);
 		await tx.insert(operation).values({
 			playerId,
 			characterId: idle.id,
