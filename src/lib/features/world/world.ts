@@ -18,6 +18,10 @@ export type OrderRequest = { x: number; y: number; buildingTypeId: number };
 export type WorldPayload = {
 	now: string;
 	gridSize: number;
+	// Set by the /api/world route, not by readWorld — it is a fact about *this request*
+	// (the realm you asked for was gone), not about the world. True on exactly one response,
+	// so the client makes it sticky rather than re-reading it.
+	worldReset?: boolean;
 	terrainTypes: {
 		id: number;
 		displayName: string;

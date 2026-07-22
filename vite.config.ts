@@ -19,6 +19,13 @@ export default defineConfig({
 			// already colocates with the Neon database in us-east-1. Set them if that changes.
 			adapter: adapter(),
 
+			// A deployed client keeps running the JS it loaded, against an API that has moved.
+			// SvelteKit already polls its own version manifest and flips `updated` when the
+			// build changes — the page just has to say so (see +page.svelte). The default
+			// version name is the build timestamp, which changes on every deploy, so there is
+			// nothing to configure but the interval.
+			version: { pollInterval: 30_000 },
+
 			typescript: {
 				config: (config) => {
 					config.include.push('../drizzle.config.ts');

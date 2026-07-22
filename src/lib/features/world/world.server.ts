@@ -18,26 +18,36 @@ const START = { hamletX: 7, hamletY: 8, characterX: 7, characterY: 9, speed: 0.5
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
+export type PlayerSession = {
+	playerId: number;
+	/** True when the caller arrived holding a realm that no longer exists — see below. */
+	worldReset: boolean;
+};
+
 /**
  * Resolves the caller's sandbox, creating one on first visit. Returns the id to store in
  * the cookie.
  *
- * `id` is whatever the cookie claimed, and is not trusted: a reseed drops every player, so
- * a returning browser can hold an id that no longer exists. Verifying costs one primary-key
- * lookup and turns that case into a fresh world instead of a silently empty one — no
- * character, no hamlet, no error.
+ * `id` is whatever the cookie claimed, and is not trusted: it can name a player who is gone.
+ * That case used to be papered over — a returning visitor was handed a brand-new realm with
+ * no acknowledgement that their old one had been destroyed. It is reported now instead.
+ *
+ * **This is how a save-breaking change announces itself.** There is no schema-version column
+ * and no compatibility matrix: when a migration genuinely cannot carry realms forward, it
+ * deletes the player rows, and every affected visitor lands here and gets told. A deploy that
+ * preserves saves touches nothing and nobody sees a thing.
  *
  * ponytail: anyone holding a cookie can act as that player. There is no auth here at all;
  * guessing another integer is the whole attack. That is acceptable while the world is
  * disposable, and is what the accounts epic (VISION #10) replaces.
  */
-export async function ensurePlayer(id: number | null): Promise<number> {
+export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 	if (id !== null) {
 		const [found] = await db.select({ id: player.id }).from(player).where(eq(player.id, id));
-		if (found) return found.id;
+		if (found) return { playerId: found.id, worldReset: false };
 	}
 
-	return db.transaction(async (tx) => {
+	const playerId = await db.transaction(async (tx) => {
 		// The building catalog is global and seeded, not per-player. Without it there is no
 		// hamlet to hand out, which is a broken deploy rather than a new-player problem.
 		const [house] = await tx.select().from(buildingType).limit(1);
@@ -57,6 +67,27 @@ export async function ensurePlayer(id: number | null): Promise<number> {
 			speed: START.speed
 		});
 		return p.id;
+	});
+
+	// No cookie at all is a first visit. A cookie naming a player who is gone is a realm that
+	// was destroyed — the same thing from the database's side, a very different thing to say.
+	return { playerId, worldReset: id !== null };
+}
+
+/**
+ * Throws the caller's realm away. Deliberately does *not* mint the replacement: the route
+ * clears the cookie instead, so the next request looks exactly like a first visit and runs
+ * through `ensurePlayer`'s create path. One world-creation path, and a restart the player
+ * asked for never reports itself as a world they lost.
+ */
+export async function deletePlayer(playerId: number): Promise<void> {
+	await db.transaction(async (tx) => {
+		// Children first — the FKs have no ON DELETE CASCADE, and that is the safer default
+		// for rows a player spent real time on.
+		await tx.delete(operation).where(eq(operation.playerId, playerId));
+		await tx.delete(building).where(eq(building.playerId, playerId));
+		await tx.delete(character).where(eq(character.playerId, playerId));
+		await tx.delete(player).where(eq(player.id, playerId));
 	});
 }
 

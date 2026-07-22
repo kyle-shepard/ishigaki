@@ -3,5 +3,5 @@ import type { RequestHandler } from './$types';
 import { loadWorld } from '$lib/features/world/world.server';
 
 export const GET: RequestHandler = async ({ locals }) => {
-	return json(await loadWorld(locals.playerId));
+	return json({ ...(await loadWorld(locals.playerId)), worldReset: locals.worldReset });
 };

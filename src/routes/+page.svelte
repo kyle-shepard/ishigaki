@@ -1,5 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	// SvelteKit polls its own version manifest (interval set in vite.config.ts) and flips this
+	// when the deployed build changes. Rolling our own version field on the world payload
+	// would have been the same feature, written twice.
+	import { updated } from '$app/state';
 	import {
 		GRID_SIZE,
 		positionAt,
@@ -19,6 +23,9 @@
 
 	let world = $state<WorldPayload | null>(null);
 	let message = $state('');
+	// Sticky: the server reports a lost realm on one response only, and a heartbeat refresh
+	// half a minute later must not quietly erase the notice before it has been read.
+	let worldReset = $state(false);
 	// Server time, advanced by rAF. Positions are *derived* from it rather than written by
 	// the loop, so the very first paint is already correct — no frame has to fire first.
 	let nowMs = $state(0);
@@ -26,16 +33,24 @@
 	// The browser clock is never trusted directly — only its offset from the server's.
 	let clockOffset = 0;
 
+	// When the last successful read landed. Drives the idle heartbeat below.
+	let lastReadMs = 0;
+
 	function apply(payload: WorldPayload) {
 		clockOffset = Date.now() - Date.parse(payload.now);
 		world = payload;
 		nowMs = Date.parse(payload.now);
+		lastReadMs = Date.now();
+		if (payload.worldReset) worldReset = true;
 	}
 
 	// The server distinguishes "you broke a game rule" (400 with a reason) from "something
 	// went wrong" (anything else). The client has to keep that distinction visible instead of
 	// applying an error body as if it were a world.
 	const TROUBLE = 'Lost contact with the world. Retrying…';
+	// Slow on purpose: the economy runs in minutes, so this only has to be faster than a
+	// player noticing that a live content edit hasn't landed.
+	const IDLE_REFRESH_MS = 30_000;
 
 	let refreshing = false;
 	async function refresh() {
@@ -61,10 +76,16 @@
 	onMount(() => {
 		let frame: number;
 
-		// Recovery runs on a timer, not on rAF: a backgrounded tab suspends animation frames
-		// entirely, and reconnecting is not a rendering concern.
+		// Runs on a timer, not on rAF: a backgrounded tab suspends animation frames entirely,
+		// and neither reconnecting nor keeping up with the world is a rendering concern.
+		//
+		// Two jobs, one timer. Reconnect attempts stay fast; otherwise this is a slow heartbeat
+		// so that a live content edit (VISION #10 — retune a movement cost, edit a display name,
+		// no deploy) actually reaches an open tab. Without it an idle player never re-reads at
+		// all: refreshes only fired on mount and when an operation came due, so "live on next
+		// read" had no next read.
 		const retry = setInterval(() => {
-			if (message === TROUBLE) refresh();
+			if (message === TROUBLE || Date.now() - lastReadMs > IDLE_REFRESH_MS) refresh();
 		}, 3000);
 
 		const tick = () => {
@@ -121,6 +142,25 @@
 		}
 	}
 
+	async function newGame() {
+		// Native confirm, because this destroys a realm someone spent real time on and the
+		// browser already ships the dialog.
+		if (!confirm('Start a new realm? Everything you have built will be lost.')) return;
+		try {
+			const res = await fetch('/api/new-game', { method: 'POST' });
+			if (!res.ok) throw new Error(`new game failed: ${res.status}`);
+			// The cookie is gone, so the refresh below bootstraps a fresh realm the same way a
+			// first visit does.
+			worldReset = false;
+			message = '';
+			settled.clear();
+			await refresh();
+		} catch (e) {
+			console.error(e);
+			message = TROUBLE;
+		}
+	}
+
 	const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => ({
 		x: i % GRID_SIZE,
 		y: Math.floor(i / GRID_SIZE)
@@ -150,6 +190,21 @@
 
 <h1>石垣 Ishigaki</h1>
 <p>Click any empty tile to order a House.</p>
+
+{#if updated.current}
+	<p class="notice">
+		A new version of the world has been deployed.
+		<!-- Full reload, not goto(): the point is to drop the old JS this tab is running. -->
+		<button onclick={() => location.reload()}>Refresh</button>
+	</p>
+{/if}
+
+{#if worldReset}
+	<p class="notice">
+		Your previous realm couldn't be carried across a change to how the world works, so this is a
+		fresh start. Sorry — the world is still being built.
+	</p>
+{/if}
 
 {#if world}
 	<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
@@ -183,6 +238,8 @@
 {/if}
 
 {#if message}<p class="error">{message}</p>{/if}
+
+<p><button onclick={newGame}>New game</button></p>
 
 <style>
 	.grid {
@@ -242,5 +299,11 @@
 	}
 	.error {
 		color: #b91c1c;
+	}
+	.notice {
+		background: #fef9c3;
+		border-left: 4px solid #ca8a04;
+		padding: 0.5rem 0.75rem;
+		max-width: 34rem;
 	}
 </style>
