@@ -53,9 +53,14 @@ These were argued out and are settled. Change them only with a deliberate revers
    tile uniqueness index.
 
    **Reversal path:** drop `player_id` from the occupancy checks in `world.server.ts` and from
-   `building_tile_idx`, and the shared-world model is back. Do this when the multiplayer shell
-   (#10) lands and players are meant to see each other. Until then, treat any code that assumes
-   world-global tile ownership as wrong.
+   `building_tile_idx`, and the shared-world model is back. Until then, treat any code that
+   assumes world-global tile ownership as wrong.
+
+   **Timing — deliberately late.** Stitching the world back together comes _after_ economy,
+   people, expansion, and borders. Until then this is a set of parallel single-player instances
+   on one geography, and that is the intended state, not a debt being serviced. Every deepening
+   epic is designed against a world with no neighbours in it; contested tiles are a change we
+   make once there is something worth contesting.
 
 5. **Multiplayer-readiness** — **Multi-tenant schema, zero multiplayer features.** Every
    ownable entity carries a `player_id` from day one. No auth, accounts, or politics yet —
@@ -168,8 +173,9 @@ the tracer, the deepening epics have no strict dependency order — prioritize b
 **Issue #1 — Setup** ([#1](https://github.com/kyle-shepard/ishigaki/issues/1), created): the
 empty running skeleton (SvelteKit + Postgres + Drizzle). No game logic.
 
-**Reminder — break the rest into GitHub issues _after_ #1 lands.** The breakdown below is held
-here for that moment, not yet created as issues.
+The core-mechanic trio is now written up as issues; the rest of the breakdown below is held here
+until each is actually next. An epic gets an issue when it's close enough that the issue won't be
+rewritten before anyone reads it.
 
 ### Epic 2 — Tracer bullet (the thin vertical slice)
 
@@ -192,12 +198,14 @@ API, SvelteKit render-and-order, and the travel primitive.
 
 ### Deepening epics (order by feel after the tracer)
 
-3. **Construction depth** — data-driven building catalog; restrict-builders + specialties;
-   cancel/rush; requirements.
-4. **People depth** — two-tier model; commoner aggregate; individual skilled characters with
-   abilities/skills → quality; auto-assign pool; multiple characters.
-5. **Economy & resources** — build costs, production chains, storage. _(turns the tracer into a
-   game fastest — thicken early)_
+3. **Construction depth** ([#7](https://github.com/kyle-shepard/ishigaki/issues/7)) —
+   data-driven building catalog; restrict-builders + specialties; cancel/rush; requirements.
+4. **People depth** ([#8](https://github.com/kyle-shepard/ishigaki/issues/8)) — two-tier model;
+   commoner aggregate; individual skilled characters with abilities/skills → quality;
+   auto-assign pool; multiple characters.
+5. **Economy & resources** ([#6](https://github.com/kyle-shepard/ishigaki/issues/6)) — build
+   costs, production chains, storage. **Running first of the three:** cost is what makes a tile
+   choice matter, and both epics above lean on its answers.
 6. **Time/progression hardening** — robust offline/concurrency resolution (the hard cases the
    tracer stubs); depends on the R-step time-model decision.
 7. **Map client depth** — zoom/LOD tiers, terrain rendering.
@@ -206,8 +214,12 @@ API, SvelteKit render-and-order, and the travel primitive.
 10. **Accounts & multiplayer shell** — auth, player identity. _(schema already ready)_
 11. **Settlement hierarchy & politics** — growth ladder, domains/provinces, vassalage, war.
 
-Recommended first thickenings: **Construction + Economy + People** — the trio that turns
-"a house appears" into "a settlement you're growing." Each epic runs its own QRSPI cycle.
+Also owed, and not yet epics: **expansion** (how a settlement claims more than the tile it
+started on) and **borders** (where one settlement ends). Both sit between People and the
+shared-world reversal, and both are still too vague to write down honestly.
+
+The trio — **Economy → Construction → People** — is what turns "a house appears" into "a
+settlement you're growing." Each epic runs its own QRSPI cycle.
 
 ---
 
