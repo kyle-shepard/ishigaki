@@ -19,7 +19,8 @@
 		UNKNOWN_BUILDING_TYPE: "You can't build that.",
 		TILE_NOT_BUILDABLE: "You can't build on that ground.",
 		TILE_OCCUPIED: 'Something is already on that tile.',
-		NO_IDLE_CHARACTER: 'Everyone is busy.'
+		NO_IDLE_CHARACTER: 'Everyone is busy.',
+		INSUFFICIENT_RESOURCES: "You don't have the materials for that."
 	};
 
 	let world = $state<WorldPayload | null>(null);
@@ -219,6 +220,13 @@
 
 {#if world}
 	<Sprites />
+	<!-- Floored, not rounded: showing 5 Wood when you hold 4.9 and then refusing a 5-Wood
+	     build would read as the server lying. -->
+	<p class="stock">
+		{#each world.stock as s (s.resourceId)}
+			<span><b>{resourceName.get(s.resourceId)}</b> {Math.floor(s.quantity)}</span>
+		{/each}
+	</p>
 	<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
 		{#each tiles as t, i (t.x + ',' + t.y)}
 			<button
@@ -328,6 +336,11 @@
 		opacity: 0.45;
 		outline: 2px dashed #4a3520;
 		outline-offset: -2px;
+	}
+	.stock {
+		display: flex;
+		gap: 1rem;
+		font-variant-numeric: tabular-nums;
 	}
 	.error {
 		color: #b91c1c;

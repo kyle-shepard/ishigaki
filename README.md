@@ -49,20 +49,27 @@ render a world with no ground under it.
 
 > **Secrets:** `.env` is gitignored and has never been committed.
 >
-> **`.env` and production currently point at the same Neon database.** There is no separate
-> development branch — earlier revisions of this file claimed there was, which is worse than
-> saying nothing, because it invites you to run destructive scripts without thinking. Assume
-> everything you do locally is live: migrations apply to production the moment you run them,
-> and ordinary play writes real rows.
+> **Local development and production now use different Neon branches.** `.env` points at the
+> development branch; Vercel's `DATABASE_URL` points at the production one. So `npm run seed`
+> and `npm run db:migrate` no longer touch the live world, and production only migrates when a
+> deploy runs `vercel-build`.
 >
-> `npm run seed` truncates every realm, so it refuses to run when players exist unless you
-> pass `--wipe`. That flag is the only thing standing between a routine reseed and deleting
-> everyone's world.
+> **Do not trust the Neon console's branch names to tell you which is which.** They were
+> misleading here — the branch labelled "dev" was the one Vercel actually served from. Names are
+> a claim; the env var is the fact. Verify empirically before running anything destructive:
 >
-> Splitting the two is real work rather than a second credential: `vercel-build` only runs
-> migrations, so a fresh production branch would serve 500s from `/api/world` until something
-> seeded it. Worth doing before the URL reaches a real player, or before the first migration
-> that drops anything.
+> ```sh
+> # count players locally, hit production twice with no cookie, count again
+> curl -s -o /dev/null https://ishigaki-eosin.vercel.app/api/world   # x2
+> ```
+>
+> Each cookie-less request to `/api/world` mints a player. If your local player count moves,
+> your `.env` is pointed at production — stop. `.env` itself carries the current mapping and
+> how it was established; keep that comment true if you change branches.
+>
+> `npm run seed` truncates every realm, so it refuses to run when players exist unless you pass
+> `--wipe`. With the branches split that flag is now routine locally, and still the last thing
+> standing between a reseed and deleting everyone's world if `.env` is ever wrong.
 
 Verify the full app → Drizzle → Postgres path:
 
@@ -78,9 +85,9 @@ Useful scripts: `npm run check` (type-check), `npm run format` / `npm run lint`
 ## Deployment
 
 Hosted on Vercel, deployed from GitHub: every push to `main` builds and ships. Postgres is
-[Neon](https://neon.tech) — **the same database local development uses**, per the note above.
-`npm run seed -- --wipe` on your machine wipes the live world, and a local `npm run db:migrate`
-migrates production before the code using that schema has shipped.
+[Neon](https://neon.tech), on a **separate branch from the one local development uses** (see the
+note above). A local `npm run seed -- --wipe` or `npm run db:migrate` therefore hits development
+only; production's schema changes when a deploy runs, not when you run a command.
 
 Vercel runs `npm run vercel-build`, which is `drizzle-kit migrate && vite build`. Schema
 changes therefore apply themselves on deploy; there is no "remember to migrate prod"
@@ -89,7 +96,7 @@ should stop the deploy rather than leave the site serving against a schema that 
 match the code.
 
 Configuration is one environment variable in the Vercel project: `DATABASE_URL`, the Neon
-pooled connection string — currently the same branch `.env` points at. Nothing else.
+pooled connection string for the **production** branch — not the one `.env` uses. Nothing else.
 
 It must be ticked for the **Production** environment specifically, not just added. Because
 `vercel-build` migrates, the variable is read at **build** time, not only at runtime — so a

@@ -7,7 +7,8 @@ export type OrderReason =
 	| 'UNKNOWN_BUILDING_TYPE'
 	| 'TILE_NOT_BUILDABLE'
 	| 'TILE_OCCUPIED'
-	| 'NO_IDLE_CHARACTER';
+	| 'NO_IDLE_CHARACTER'
+	| 'INSUFFICIENT_RESOURCES';
 
 export type OrderRequest = { x: number; y: number; buildingTypeId: number };
 
@@ -32,6 +33,11 @@ export type WorldPayload = {
 		yieldsResourceId: number | null;
 	}[];
 	resources: { id: number; displayName: string }[];
+	// What you hold, one entry per resource — fractional, because accrual is continuous. The
+	// client floors it; the server never does.
+	stock: { resourceId: number; quantity: number }[];
+	// What each building type costs. A type with no entries is free.
+	buildingCosts: { buildingTypeId: number; resourceId: number; quantity: number }[];
 	// Row-major, index = y * gridSize + x, value = terrainTypeId — the same flat indexing the
 	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
 	// client estimates travel.

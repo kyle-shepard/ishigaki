@@ -36,7 +36,19 @@ function check(name: string, actual: unknown, expected: unknown) {
 // The first call creates the sandbox, so the cookie exists before any order is placed.
 const world = await api('/api/world');
 if (world.status !== 200) throw new Error(`GET /api/world returned ${world.status}`);
-const house = world.body.buildingTypes[0].id;
+const typeId = (name: string) => {
+	const t = world.body.buildingTypes.find((b: { displayName: string }) => b.displayName === name);
+	if (!t) throw new Error(`no '${name}' building type — seed the database`);
+	return t.id;
+};
+const house = typeId('House');
+const woodHeld = (w: {
+	stock: { resourceId: number; quantity: number }[];
+	resources: { id: number; displayName: string }[];
+}) => {
+	const wood = w.resources.find((r) => r.displayName === 'Wood')!.id;
+	return w.stock.find((s) => s.resourceId === wood)!.quantity;
+};
 
 // Terrain rules. The lake and mountain coordinates are the seed layout's; the accepted three
 // cover plain ground, forest, and a deposit — deposits are buildable by design.
@@ -90,6 +102,47 @@ check(
 	`7 tiles of lake (${legs.wet}s) costs 3x+ the same distance of meadow (${legs.dry}s)`,
 	legs.wet > legs.dry * 3,
 	true
+);
+
+// A build costs, and an order you can't pay for is refused without spending anything. Asserted
+// off the world payload's own stock rather than through psql — same rule as the travel legs,
+// and the cost is read from the payload too, so retuning the row doesn't break the check.
+cookie = '';
+const fresh = await api('/api/world');
+const before = woodHeld(fresh.body);
+const woodId = fresh.body.resources.find(
+	(r: { displayName: string }) => r.displayName === 'Wood'
+).id;
+const houseCost = fresh.body.buildingCosts.find(
+	(c: { buildingTypeId: number; resourceId: number }) =>
+		c.buildingTypeId === house && c.resourceId === woodId
+).quantity;
+
+// On the character's own tile, so the trip is zero-length and only the build itself has to
+// elapse below.
+const bought = await order(7, 9, house);
+check('a House costs Wood', [bought.status, woodHeld(bought.body)], [200, before - houseCost]);
+
+// The idle check runs before the cost check, so seeing INSUFFICIENT_RESOURCES needs a realm
+// that is both broke *and* free — which means waiting out the build above rather than firing a
+// second order at a busy character. The wait is the build time; there is no shortcut that
+// doesn't test a different rule.
+const deadline = Date.now() + 60_000;
+while (Date.now() < deadline) {
+	const w = await api('/api/world');
+	if (w.body.operations.length === 0) break;
+	await new Promise((r) => setTimeout(r, 1000));
+}
+const refused = await order(9, 9, house);
+check(
+	`a House costing ${houseCost} Wood is refused on ${before - houseCost}`,
+	[refused.status, refused.body.reason],
+	[400, 'INSUFFICIENT_RESOURCES']
+);
+check(
+	'a refused order spends nothing',
+	woodHeld((await api('/api/world')).body),
+	before - houseCost
 );
 
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');

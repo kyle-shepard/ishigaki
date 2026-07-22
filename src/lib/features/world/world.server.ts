@@ -1,20 +1,37 @@
-import { and, eq, lte, notInArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, lte, notInArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import {
 	building,
+	buildingCost,
 	buildingType,
 	character,
 	operation,
 	player,
 	resource,
+	settlement,
+	stock,
 	terrainType,
 	tile
 } from '$lib/server/db/schema';
 import { GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
 
 // Where a new sandbox starts. Every player gets the same coordinates because they never
-// see each other (VISION #4 interim override) — the hamlet and its builder, nothing else.
-const START = { hamletX: 7, hamletY: 8, characterX: 7, characterY: 9, speed: 0.5 };
+// see each other (VISION #4 interim override) — the hamlet, the barn beside it, and a builder.
+const START = {
+	hamletX: 7,
+	hamletY: 8,
+	barnX: 8,
+	barnY: 8,
+	characterX: 7,
+	characterY: 9,
+	speed: 0.5
+};
+
+// A grubstake, so a fresh realm can afford its first House before there is any way to
+// gather one. Deliberate scaffolding: it goes to nothing the moment gathering exists.
+// ponytail: keyed by display name because resource ids are seeded serials and this constant
+// outlives none of them — it is deleted next slice.
+const STARTING_STOCK: Record<string, number> = { Wood: 10 };
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -50,16 +67,42 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 	const playerId = await db.transaction(async (tx) => {
 		// The building catalog is global and seeded, not per-player. Without it there is no
 		// hamlet to hand out, which is a broken deploy rather than a new-player problem.
-		const [house] = await tx.select().from(buildingType).limit(1);
-		if (!house) throw new Error('no building_type rows — run `npm run seed` against this database');
+		// Looked up by name, not by `limit(1)`: there is more than one type now, and an
+		// unordered pick would eventually hand somebody a barn to live in.
+		const catalog = new Map((await tx.select().from(buildingType)).map((t) => [t.displayName, t]));
+		const house = catalog.get('House');
+		const barn = catalog.get('Barn');
+		if (!house || !barn)
+			throw new Error(
+				'no House/Barn building_type rows — run `npm run seed` against this database'
+			);
+
+		const resources = await tx.select().from(resource);
+		if (resources.length === 0)
+			throw new Error('no resource rows — run `npm run seed` against this database');
 
 		const [p] = await tx.insert(player).values({}).returning();
-		await tx.insert(building).values({
-			playerId: p.id,
-			x: START.hamletX,
-			y: START.hamletY,
-			buildingTypeId: house.id
-		});
+		const [s] = await tx
+			.insert(settlement)
+			.values({ playerId: p.id, x: START.hamletX, y: START.hamletY })
+			.returning();
+		// A row per resource, present from the start rather than created on first gain: the
+		// deduction is then an UPDATE that either matches a row or does not, with no upsert and
+		// no "is this a new resource or an empty one" question at the till.
+		await tx.insert(stock).values(
+			resources.map((r) => ({
+				settlementId: s.id,
+				resourceId: r.id,
+				quantity: STARTING_STOCK[r.displayName] ?? 0
+			}))
+		);
+		await tx.insert(building).values([
+			{ playerId: p.id, x: START.hamletX, y: START.hamletY, buildingTypeId: house.id },
+			// The barn stores nothing yet and gates nothing — with no capacity there is nothing
+			// for it to read. It is here so "where your stock lives" is a place on the map, and
+			// it is the row capacity will hang off when it arrives.
+			{ playerId: p.id, x: START.barnX, y: START.barnY, buildingTypeId: barn.id }
+		]);
 		await tx.insert(character).values({
 			playerId: p.id,
 			x: START.characterX,
@@ -87,6 +130,15 @@ export async function deletePlayer(playerId: number): Promise<void> {
 		await tx.delete(operation).where(eq(operation.playerId, playerId));
 		await tx.delete(building).where(eq(building.playerId, playerId));
 		await tx.delete(character).where(eq(character.playerId, playerId));
+		await tx
+			.delete(stock)
+			.where(
+				inArray(
+					stock.settlementId,
+					tx.select({ id: settlement.id }).from(settlement).where(eq(settlement.playerId, playerId))
+				)
+			);
+		await tx.delete(settlement).where(eq(settlement.playerId, playerId));
 		await tx.delete(player).where(eq(player.id, playerId));
 	});
 }
@@ -103,10 +155,20 @@ export async function loadWorld(playerId: number): Promise<WorldPayload> {
  * performs writes and what is stored always reflects reality — nothing is computed in memory
  * and thrown away.
  *
- * ponytail: FOR UPDATE over the player's whole in-progress set is a coarse lock. Fine at one
- * player; narrow it when contention is real.
+ * ponytail: the settlement row is a per-player lock — coarse, and taken on reads as well as
+ * writes. Narrow it when a settlement has more than one owner.
  */
 export async function resolveOperations(tx: Tx, playerId: number): Promise<void> {
+	// Every read-modify-write for this player queues behind this one row. It cannot be the
+	// `FOR UPDATE` below instead: that one locks only operations already due, so with nothing
+	// due it names an empty set and Postgres locks nothing — two orders placed at the same
+	// moment would both read the same stock and both spend it.
+	await tx
+		.select({ id: settlement.id })
+		.from(settlement)
+		.where(eq(settlement.playerId, playerId))
+		.for('update');
+
 	const due = await tx
 		.select()
 		.from(operation)
@@ -232,6 +294,32 @@ export async function createBuildOrder(
 			.limit(1);
 		if (!idle) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
 
+		// Cost comes last, because it is the only check that writes: a refusal on any earlier
+		// ground has to leave stock untouched. Deducted at order rather than on completion —
+		// there is no cancel path to refund, and a charge that failed at completion would fail
+		// silently while the player was away, which is exactly when completion happens.
+		const costs = await tx
+			.select()
+			.from(buildingCost)
+			.where(eq(buildingCost.buildingTypeId, buildingTypeId));
+		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
+		if (!home) throw new Error(`player ${playerId} has no settlement`);
+		const held = new Map(
+			(await tx.select().from(stock).where(eq(stock.settlementId, home.id))).map((s) => [
+				s.resourceId,
+				s.quantity
+			])
+		);
+		// Checked in full before anything is spent, so a two-resource cost can't half-pay.
+		if (costs.some((c) => (held.get(c.resourceId) ?? 0) < c.quantity))
+			return { ok: false, reason: 'INSUFFICIENT_RESOURCES' };
+		for (const c of costs) {
+			await tx
+				.update(stock)
+				.set({ quantity: sql`${stock.quantity} - ${c.quantity}` })
+				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, c.resourceId)));
+		}
+
 		// Every timestamp is computed by Postgres in this one statement. Node's clock never
 		// stamps anything, so the client's interpolation is exact by construction.
 		// The grid loaded for the buildable check is the same one the path is priced against —
@@ -266,11 +354,18 @@ export async function createBuildOrder(
 /** The world as stored, plus the DB's own `now` — the only clock anything trusts. */
 export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload> {
 	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
-	const types = await tx.select().from(buildingType);
+	// Ordered, because the client picks a default from this list by position.
+	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
+	const costs = await tx.select().from(buildingCost);
 	// Terrain and resources are global catalogs, unfiltered by player — same split as
 	// buildingTypes. The ground is the world's, not yours.
 	const terrainTypes = await tx.select().from(terrainType);
 	const resources = await tx.select().from(resource);
+	const held = await tx
+		.select({ resourceId: stock.resourceId, quantity: stock.quantity })
+		.from(stock)
+		.innerJoin(settlement, eq(stock.settlementId, settlement.id))
+		.where(eq(settlement.playerId, playerId));
 	const tiles = await tx.select().from(tile);
 	const buildings = await tx.select().from(building).where(eq(building.playerId, playerId));
 	const characters = await tx.select().from(character).where(eq(character.playerId, playerId));
@@ -307,6 +402,12 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			yieldsResourceId: t.yieldsResourceId
 		})),
 		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName })),
+		stock: held,
+		buildingCosts: costs.map((c) => ({
+			buildingTypeId: c.buildingTypeId,
+			resourceId: c.resourceId,
+			quantity: c.quantity
+		})),
 		terrain,
 		buildingTypes: types.map((t) => ({
 			id: t.id,

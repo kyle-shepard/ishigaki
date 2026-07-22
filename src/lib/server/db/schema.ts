@@ -1,5 +1,8 @@
+import { sql } from 'drizzle-orm';
 import {
 	boolean,
+	check,
+	doublePrecision,
 	integer,
 	pgTable,
 	primaryKey,
@@ -61,6 +64,64 @@ export const resource = pgTable('resource', {
 	id: serial('id').primaryKey(),
 	displayName: text('display_name').notNull()
 });
+
+// What a building costs to order. Content, not code (VISION #10): retuning a cost is an
+// UPDATE, and a new building type brings its own rows. No row for a type means it is free.
+export const buildingCost = pgTable(
+	'building_cost',
+	{
+		buildingTypeId: integer('building_type_id')
+			.notNull()
+			.references(() => buildingType.id),
+		resourceId: integer('resource_id')
+			.notNull()
+			.references(() => resource.id),
+		quantity: integer('quantity').notNull()
+	},
+	(t) => [
+		primaryKey({ columns: [t.buildingTypeId, t.resourceId] }),
+		// A zero-cost row and a missing row would mean the same thing said two ways; a negative
+		// one would pay you to build.
+		check('building_cost_positive', sql`${t.quantity} > 0`)
+	]
+);
+
+// Where a player's stock lives. One per player for now — the uniqueness is not decoration:
+// the read-modify-write lock is `WHERE player_id = $1 FOR UPDATE`, and a second row would
+// split the stock in two and lock only whichever came back first.
+export const settlement = pgTable('settlement', {
+	id: serial('id').primaryKey(),
+	playerId: integer('player_id')
+		.notNull()
+		.unique()
+		.references(() => player.id),
+	x: integer('x').notNull(),
+	y: integer('y').notNull()
+});
+
+// Held stock, one row per (settlement, resource). No cap this epic — capacity is a later
+// lever and the barn is where it will hang off.
+export const stock = pgTable(
+	'stock',
+	{
+		settlementId: integer('settlement_id')
+			.notNull()
+			.references(() => settlement.id),
+		resourceId: integer('resource_id')
+			.notNull()
+			.references(() => resource.id),
+		// Not integer: accrual is continuous, and truncating each read would make a player who
+		// refreshes often earn strictly less than one who stays away. Floored for display only.
+		quantity: doublePrecision('quantity').notNull()
+	},
+	(t) => [
+		primaryKey({ columns: [t.settlementId, t.resourceId] }),
+		// "Stock can go negative" is a stated failure condition, and one guarded only by
+		// application code is waiting for the one path that forgets. The app check stays too —
+		// it is what produces the refusal the player reads.
+		check('stock_non_negative', sql`${t.quantity} >= 0`)
+	]
+);
 
 // A deposit is a terrain type, not an overlay on one: "iron vein" is a row with a yield,
 // meadow is a row without. One table until something needs iron to sit *on* mountain.

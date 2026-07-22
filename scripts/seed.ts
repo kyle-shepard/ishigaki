@@ -4,7 +4,14 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { sql } from 'drizzle-orm';
-import { buildingType, player, resource, terrainType, tile } from '../src/lib/server/db/schema.ts';
+import {
+	buildingCost,
+	buildingType,
+	player,
+	resource,
+	terrainType,
+	tile
+} from '../src/lib/server/db/schema.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);
@@ -24,16 +31,22 @@ if (players > 0 && !process.argv.includes('--wipe')) {
 
 // ponytail: truncate-and-reseed, not idempotent upserts — no data worth keeping yet.
 await db.execute(
-	sql`TRUNCATE operation, building, character, building_type, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
+	sql`TRUNCATE operation, building, character, building_cost, building_type, stock, settlement, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
 );
 
 // Only the global catalog is seeded now. Players, hamlets, and characters are created on
 // demand by ensurePlayer() when a visitor first hits the API — seeding one here would just
 // make an orphan world nobody holds the cookie for.
-const [house] = await db
+const buildingTypes = await db
 	.insert(buildingType)
-	.values({ displayName: 'House', icon: 'house', buildSeconds: 20 })
+	.values([
+		{ displayName: 'House', icon: 'house', buildSeconds: 20 },
+		// Where stock is kept. Inert this epic — nothing reads it — but it makes "where your
+		// things are" a place on the map, and it is the row storage capacity will hang off.
+		{ displayName: 'Barn', icon: 'house', buildSeconds: 30 }
+	])
 	.returning();
+const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 
 const resources = await db
 	.insert(resource)
@@ -45,6 +58,12 @@ const resources = await db
 	])
 	.returning();
 const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));
+
+// What a build costs. Rows, not constants: retuning this is an UPDATE against a live world,
+// no deploy (VISION #10).
+await db
+	.insert(buildingCost)
+	.values([{ buildingTypeId: bt['House'], resourceId: res['Wood'], quantity: 6 }]);
 
 // Movement costs are tuning data (VISION #10), not physics: the spread is chosen to be
 // perceptible, not realistic. Deposits are buildable=true because a terrain-level false
@@ -188,13 +207,14 @@ const meadowAt = (x: number, y: number) => {
 	return name;
 };
 meadowAt(7, 8);
+meadowAt(8, 8);
 meadowAt(7, 9);
 
 await db.insert(tile).values(tiles);
 
 console.log(
-	`seeded: building type ${house.id} (House), ${resources.length} resources, ` +
-		`${terrainRows.length} terrain types, ${tiles.length} tiles; start tiles (7,8) and (7,9) are Meadow. ` +
+	`seeded: ${buildingTypes.length} building types, ${resources.length} resources, ` +
+		`${terrainRows.length} terrain types, ${tiles.length} tiles; start tiles (7,8), (8,8) and (7,9) are Meadow. ` +
 		`Players self-create on first visit — no player rows.`
 );
 await client.end();
