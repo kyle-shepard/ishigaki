@@ -69,7 +69,7 @@ Neon **production** branch pooled connection string. Nothing else. If preview
 deployments start failing, give the Preview scope its own `DATABASE_URL` pointing at
 the development branch.
 
-Seeding is deliberately *not* part of the build — `npm run seed` truncates. The
+Seeding is deliberately _not_ part of the build — `npm run seed` truncates. The
 production branch gets seeded by hand, once, and again only when a schema change makes
 the old world invalid:
 
