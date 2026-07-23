@@ -7,6 +7,7 @@ import { eq, sql } from 'drizzle-orm';
 import {
 	buildingCost,
 	buildingType,
+	gameConfig,
 	player,
 	resource,
 	terrainType,
@@ -48,24 +49,42 @@ if (WIPE) {
 const buildingTypes = await db
 	.insert(buildingType)
 	.values([
-		{ displayName: 'House', icon: 'house', buildSeconds: 20 },
+		// housingCapacity is the room a building adds to the population cap; only the House
+		// houses anyone. Tunable (VISION #10) — a bigger dorm is a bigger number here.
+		{ displayName: 'House', icon: 'house', buildSeconds: 20, housingCapacity: 4 },
 		// Where stock is kept. Inert this epic — nothing reads it — but it makes "where your
 		// things are" a place on the map, and it is the row storage capacity will hang off.
-		{ displayName: 'Barn', icon: 'barn', buildSeconds: 30 },
+		{ displayName: 'Barn', icon: 'barn', buildSeconds: 30, housingCapacity: 0 },
 		// The gate. Stone cannot be taken from an outcrop until one of these stands on it.
-		{ displayName: 'Quarry', icon: 'quarry', buildSeconds: 60 },
+		{ displayName: 'Quarry', icon: 'quarry', buildSeconds: 60, housingCapacity: 0 },
 		// The milestone, and the thing the project is named for: 石垣, fitted stone. It is the
 		// first build that needs a resource you cannot simply walk out and pick up.
-		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90 }
+		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90, housingCapacity: 0 }
 	])
 	// Keyed on the name, so re-running against a live world retunes the row a player's
 	// buildings already point at rather than making a second one beside it.
 	.onConflictDoUpdate({
 		target: buildingType.displayName,
-		set: { icon: sql`excluded.icon`, buildSeconds: sql`excluded.build_seconds` }
+		set: {
+			icon: sql`excluded.icon`,
+			buildSeconds: sql`excluded.build_seconds`,
+			housingCapacity: sql`excluded.housing_capacity`
+		}
 	})
 	.returning();
 const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
+
+// The one global-scalar row. Upserted on the fixed id=1 so a live edit retunes the world in
+// place (VISION #10) rather than appending a second row the singleton CHECK would reject.
+// growthPerHour ~2 → a 4-room House fills from 3 settlers in about half an hour, slow enough
+// to feel real, fast enough to watch. Later slices add food/skill columns to this same row.
+await db
+	.insert(gameConfig)
+	.values([{ id: 1, growthPerHour: 2 }])
+	.onConflictDoUpdate({
+		target: gameConfig.id,
+		set: { growthPerHour: sql`excluded.growth_per_hour` }
+	});
 
 // units_per_hour is per worker, flat. Food is fast because forage is the bootstrap floor —
 // it is what a realm with nothing can always do. Zero means seeded on the map but not yet

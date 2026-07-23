@@ -5,6 +5,7 @@ import {
 	buildingCost,
 	buildingType,
 	character,
+	gameConfig,
 	operation,
 	player,
 	resource,
@@ -14,7 +15,14 @@ import {
 	tile,
 	tileStock
 } from '$lib/server/db/schema';
-import { accrue, GRID_SIZE, travelSeconds, type OrderReason, type WorldPayload } from './world';
+import {
+	accrue,
+	GRID_SIZE,
+	grow,
+	travelSeconds,
+	type OrderReason,
+	type WorldPayload
+} from './world';
 
 // Where a new sandbox starts. Every player gets the same coordinates because they never
 // see each other (VISION #4 interim override) — the hamlet, the barn beside it, and a builder.
@@ -183,7 +191,12 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 	// nothing due it locked nothing and two orders placed at the same moment would both read
 	// the same stock and both spend it.
 	const [home] = await tx
-		.select({ id: settlement.id })
+		.select({
+			id: settlement.id,
+			x: settlement.x,
+			y: settlement.y,
+			populationAsOf: settlement.populationAsOf
+		})
 		.from(settlement)
 		.where(eq(settlement.playerId, playerId))
 		.for('update');
@@ -279,6 +292,52 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			.update(character)
 			.set({ x: op.destX, y: op.destY })
 			.where(eq(character.id, op.characterId));
+	}
+
+	// Population, integrated from the settlement's own anchor — the same integrate-on-read shape
+	// as the gather accrual above, no tick. Runs after the operations loop so a later slice's
+	// food drain reads a stock already credited with this pass's foraging (Slice 4's ordering).
+	//
+	// Count all characters (a busy one still eats and still fills a bed), sum housing capacity
+	// over built buildings, and let `grow` decide how many settlers arrive and how far to move
+	// the anchor. New settlers materialize at the hamlet — profession-less rows, the same shape
+	// `ensurePlayer` seeds, so nothing downstream needs to know they were born rather than granted.
+	const [cfg] = await tx.select().from(gameConfig);
+	if (cfg) {
+		const [{ pop }] = await tx
+			.select({ pop: sql<number>`count(*)::int` })
+			.from(character)
+			.where(eq(character.playerId, playerId));
+		const [{ cap }] = await tx
+			.select({ cap: sql<number>`coalesce(sum(${buildingType.housingCapacity}), 0)::int` })
+			.from(building)
+			.innerJoin(buildingType, eq(building.buildingTypeId, buildingType.id))
+			.where(eq(building.playerId, playerId));
+
+		const { born, consumedSeconds } = grow(
+			pop,
+			cap,
+			cfg.growthPerHour,
+			(nowMs - home.populationAsOf.getTime()) / 1000
+		);
+		if (born > 0)
+			await tx.insert(character).values(
+				Array.from({ length: born }, () => ({
+					playerId,
+					x: home.x,
+					y: home.y,
+					speed: START.speed
+				}))
+			);
+		// Advance the anchor by only what `grow` consumed — the sub-settler remainder is carried
+		// by leaving the stored timestamp short, so it re-counts on the next read.
+		if (consumedSeconds > 0)
+			await tx
+				.update(settlement)
+				.set({
+					populationAsOf: sql`${settlement.populationAsOf} + ${`${consumedSeconds} seconds`}::interval`
+				})
+				.where(eq(settlement.id, home.id));
 	}
 }
 

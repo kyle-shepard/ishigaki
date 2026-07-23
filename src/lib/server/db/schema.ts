@@ -38,7 +38,12 @@ export const buildingType = pgTable('building_type', {
 	// called "House" would make both of those pick one arbitrarily.
 	displayName: text('display_name').notNull().unique(),
 	icon: text('icon').notNull(),
-	buildSeconds: integer('build_seconds').notNull()
+	buildSeconds: integer('build_seconds').notNull(),
+	// How many settlers this building houses. The population cap is the SUM over a player's
+	// built buildings, so a House carries a number and everything else is 0 — build a House,
+	// room opens, people arrive. A column, not a constant, so "a dorm holds more" is a row
+	// edit (VISION #10), and so the cap is one relational SUM rather than a rule in code.
+	housingCapacity: integer('housing_capacity').notNull().default(0)
 });
 
 // A row exists only once built — presence *is* built, so there is no status column.
@@ -116,8 +121,28 @@ export const settlement = pgTable('settlement', {
 		.unique()
 		.references(() => player.id),
 	x: integer('x').notNull(),
-	y: integer('y').notNull()
+	y: integer('y').notNull(),
+	// The anchor population growth (and, later, food drain) is integrated from on read — the
+	// same integrate-on-read trick `tile_stock.as_of` uses for regrowth, one timestamp for the
+	// whole settlement. Defaults to now so a fresh realm starts counting from creation; existing
+	// realms backfill to deploy time and grow from then, with no retroactive population.
+	populationAsOf: timestamp('population_as_of', { withTimezone: true }).notNull().defaultNow()
 });
+
+// Global scalars that shape play but aren't per-anything: growth rate now, food and skill
+// tuning as later slices need them. One typed row, not a stringly key/value bag — VISION #10
+// wants these as data, but data with columns a query can read, not strings to parse. The CHECK
+// pins it to a single row so there is never a second, contradicting truth (same instinct as
+// settlement's unique player_id).
+export const gameConfig = pgTable(
+	'game_config',
+	{
+		id: integer('id').primaryKey().default(1),
+		// Settlers gained per real hour while there is spare housing and (Slice 4) food.
+		growthPerHour: real('growth_per_hour').notNull()
+	},
+	(t) => [check('game_config_singleton', sql`${t.id} = 1`)]
+);
 
 // Held stock, one row per (settlement, resource). No cap this epic — capacity is a later
 // lever and the barn is where it will hang off.

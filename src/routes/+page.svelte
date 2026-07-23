@@ -289,6 +289,29 @@
 				})
 			: []
 	);
+
+	// Bodies on the map are dots, and bodies sharing a tile fan into a 2×2 so a stack reads as
+	// a crowd rather than one pawn (LoL-style). A lone body sits centred (slot −1); past four on
+	// a tile the extras are only in the panel's worker list — the map says "a crowd", the panel
+	// says who. Keyed on live position, so it recomputes as workers walk and regroups on arrival.
+	const DOT = 6; // how far a dot sits from cell centre, in the 32-unit viewBox
+	const slotOffset = (slot: number) =>
+		slot < 0 ? [0, 0] : [slot % 2 ? DOT : -DOT, slot < 2 ? -DOT : DOT];
+	const dots = $derived.by(() => {
+		if (!world) return [];
+		const groups = new Map<string, { id: number; x: number; y: number }[]>();
+		for (const c of world.characters) {
+			const p = at(c);
+			const key = `${Math.round(p.x)},${Math.round(p.y)}`;
+			(groups.get(key) ?? groups.set(key, []).get(key)!).push({ id: c.id, x: p.x, y: p.y });
+		}
+		const out: { id: number; x: number; y: number; slot: number }[] = [];
+		for (const arr of groups.values()) {
+			const lone = arr.length === 1;
+			arr.slice(0, 4).forEach((d, i) => out.push({ ...d, slot: lone ? -1 : i }));
+		}
+		return out;
+	});
 </script>
 
 <h1>石垣 Ishigaki</h1>
@@ -361,13 +384,14 @@
 					<use href="#i-{typeIcon(o.buildingTypeId!)}" />
 				</svg>
 			{/each}
-			{#each world.characters as c (c.id)}
+			{#each dots as d (d.id)}
+				{@const off = slotOffset(d.slot)}
 				<svg
 					class="over"
 					viewBox="0 0 32 32"
-					style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
+					style="transform: translate({d.x * CELL}px, {d.y * CELL}px)"
 				>
-					<use href="#i-pawn" />
+					<circle class="dot" cx={16 + off[0]} cy={16 + off[1]} r="5" />
 				</svg>
 			{/each}
 		</div>
@@ -484,6 +508,12 @@
 		width: var(--cell);
 		height: var(--cell);
 		pointer-events: none;
+	}
+	/* A body on the map. Filled dark with a light rim so it reads on any terrain colour. */
+	.dot {
+		fill: #2b2420;
+		stroke: #f5f2ea;
+		stroke-width: 1.5;
 	}
 	/* outline, not border: a border would sit inside the box and shrink the 32px art. */
 	.site {

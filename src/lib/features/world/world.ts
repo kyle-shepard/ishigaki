@@ -120,6 +120,50 @@ export function accrue(
 	return { harvested, quantity };
 }
 
+/**
+ * How many settlers a settlement has gained over an interval, and how far to advance its
+ * growth anchor. Pure and database-free for the same reason as `accrue`: population moves in
+ * real time whether or not anyone is watching, so a week away must equal a hundred short
+ * visits, and that property is only checkable where `npm test` can reach it.
+ *
+ * People arrive to fill spare housing and stop at the cap — build a House, room opens, settlers
+ * come. Growth is fractional (a rate per hour) but a person is whole, so births are only booked
+ * as the accumulator crosses an integer. The un-booked remainder is carried not in a stored
+ * fraction but in the *anchor we decline to advance*: `consumedSeconds` moves the anchor forward
+ * only by the whole-settler portion, so the leftover time is re-counted on the next read. That
+ * is what makes the result independent of how often it is called.
+ *
+ * The two clamp cases both sync the anchor fully to now (`consumedSeconds = elapsedSeconds`),
+ * and this is load-bearing: at or over the cap, time spent full must NOT bank as a backlog, or
+ * a House built after a week at capacity would fill instantly from stored-up time instead of
+ * gradually. Over-cap time is discarded, not owed.
+ *
+ * ponytail: always-fed. Food does not enter yet — Slice 4 replaces this with a piecewise
+ * fed/starving integrator. Don't over-fit callers to this shape.
+ */
+export function grow(
+	currentPop: number,
+	capacity: number,
+	ratePerHour: number,
+	elapsedSeconds: number
+): { born: number; consumedSeconds: number } {
+	// Nothing to integrate — leave the anchor where it is so no sliver of time is lost.
+	if (elapsedSeconds <= 0 || ratePerHour <= 0) return { born: 0, consumedSeconds: 0 };
+	const room = capacity - currentPop;
+	// At or over the cap: no births, but sync the anchor to now so idle-at-capacity time can't
+	// accumulate into an instant fill when room later opens.
+	if (room <= 0) return { born: 0, consumedSeconds: elapsedSeconds };
+
+	const wanted = (ratePerHour * elapsedSeconds) / 3600;
+	// The cap is reached within this interval: take exactly the room, discard the excess time.
+	if (wanted >= room) return { born: room, consumedSeconds: elapsedSeconds };
+
+	// Still below cap: book whole settlers only, and advance the anchor by just the time that
+	// produced them — the sub-settler remainder is carried by leaving the anchor short.
+	const born = Math.floor(wanted);
+	return { born, consumedSeconds: (born / ratePerHour) * 3600 };
+}
+
 export type TravelLeg = {
 	originX: number;
 	originY: number;

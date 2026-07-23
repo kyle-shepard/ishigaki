@@ -1,7 +1,7 @@
 // Run: npm test  (node --test, no framework added)
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { accrue, positionAt, travelFraction, travelSeconds } from './world.ts';
+import { accrue, grow, positionAt, travelFraction, travelSeconds } from './world.ts';
 
 const leg = (startedAt: string, travelDoneAt: string) => ({
 	originX: 0,
@@ -149,6 +149,53 @@ test('the display path and the work path agree over the same interval', () => {
 	const displayed = accrue(0, 0, forest(4, 3 * DAY));
 	const worked = accrue(0, 3 * DAY, forest(4, 3 * DAY));
 	assert.equal(displayed.quantity, worked.quantity);
+});
+
+// Population growth. Like accrual, real-time and unwatchable at speed — pinned here.
+
+test('nobody is born before a whole settler has accrued', () => {
+	// 2/hr for half an hour is 1.0 settlers — but only just; a shade under is still zero.
+	assert.deepEqual(grow(3, 10, 2, HOUR / 2), { born: 1, consumedSeconds: HOUR / 2 });
+	assert.equal(grow(3, 10, 2, HOUR / 4).born, 0);
+	// And the anchor doesn't move while the fraction is still building, so it isn't lost.
+	assert.equal(grow(3, 10, 2, HOUR / 4).consumedSeconds, 0);
+});
+
+test('growth stops at the housing cap', () => {
+	// Room for 2 more, but an hour at 2/hr wants 2 — exactly fills it.
+	assert.deepEqual(grow(8, 10, 2, HOUR), { born: 2, consumedSeconds: HOUR });
+	// Already full: no births, but the anchor syncs forward so full time cannot bank.
+	assert.deepEqual(grow(10, 10, 2, HOUR), { born: 0, consumedSeconds: HOUR });
+	// Over a long absence, still only the room — the extra time is discarded, not owed.
+	assert.deepEqual(grow(9, 10, 2, 100 * HOUR), { born: 1, consumedSeconds: 100 * HOUR });
+});
+
+test('no housing means no anchor drift into an instant fill', () => {
+	// A realm sat a week over/at capacity, then a House opens 4 rooms. The week must not
+	// have banked into four instant arrivals — the anchor was synced each read while full.
+	const away = grow(4, 4, 2, 7 * DAY); // at cap all week
+	assert.equal(away.born, 0);
+	assert.equal(away.consumedSeconds, 7 * DAY, 'anchor advanced to now, no backlog');
+});
+
+test('population growth is resolution-independent below the cap', () => {
+	// Far-off cap so nothing clamps: how often you look cannot change who is born. Clean
+	// half-hour steps at 1/hr keep every value exact, so this tests the model, not float drift.
+	const capacity = 1000;
+	const rate = 1;
+	const span = 10.5 * HOUR;
+	const away = grow(0, capacity, rate, span).born;
+	assert.equal(away, 10);
+
+	let pop = 0;
+	let carry = 0; // the time the anchor was left short of, re-counted next read
+	for (let i = 0; i < 21; i++) {
+		const elapsed = HOUR / 2 + carry;
+		const step = grow(pop, capacity, rate, elapsed);
+		pop += step.born;
+		carry = elapsed - step.consumedSeconds;
+	}
+	assert.equal(pop, away, 'same total whether watched once or twenty-one times');
 });
 
 test('a week away on a finite tile equals many visits', () => {
