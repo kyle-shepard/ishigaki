@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, lte, notInArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, lte, notInArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import {
 	building,
@@ -8,6 +8,7 @@ import {
 	gameConfig,
 	operation,
 	player,
+	profession,
 	resource,
 	settlement,
 	stock,
@@ -18,7 +19,9 @@ import {
 import {
 	accrue,
 	GRID_SIZE,
+	pickName,
 	population,
+	rollStats,
 	travelSeconds,
 	type OrderReason,
 	type WorldPayload
@@ -39,6 +42,11 @@ const START = {
 // How many people a realm starts with. An explicit placeholder for real population growth
 // (the People epic). One would mean every build order cancels your only gatherer.
 const STARTING_CHARACTERS = 3;
+
+// How long training takes once the settler reaches the School, in seconds. ponytail: a module
+// constant, not game_config — training time isn't an economy knob a live world is balanced on
+// the way growth/food rates are. Move it to game_config if that changes.
+const TRAIN_SECONDS = 30;
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -281,8 +289,37 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			continue;
 		}
 
+		// Build and train are both edge-triggered — due or not.
 		if (op.completeAt!.getTime() > nowMs) continue;
 		await tx.update(operation).set({ status: 'completed' }).where(eq(operation.id, op.id));
+
+		if (op.type === 'train') {
+			// The settler becomes a named specialist of the trained profession, standing at the
+			// School. Stats are rolled and a name picked here — the one place Math.random enters,
+			// funnelled through the pure, tested rollStats/pickName. Names avoid collision with
+			// this player's existing specialists (re-read each completion, so two trainings landing
+			// in one pass don't both grab the same name).
+			const named = await tx
+				.select({ name: character.name })
+				.from(character)
+				.where(and(eq(character.playerId, playerId), sql`${character.name} IS NOT NULL`));
+			const stats = rollStats(Math.random);
+			await tx
+				.update(character)
+				.set({
+					professionId: op.professionId,
+					name: pickName(Math.random, new Set(named.map((n) => n.name!))),
+					strength: stats.strength,
+					dexterity: stats.dexterity,
+					constitution: stats.constitution,
+					intelligence: stats.intelligence,
+					x: op.destX,
+					y: op.destY
+				})
+				.where(eq(character.id, op.characterId));
+			continue;
+		}
+
 		await tx.insert(building).values({
 			playerId,
 			x: op.destX,
@@ -658,6 +695,96 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 	});
 }
 
+/**
+ * Sends an idle settler to a School to be trained into a specialist of a chosen profession.
+ * Edge-triggered like a build (a fixed training time, a `complete_at`); `resolveWorld` does the
+ * conversion on completion. Mirrors `assignWorker`'s shape — the checks that must hold before any
+ * row is written happen first, so every refusal leaves the world untouched.
+ */
+export async function assignTraining(
+	playerId: number,
+	x: number,
+	y: number,
+	professionId: number
+): Promise<OrderResult> {
+	return db.transaction(async (tx): Promise<OrderResult> => {
+		await resolveWorld(tx, playerId);
+
+		if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
+		if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
+			return { ok: false, reason: 'OUT_OF_BOUNDS' };
+
+		const [prof] = await tx.select().from(profession).where(eq(profession.id, professionId));
+		if (!prof) return { ok: false, reason: 'UNKNOWN_PROFESSION' };
+
+		// A School must stand on the tile — the same shape as the Quarry gating Stone. Looked up
+		// by name like the hamlet's House/Barn in ensurePlayer: a building type that code gates on
+		// specifically is code-coupled by nature, unlike the tuning data VISION #10 keeps as rows.
+		const [schoolType] = await tx
+			.select({ id: buildingType.id })
+			.from(buildingType)
+			.where(eq(buildingType.displayName, 'School'));
+		if (!schoolType)
+			throw new Error('no School building_type row — run `npm run seed` against this database');
+		const [school] = await tx
+			.select()
+			.from(building)
+			.where(
+				and(
+					eq(building.playerId, playerId),
+					eq(building.x, x),
+					eq(building.y, y),
+					eq(building.buildingTypeId, schoolType.id)
+				)
+			);
+		if (!school) return { ok: false, reason: 'MISSING_SCHOOL' };
+
+		// A settler specifically — a specialist is already trained, and this is what makes holding
+		// one back a real choice. Idle (in no in-progress operation) and profession-less.
+		const busy = tx
+			.select({ id: operation.characterId })
+			.from(operation)
+			.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+		const [settler] = await tx
+			.select()
+			.from(character)
+			.where(
+				and(
+					eq(character.playerId, playerId),
+					isNull(character.professionId),
+					notInArray(character.id, busy)
+				)
+			)
+			.limit(1);
+		if (!settler) return { ok: false, reason: 'NO_IDLE_SETTLER' };
+
+		const grid = await loadGrid(tx);
+		const travel = travelSeconds(settler.x, settler.y, x, y, settler.speed, (cx, cy) => {
+			const g = grid.get(cy * GRID_SIZE + cx);
+			if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
+			return g.movementCost;
+		});
+		await tx.insert(operation).values({
+			playerId,
+			characterId: settler.id,
+			type: 'train',
+			status: 'in-progress',
+			originX: settler.x,
+			originY: settler.y,
+			destX: x,
+			destY: y,
+			buildingTypeId: null,
+			professionId,
+			startedAt: sql`now()`,
+			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
+			// Edge-triggered: finishes on its own once travel plus the training time is up.
+			completeAt: sql`now() + ${`${travel + TRAIN_SECONDS} seconds`}::interval`
+		});
+
+		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
 /** Ends an assignment. `resolveWorld` above has already paid out the final stretch. */
 export async function recallWorker(playerId: number, operationId: number): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
@@ -698,6 +825,9 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 	// buildingTypes. The ground is the world's, not yours.
 	const terrainTypes = await tx.select().from(terrainType);
 	const resources = await tx.select().from(resource);
+	// Professions the School offers — a global catalog like building types, ordered so the Train
+	// picker doesn't reshuffle between reads.
+	const professions = await tx.select().from(profession).orderBy(asc(profession.id));
 	const held = await tx
 		.select({ resourceId: stock.resourceId, quantity: stock.quantity })
 		.from(stock)
@@ -774,6 +904,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			yieldsResourceId: t.yieldsResourceId
 		})),
 		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName })),
+		professions: professions.map((p) => ({ id: p.id, displayName: p.displayName })),
 		stock: held,
 		buildingCosts: costs.map((c) => ({
 			buildingTypeId: c.buildingTypeId,
@@ -793,12 +924,20 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			y: b.y,
 			buildingTypeId: b.buildingTypeId
 		})),
-		characters: characters.map((c) => ({ id: c.id, x: c.x, y: c.y, speed: c.speed })),
+		characters: characters.map((c) => ({
+			id: c.id,
+			x: c.x,
+			y: c.y,
+			speed: c.speed,
+			professionId: c.professionId,
+			name: c.name
+		})),
 		operations: operations.map((o) => ({
 			id: o.id,
 			characterId: o.characterId,
 			type: o.type,
 			buildingTypeId: o.buildingTypeId,
+			professionId: o.professionId,
 			originX: o.originX,
 			originY: o.originY,
 			destX: o.destX,

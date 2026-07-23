@@ -1,7 +1,18 @@
 // Run: npm test  (node --test, no framework added)
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { accrue, population, positionAt, travelFraction, travelSeconds } from './world.ts';
+import {
+	accrue,
+	NAME_POOL,
+	pickName,
+	population,
+	positionAt,
+	rollStats,
+	STAT_MAX,
+	STAT_MIN,
+	travelFraction,
+	travelSeconds
+} from './world.ts';
 
 const leg = (startedAt: string, travelDoneAt: string) => ({
 	originX: 0,
@@ -227,6 +238,32 @@ test('food drain is resolution-independent at a steady population', () => {
 		Math.abs(drained - once.foodDrained) < 1e-9,
 		`drifted by ${drained - once.foodDrained}`
 	);
+});
+
+// Specialist generation. The roll uses randomness in production, so it is pinned here with a
+// seeded generator — a repeatable sequence, not a coin flip npm test can't check.
+const seeded = (seed: number) => () => {
+	seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+	return seed / 0x7fffffff;
+};
+
+test('rolled stats stay in range and are repeatable from a seed', () => {
+	const s = rollStats(seeded(42));
+	for (const v of Object.values(s)) {
+		assert.ok(Number.isInteger(v), `${v} is not a whole stat`);
+		assert.ok(v >= STAT_MIN && v <= STAT_MAX, `${v} out of [${STAT_MIN}, ${STAT_MAX}]`);
+	}
+	// Same seed, same sheet — determinism is the property that makes this testable at all.
+	assert.deepEqual(rollStats(seeded(42)), s);
+});
+
+test('names prefer the unused, and never run dry', () => {
+	// With all but one taken, the pick is forced to the survivor.
+	const taken = new Set(NAME_POOL.slice(1));
+	assert.equal(pickName(seeded(7), taken), NAME_POOL[0]);
+	// Everyone taken: reuse rather than fail — a cosmetic collision, not an error.
+	const all = new Set(NAME_POOL);
+	assert.ok(NAME_POOL.includes(pickName(seeded(7), all)));
 });
 
 test('a week away on a finite tile equals many visits', () => {

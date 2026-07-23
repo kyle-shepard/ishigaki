@@ -99,6 +99,13 @@
       "when": 1784838922463,
       "tag": "0013_left_moira_mactaggert",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1784839493187,
+      "tag": "0014_smart_vertigo",
+      "breakpoints": true
     }
   ]
 }

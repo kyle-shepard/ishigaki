@@ -68,6 +68,58 @@ export const building = pgTable(
 	(t) => [uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y)]
 );
 
+// The action-skills a body can have — Foraging, Woodcutting, and so on. Global catalog,
+// natural-keyed like resource/building_type. Each skill is governed by exactly two of the four
+// base stats (Slice 6 modulates a specialist's competence by their rolled values of these), and
+// "exactly two, fixed" is why they are two columns rather than a join table. stat_a/stat_b name
+// a character stat column; the CHECK keeps a typo from naming one that does not exist.
+export const skill = pgTable(
+	'skill',
+	{
+		id: serial('id').primaryKey(),
+		/** Natural key — see building_type.display_name. */
+		displayName: text('display_name').notNull().unique(),
+		statA: text('stat_a').notNull(),
+		statB: text('stat_b').notNull()
+	},
+	(t) => [
+		check(
+			'skill_stat_a_valid',
+			sql`${t.statA} IN ('strength','dexterity','constitution','intelligence')`
+		),
+		check(
+			'skill_stat_b_valid',
+			sql`${t.statB} IN ('strength','dexterity','constitution','intelligence')`
+		)
+	]
+);
+
+// A trained calling — Forager, Woodcutter, Mason. A profession is a bundle of skill values
+// (profession_skill below); one row, one display name. New/retuned professions are row edits.
+export const profession = pgTable('profession', {
+	id: serial('id').primaryKey(),
+	/** Natural key — see building_type.display_name. */
+	displayName: text('display_name').notNull().unique()
+});
+
+// The bundle: how good a profession is at each skill it carries. This is the Q's "data table of
+// skill bundles" — a Mason carries both Quarrying and Construction as two rows. `value` is the
+// trained competence (Slice 6 scales output by it, modulated by the specialist's rolled stats);
+// a profession with no row for a skill is simply untrained at it.
+export const professionSkill = pgTable(
+	'profession_skill',
+	{
+		professionId: integer('profession_id')
+			.notNull()
+			.references(() => profession.id),
+		skillId: integer('skill_id')
+			.notNull()
+			.references(() => skill.id),
+		value: real('value').notNull()
+	},
+	(t) => [primaryKey({ columns: [t.professionId, t.skillId] })]
+);
+
 // What a tile can produce.
 export const resource = pgTable('resource', {
 	id: serial('id').primaryKey(),
@@ -92,7 +144,12 @@ export const resource = pgTable('resource', {
 	// resource — wood and forage need a person and nothing else. Set means extracted: the
 	// structure comes first. Expressing it as a column makes "stone needs a quarry on the
 	// outcrop" one join rather than a rule written in code.
-	requiresBuildingTypeId: integer('requires_building_type_id').references(() => buildingType.id)
+	requiresBuildingTypeId: integer('requires_building_type_id').references(() => buildingType.id),
+	// Which action-skill takes this resource — Wood ⇒ Woodcutting, Stone ⇒ Quarrying. Lets
+	// assignment (Slice 6) rank workers by the relevant skill, and is the seam by which quality
+	// varies by who works. Nullable only because a resource can exist before its skill is wired;
+	// the seed sets it for everything takeable.
+	skillId: integer('skill_id').references(() => skill.id)
 });
 
 // What a building costs to order. Content, not code (VISION #10): retuning a cost is an
@@ -262,15 +319,40 @@ export const tileStock = pgTable(
 );
 
 // (x, y) is the position when idle; during travel it is derived from the active operation.
-export const character = pgTable('character', {
-	id: serial('id').primaryKey(),
-	playerId: integer('player_id')
-		.notNull()
-		.references(() => player.id),
-	x: integer('x').notNull(),
-	y: integer('y').notNull(),
-	speed: real('speed').notNull()
-});
+//
+// The tier lives here, not in a separate table: a settler is a character with no profession, a
+// specialist is one with a profession and a rolled stat sheet. Everything below profession_id is
+// null for a settler and set for a specialist — the CHECK holds that all-or-nothing invariant at
+// the DB (mirroring the operation build/gather CHECKs), so a half-rolled body can't be written.
+export const character = pgTable(
+	'character',
+	{
+		id: serial('id').primaryKey(),
+		playerId: integer('player_id')
+			.notNull()
+			.references(() => player.id),
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		speed: real('speed').notNull(),
+		// Null ⇒ settler, set ⇒ specialist. The tier is a property of the body, so the whole
+		// operation/travel/idle machinery works on both without a fork.
+		professionId: integer('profession_id').references(() => profession.id),
+		// A specialist you know by name; a settler is one of an anonymous many.
+		name: text('name'),
+		// Rolled once at training. Slice 6 turns these into the quality a specialist works at.
+		strength: integer('strength'),
+		dexterity: integer('dexterity'),
+		constitution: integer('constitution'),
+		intelligence: integer('intelligence')
+	},
+	(t) => [
+		check(
+			'character_tier',
+			sql`(${t.professionId} IS NULL AND ${t.name} IS NULL AND ${t.strength} IS NULL AND ${t.dexterity} IS NULL AND ${t.constitution} IS NULL AND ${t.intelligence} IS NULL)
+			 OR (${t.professionId} IS NOT NULL AND ${t.name} IS NOT NULL AND ${t.strength} IS NOT NULL AND ${t.dexterity} IS NOT NULL AND ${t.constitution} IS NOT NULL AND ${t.intelligence} IS NOT NULL)`
+		)
+	]
+);
 
 // Defined next to the wire types rather than here: the client branches on it too, and two
 // copies of a union is one copy waiting to fall behind.
@@ -303,6 +385,10 @@ export const operation = pgTable(
 		destX: integer('dest_x').notNull(),
 		destY: integer('dest_y').notNull(),
 		buildingTypeId: integer('building_type_id').references(() => buildingType.id),
+		// The profession a training operation is producing. Null on build/gather; a train row
+		// carries the calling the settler will emerge with. Edge-triggered like a build, so it
+		// also carries a complete_at (see the CHECK).
+		professionId: integer('profession_id').references(() => profession.id),
 		startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
 		travelDoneAt: timestamp('travel_done_at', { withTimezone: true }).notNull(),
 		// Null means "never finishes on its own" — a gather runs until it is recalled.
@@ -320,6 +406,12 @@ export const operation = pgTable(
 			'operation_build_is_complete',
 			sql`${t.type} <> 'build' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
 		),
-		check('operation_gather_accrues', sql`${t.type} <> 'gather' OR ${t.accruedAt} IS NOT NULL`)
+		check('operation_gather_accrues', sql`${t.type} <> 'gather' OR ${t.accruedAt} IS NOT NULL`),
+		// A train row is edge-triggered like a build and names the profession it will grant — both
+		// dereferenced on completion, so both are required at the DB rather than by convention.
+		check(
+			'operation_train_is_complete',
+			sql`${t.type} <> 'train' OR (${t.professionId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
+		)
 	]
 );

@@ -9,7 +9,10 @@ import {
 	buildingType,
 	gameConfig,
 	player,
+	profession,
+	professionSkill,
 	resource,
+	skill,
 	terrainType,
 	tile
 } from '../src/lib/server/db/schema.ts';
@@ -59,7 +62,10 @@ const buildingTypes = await db
 		{ displayName: 'Quarry', icon: 'quarry', buildSeconds: 60, housingCapacity: 0 },
 		// The milestone, and the thing the project is named for: 石垣, fitted stone. It is the
 		// first build that needs a resource you cannot simply walk out and pick up.
-		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90, housingCapacity: 0 }
+		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90, housingCapacity: 0 },
+		// Where a settler is trained into a specialist. Gates training exactly as the Quarry gates
+		// Stone — no School, no specialists.
+		{ displayName: 'School', icon: 'school', buildSeconds: 45, housingCapacity: 0 }
 	])
 	// Keyed on the name, so re-running against a live world retunes the row a player's
 	// buildings already point at rather than making a second one beside it.
@@ -93,9 +99,83 @@ await db
 		}
 	});
 
+// The action-skill catalog — six skills, each governed by two of the four base stats. Content,
+// natural-keyed like everything else (VISION #10): a retuned governing stat is a row edit.
+// The stat pairs are flavor, not physics — the spread they give two specialists is the point.
+const skills = await db
+	.insert(skill)
+	.values([
+		{ displayName: 'Foraging', statA: 'dexterity', statB: 'intelligence' },
+		{ displayName: 'Woodcutting', statA: 'strength', statB: 'constitution' },
+		{ displayName: 'Quarrying', statA: 'strength', statB: 'constitution' },
+		{ displayName: 'Digging', statA: 'strength', statB: 'dexterity' },
+		{ displayName: 'Mining', statA: 'strength', statB: 'constitution' },
+		{ displayName: 'Construction', statA: 'dexterity', statB: 'intelligence' }
+	])
+	.onConflictDoUpdate({
+		target: skill.displayName,
+		set: { statA: sql`excluded.stat_a`, statB: sql`excluded.stat_b` }
+	})
+	.returning();
+const sk = Object.fromEntries(skills.map((s) => [s.displayName, s.id]));
+
+// The five professions and their skill bundles. A Mason carries two skills; everyone else one.
+// value ~0.7 is the trained competence (Slice 6 scales output by it against a ~0.15 settler
+// baseline — the ~4–5× the Q asks for); Mason's Construction is a touch lower, a jack of two.
+const professions = await db
+	.insert(profession)
+	.values([
+		{ displayName: 'Forager' },
+		{ displayName: 'Woodcutter' },
+		{ displayName: 'Mason' },
+		{ displayName: 'Digger' },
+		{ displayName: 'Miner' }
+	])
+	.onConflictDoUpdate({
+		target: profession.displayName,
+		set: { displayName: sql`excluded.display_name` }
+	})
+	.returning();
+const pr = Object.fromEntries(professions.map((p) => [p.displayName, p.id]));
+
+const BUNDLE = [
+	{ profession: 'Forager', skill: 'Foraging', value: 0.7 },
+	{ profession: 'Woodcutter', skill: 'Woodcutting', value: 0.7 },
+	{ profession: 'Mason', skill: 'Quarrying', value: 0.7 },
+	{ profession: 'Mason', skill: 'Construction', value: 0.6 },
+	{ profession: 'Digger', skill: 'Digging', value: 0.7 },
+	{ profession: 'Miner', skill: 'Mining', value: 0.7 }
+];
+await db
+	.insert(professionSkill)
+	.values(
+		BUNDLE.map((b) => ({ professionId: pr[b.profession], skillId: sk[b.skill], value: b.value }))
+	)
+	.onConflictDoUpdate({
+		target: [professionSkill.professionId, professionSkill.skillId],
+		set: { value: sql`excluded.value` }
+	});
+// A bundle row dropped from BUNDLE must actually stop applying, same as building_cost — upserts
+// alone would leave the stale row behind.
+await db.execute(
+	sql`DELETE FROM profession_skill WHERE (profession_id, skill_id) NOT IN (${sql.join(
+		BUNDLE.map((b) => sql`(${pr[b.profession]}, ${sk[b.skill]})`),
+		sql`, `
+	)})`
+);
+
 // units_per_hour is per worker, flat. Food is fast because forage is the bootstrap floor —
 // it is what a realm with nothing can always do. Zero means seeded on the map but not yet
 // wired: assignment refuses those tiles outright rather than paying nothing in silence.
+// skillId names the action-skill that takes each resource, so assignment (Slice 6) can rank
+// workers by it; build always uses Construction, looked up there.
+const RESOURCE_SKILL: Record<string, string> = {
+	Food: 'Foraging',
+	Wood: 'Woodcutting',
+	Stone: 'Quarrying',
+	Clay: 'Digging',
+	'Iron ore': 'Mining'
+};
 const resources = await db
 	.insert(resource)
 	.values([
@@ -103,18 +183,30 @@ const resources = await db
 		// while forage ramps and enough Wood to afford a first House, so a new hamlet survives
 		// its first minutes before growth's Food drain lands (People epic, Slice 4). Everything
 		// else starts at zero — you go and take it.
-		{ displayName: 'Food', unitsPerHour: 12, startingStock: 40, isSustenance: true },
-		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 10 },
-		{ displayName: 'Stone', unitsPerHour: 2, startingStock: 0 },
-		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 0 },
-		{ displayName: 'Iron ore', unitsPerHour: 0, startingStock: 0 }
+		{
+			displayName: 'Food',
+			unitsPerHour: 12,
+			startingStock: 40,
+			isSustenance: true,
+			skillId: sk[RESOURCE_SKILL.Food]
+		},
+		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 10, skillId: sk[RESOURCE_SKILL.Wood] },
+		{ displayName: 'Stone', unitsPerHour: 2, startingStock: 0, skillId: sk[RESOURCE_SKILL.Stone] },
+		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 0, skillId: sk[RESOURCE_SKILL.Clay] },
+		{
+			displayName: 'Iron ore',
+			unitsPerHour: 0,
+			startingStock: 0,
+			skillId: sk[RESOURCE_SKILL['Iron ore']]
+		}
 	])
 	.onConflictDoUpdate({
 		target: resource.displayName,
 		set: {
 			unitsPerHour: sql`excluded.units_per_hour`,
 			startingStock: sql`excluded.starting_stock`,
-			isSustenance: sql`excluded.is_sustenance`
+			isSustenance: sql`excluded.is_sustenance`,
+			skillId: sql`excluded.skill_id`
 		}
 	})
 	.returning();
@@ -139,7 +231,10 @@ const COSTS = [
 	// paying for it in stone would seal the ladder shut.
 	{ building: 'Quarry', resource: 'Wood', quantity: 12 },
 	{ building: 'Stone wall', resource: 'Stone', quantity: 8 },
-	{ building: 'Stone wall', resource: 'Wood', quantity: 4 }
+	{ building: 'Stone wall', resource: 'Wood', quantity: 4 },
+	// The School is priced in Wood alone — reachable bare-handed from the start, so the path to
+	// specialists never strands (the winnability check below proves it).
+	{ building: 'School', resource: 'Wood', quantity: 15 }
 ];
 await db
 	.insert(buildingCost)

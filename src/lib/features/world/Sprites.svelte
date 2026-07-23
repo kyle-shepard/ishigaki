@@ -120,6 +120,20 @@
 			<rect x="3" y="27" width="26" height="1.6" fill="#00000022" />
 		</symbol>
 
+		<!-- A school: a hall with a pediment and a bell-cote — reads as a civic building, not a home. -->
+		<symbol id="i-school" viewBox="0 0 32 32">
+			<rect x="5" y="14" width="22" height="14" fill="#d8c59a" />
+			<path d="M4 14 L16 6 L28 14 Z" fill="#5b6b7a" />
+			<path d="M15 3 h2 v3 h-2 z" fill="#8a6d3a" />
+			<circle cx="16" cy="10.5" r="1.4" fill="#3a2f1c" />
+			<g fill="#7d5a2e">
+				<rect x="8" y="18" width="4" height="10" />
+				<rect x="20" y="18" width="4" height="10" />
+			</g>
+			<rect x="14" y="20" width="4" height="8" fill="#5b3a22" />
+			<rect x="5" y="27" width="22" height="1.6" fill="#00000022" />
+		</symbol>
+
 		<!-- A character. Pale outline so it stays legible crossing water, forest, or mountain. -->
 		<symbol id="i-pawn" viewBox="0 0 32 32">
 			<g stroke="#f2f4f8" stroke-width="1.4">

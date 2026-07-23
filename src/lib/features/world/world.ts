@@ -11,9 +11,15 @@ export type OrderReason =
 	| 'INSUFFICIENT_RESOURCES'
 	| 'TILE_YIELDS_NOTHING'
 	| 'MISSING_REQUIRED_BUILDING'
-	| 'UNKNOWN_OPERATION';
+	| 'UNKNOWN_OPERATION'
+	// Training-specific: a settler is needed (not just any idle body), a School must stand on the
+	// tile, and the chosen profession must exist.
+	| 'NO_IDLE_SETTLER'
+	| 'MISSING_SCHOOL'
+	| 'UNKNOWN_PROFESSION';
 
 export type OrderRequest = { x: number; y: number; buildingTypeId: number };
+export type TrainRequest = { x: number; y: number; professionId: number };
 
 // ponytail: the whole world, every read. Terrain now dominates the payload — 256 small ints
 // row-major is ~700 B, so a full read is ~1.3 KB, still smaller than a diff protocol's own
@@ -36,6 +42,9 @@ export type WorldPayload = {
 		yieldsResourceId: number | null;
 	}[];
 	resources: { id: number; displayName: string }[];
+	// The professions a settler can be trained into, for the School's Train picker. Global
+	// catalog, unfiltered by player — the callings the world offers, like building types.
+	professions: { id: number; displayName: string }[];
 	// What you hold, one entry per resource — fractional, because accrual is continuous. The
 	// client floors it; the server never does.
 	stock: { resourceId: number; quantity: number }[];
@@ -54,13 +63,24 @@ export type WorldPayload = {
 	tileCapacity: (number | null)[];
 	buildingTypes: { id: number; displayName: string; icon: string; buildSeconds: number }[];
 	buildings: { id: number; x: number; y: number; buildingTypeId: number }[];
-	characters: { id: number; x: number; y: number; speed: number }[];
+	// professionId null ⇒ settler (a dot); set ⇒ a named specialist (drawn distinct). name is
+	// the specialist's, null for a settler.
+	characters: {
+		id: number;
+		x: number;
+		y: number;
+		speed: number;
+		professionId: number | null;
+		name: string | null;
+	}[];
 	operations: {
 		id: number;
 		characterId: number;
 		type: OperationType;
 		// Both null on a gather: it builds nothing, and it never finishes on its own.
 		buildingTypeId: number | null;
+		// The profession a train operation will grant; null on build/gather.
+		professionId: number | null;
 		originX: number;
 		originY: number;
 		destX: number;
@@ -71,7 +91,7 @@ export type WorldPayload = {
 	}[];
 };
 
-export type OperationType = 'build' | 'gather';
+export type OperationType = 'build' | 'gather' | 'train';
 
 export type AssignRequest = { x: number; y: number };
 
@@ -199,6 +219,67 @@ export function population(
 	if (pop - died <= 0 && acc < 0) acc = 0;
 
 	return { born, died, foodDrained, accrued: acc };
+}
+
+// A specialist's stat sheet, rolled once at training. Kept in [STAT_MIN, STAT_MAX] so every
+// specialist is competent but no two are identical — the spread is what makes one genuinely
+// better than another (Slice 6 turns it into output). Range is a seed constant, not live-tunable
+// balance data: it shapes character generation, not the economy a running world is balanced on.
+export const STAT_MIN = 3;
+export const STAT_MAX = 8;
+export type Stats = {
+	strength: number;
+	dexterity: number;
+	constitution: number;
+	intelligence: number;
+};
+
+/**
+ * Rolls a specialist's four base stats. Takes its randomness as an argument — pure given the
+ * `rng`, so a seeded generator makes the roll a repeatable unit test rather than a coin flip
+ * `npm test` can't pin. Each stat is a uniform integer in [STAT_MIN, STAT_MAX].
+ */
+export function rollStats(rng: () => number): Stats {
+	const span = STAT_MAX - STAT_MIN + 1;
+	const roll = () => STAT_MIN + Math.floor(rng() * span);
+	return { strength: roll(), dexterity: roll(), constitution: roll(), intelligence: roll() };
+}
+
+// The pool trained specialists are named from. Flavor, not balance — a seed constant, and
+// deliberately neutral-European placeholder names (the feudal-Japan reskin swaps this list, per
+// VISION). Public-repo-safe: no real people.
+export const NAME_POOL = [
+	'Aldric',
+	'Rowena',
+	'Bertram',
+	'Maud',
+	'Cedric',
+	'Edith',
+	'Godwin',
+	'Hilda',
+	'Oswin',
+	'Mabel',
+	'Reyner',
+	'Sib',
+	'Wat',
+	'Alditha',
+	'Emory',
+	'Joan',
+	'Leofric',
+	'Cwen',
+	'Osric',
+	'Milburga'
+];
+
+/**
+ * Picks a specialist name, preferring one not already in `taken`. Pure given `rng`. When every
+ * name is taken it reuses one rather than failing — duplicate names are a cosmetic shrug, not a
+ * bug, and a realm with twenty specialists is far past this epic's concern.
+ */
+export function pickName(rng: () => number, taken: Set<string> = new Set()): string {
+	const free = NAME_POOL.filter((n) => !taken.has(n));
+	const pool = free.length ? free : NAME_POOL;
+	return pool[Math.floor(rng() * pool.length)];
 }
 
 export type TravelLeg = {

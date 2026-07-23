@@ -24,7 +24,10 @@
 		INSUFFICIENT_RESOURCES: "You don't have the materials for that.",
 		TILE_YIELDS_NOTHING: "There's nothing to take from that ground.",
 		MISSING_REQUIRED_BUILDING: 'That needs a building on the tile before anyone can work it.',
-		UNKNOWN_OPERATION: 'Nobody is working there.'
+		UNKNOWN_OPERATION: 'Nobody is working there.',
+		NO_IDLE_SETTLER: 'You have no idle settler to train.',
+		MISSING_SCHOOL: 'Training needs a School on the tile.',
+		UNKNOWN_PROFESSION: "That isn't a profession anyone can learn."
 	};
 
 	// A click selects a tile; the inspector panel to the right of the map owns the verbs. No
@@ -33,6 +36,8 @@
 	let selected = $state<{ x: number; y: number } | null>(null);
 	// Which building to raise. Null until the first world arrives, then the first type in the catalog.
 	let chosen = $state<number | null>(null);
+	// Which profession to train at a School. Defaults to the first once a world arrives.
+	let chosenProfession = $state<number | null>(null);
 
 	let world = $state<WorldPayload | null>(null);
 	let message = $state('');
@@ -57,6 +62,7 @@
 		// Only until the player has picked for themselves — re-defaulting on every refresh
 		// would snatch their choice back twice a minute.
 		if (chosen === null) chosen = payload.buildingTypes[0]?.id ?? null;
+		if (chosenProfession === null) chosenProfession = payload.professions[0]?.id ?? null;
 		if (payload.worldReset) worldReset = true;
 	}
 
@@ -176,6 +182,15 @@
 		act('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
 	}
 
+	function trainHere() {
+		if (!selected || chosenProfession === null) return;
+		const { x, y } = selected;
+		act('/api/training', {
+			method: 'POST',
+			body: JSON.stringify({ x, y, professionId: chosenProfession })
+		});
+	}
+
 	const recall = (id: number) => act(`/api/assignments/${id}`, { method: 'DELETE' });
 
 	async function newGame() {
@@ -252,6 +267,12 @@
 		const op = world?.operations.find((o) => o.characterId === c.id);
 		return op ? positionAt(op, nowMs) : c;
 	}
+	const professionName = $derived(
+		new Map(world?.professions.map((p) => [p.id, p.displayName]) ?? [])
+	);
+	// A body's name if it's a specialist, else "a settler" — how the panel and roster label it.
+	const who = (c: { name: string | null; professionId: number | null }) =>
+		c.name ? `${c.name} (${professionName.get(c.professionId!)})` : 'a settler';
 	const opFor = (id: number) => world?.operations.find((o) => o.characterId === id);
 	// What a worker is doing right now, for the panel. Walking is derived from the travel leg,
 	// not a stored status — a worker mid-trip reads as walking whatever they'll do on arrival.
@@ -260,6 +281,7 @@
 		if (!op) return 'idle';
 		if (travelFraction(op, nowMs) < 1) return `walking to ${op.destX}, ${op.destY}`;
 		if (op.type === 'build') return `building ${typeName(op.buildingTypeId!)}`;
+		if (op.type === 'train') return `training as ${professionName.get(op.professionId!)}`;
 		return `gathering ${resourceAt(op.destX, op.destY)}`;
 	}
 
@@ -281,6 +303,8 @@
 	);
 	// Build is offered only where the ground allows it and nothing already stands or is rising.
 	const canBuild = $derived(!!selected && selTerrain?.buildable === true && !selBuilt && !selSite);
+	// Training is offered where a finished School stands on the selected tile.
+	const selIsSchool = $derived(!!selBuilt && typeName(selBuilt.buildingTypeId) === 'School');
 	const present = $derived(
 		selected && world
 			? world.characters.filter((c) => {
@@ -299,8 +323,11 @@
 		slot < 0 ? [0, 0] : [slot % 2 ? DOT : -DOT, slot < 2 ? -DOT : DOT];
 	const dots = $derived.by(() => {
 		if (!world) return [];
+		// Settlers are the dots; specialists are drawn as their own pawns (below), so they don't
+		// take a dot slot here.
+		const settlers = world.characters.filter((c) => c.professionId === null);
 		const groups = new Map<string, { id: number; x: number; y: number }[]>();
-		for (const c of world.characters) {
+		for (const c of settlers) {
 			const p = at(c);
 			const key = `${Math.round(p.x)},${Math.round(p.y)}`;
 			(groups.get(key) ?? groups.set(key, []).get(key)!).push({ id: c.id, x: p.x, y: p.y });
@@ -312,6 +339,9 @@
 		}
 		return out;
 	});
+	// Named specialists, for both the map pawns and the roster. Live position so a pawn tracks a
+	// walking specialist.
+	const specialists = $derived(world?.characters.filter((c) => c.professionId !== null) ?? []);
 </script>
 
 <h1>石垣 Ishigaki</h1>
@@ -394,6 +424,17 @@
 					<circle class="dot" cx={16 + off[0]} cy={16 + off[1]} r="5" />
 				</svg>
 			{/each}
+			<!-- Specialists are pawns, not dots — a named individual reads as a body, not one of a
+			     crowd. Distinct from the settler dots by silhouette. -->
+			{#each specialists as c (c.id)}
+				<svg
+					class="over"
+					viewBox="0 0 32 32"
+					style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
+				>
+					<use href="#i-pawn" />
+				</svg>
+			{/each}
 		</div>
 
 		<!-- The inspector: one surface for a tile's facts and every action it affords. Which buttons
@@ -425,7 +466,8 @@
 						{#each present as c (c.id)}
 							{@const op = opFor(c.id)}
 							<li>
-								{doing(c)}
+								{#if c.name}<b>{c.name}</b> ({professionName.get(c.professionId!)}) —
+								{/if}{doing(c)}
 								{#if op?.type === 'gather' && op.destX === selected.x && op.destY === selected.y}
 									<button onclick={() => recall(op.id)}>Recall</button>
 								{/if}
@@ -453,11 +495,36 @@
 				{#if selYields !== null}
 					<p><button onclick={gatherHere}>Send someone to gather</button></p>
 				{/if}
+
+				{#if selIsSchool}
+					<h3>Train a specialist</h3>
+					<ul class="build-picker">
+						{#each world.professions as p (p.id)}
+							<li>
+								<label>
+									<input type="radio" bind:group={chosenProfession} value={p.id} />
+									{p.displayName}
+								</label>
+							</li>
+						{/each}
+					</ul>
+					<button onclick={trainHere} disabled={chosenProfession === null}>Train a settler</button>
+				{/if}
 			{/if}
 
 			{#if message}<p class="error">{message}</p>{/if}
 		</aside>
 	</div>
+
+	{#if specialists.length}
+		<!-- The specialist roster: find one by name even when they're out working the map. -->
+		<h3 class="roster-title">Specialists</h3>
+		<ul class="roster">
+			{#each specialists as c (c.id)}
+				<li>{who(c)} — {doing(c)}</li>
+			{/each}
+		</ul>
+	{/if}
 {:else}
 	<p>Loading…</p>
 {/if}
@@ -545,6 +612,15 @@
 	}
 	.hint {
 		color: #6b7280;
+	}
+	.roster-title {
+		margin: 1.25rem 0 0.25rem;
+	}
+	.roster {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+		font-variant-numeric: tabular-nums;
 	}
 	.present,
 	.build-picker {
