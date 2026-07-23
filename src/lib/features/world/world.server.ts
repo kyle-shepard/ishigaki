@@ -35,6 +35,10 @@ import {
 const START = {
 	hamletX: 7,
 	hamletY: 8,
+	// A second House beside the hamlet — a new realm opens with room for eight, so settlers
+	// arrive before the first build. Its own tile so the two Houses don't stack into one pawn.
+	house2X: 6,
+	house2Y: 8,
 	barnX: 8,
 	barnY: 8,
 	characterX: 7,
@@ -128,6 +132,8 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 			);
 		await tx.insert(building).values([
 			{ playerId: p.id, x: START.hamletX, y: START.hamletY, buildingTypeId: house.id },
+			// A second House, so a fresh realm's housing cap is eight and people keep arriving.
+			{ playerId: p.id, x: START.house2X, y: START.house2Y, buildingTypeId: house.id },
 			// The barn stores nothing yet and gates nothing — with no capacity there is nothing
 			// for it to read. It is here so "where your stock lives" is a place on the map, and
 			// it is the row capacity will hang off when it arrives.

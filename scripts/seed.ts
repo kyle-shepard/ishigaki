@@ -194,24 +194,29 @@ const RESOURCE_SKILL: Record<string, string> = {
 const resources = await db
 	.insert(resource)
 	.values([
-		// startingStock is the fresh-realm runway (VISION #10, tunable): enough Food to eat
-		// while forage ramps and enough Wood to afford a first House, so a new hamlet survives
-		// its first minutes before growth's Food drain lands (People epic, Slice 4). Everything
-		// else starts at zero — you go and take it.
+		// startingStock is the fresh-realm runway (VISION #10, tunable): a stocked hamlet so a new
+		// realm can build and grow for a good while before it has to work for materials, and a
+		// Food buffer to ride out the opening before forage and specialists ramp (People epic,
+		// Slice 4). Tune freely — this is a seed edit, not schema.
 		{
 			displayName: 'Food',
 			unitsPerHour: 12,
-			startingStock: 40,
+			startingStock: 50,
 			isSustenance: true,
 			skillId: sk[RESOURCE_SKILL.Food]
 		},
-		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 10, skillId: sk[RESOURCE_SKILL.Wood] },
-		{ displayName: 'Stone', unitsPerHour: 2, startingStock: 0, skillId: sk[RESOURCE_SKILL.Stone] },
-		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 0, skillId: sk[RESOURCE_SKILL.Clay] },
+		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 100, skillId: sk[RESOURCE_SKILL.Wood] },
+		{
+			displayName: 'Stone',
+			unitsPerHour: 2,
+			startingStock: 100,
+			skillId: sk[RESOURCE_SKILL.Stone]
+		},
+		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 50, skillId: sk[RESOURCE_SKILL.Clay] },
 		{
 			displayName: 'Iron ore',
 			unitsPerHour: 0,
-			startingStock: 0,
+			startingStock: 50,
 			skillId: sk[RESOURCE_SKILL['Iron ore']]
 		}
 	])
@@ -473,6 +478,7 @@ const meadowAt = (x: number, y: number) => {
 	return name;
 };
 meadowAt(7, 8);
+meadowAt(6, 8);
 meadowAt(8, 8);
 meadowAt(7, 9);
 
