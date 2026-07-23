@@ -73,6 +73,11 @@ export const resource = pgTable('resource', {
 	// Zero means "seeded on the map but not yet wired"; assignment refuses those outright
 	// rather than letting a worker stand in a clay pit earning nothing forever.
 	unitsPerHour: real('units_per_hour').notNull().default(0),
+	// What a fresh realm starts holding of this resource — a runway so a new hamlet can eat and
+	// afford its first House before forage ramps (and, once population drains Food, before it
+	// starves). Content, not code (VISION #10): retuning the runway is an UPDATE. Default 0, so
+	// a resource that says nothing starts at nothing.
+	startingStock: real('starting_stock').notNull().default(0),
 	// What must already stand on the tile before this can be taken from it. Null is a gathered
 	// resource — wood and forage need a person and nothing else. Set means extracted: the
 	// structure comes first. Expressing it as a column makes "stone needs a quarry on the

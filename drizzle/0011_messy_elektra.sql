@@ -1,0 +1,1 @@
+ALTER TABLE "resource" ADD COLUMN "starting_stock" real DEFAULT 0 NOT NULL;

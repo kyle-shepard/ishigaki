@@ -73,15 +73,22 @@ const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 const resources = await db
 	.insert(resource)
 	.values([
-		{ displayName: 'Food', unitsPerHour: 12 },
-		{ displayName: 'Wood', unitsPerHour: 3 },
-		{ displayName: 'Stone', unitsPerHour: 2 },
-		{ displayName: 'Clay', unitsPerHour: 0 },
-		{ displayName: 'Iron ore', unitsPerHour: 0 }
+		// startingStock is the fresh-realm runway (VISION #10, tunable): enough Food to eat
+		// while forage ramps and enough Wood to afford a first House, so a new hamlet survives
+		// its first minutes before growth's Food drain lands (People epic, Slice 4). Everything
+		// else starts at zero — you go and take it.
+		{ displayName: 'Food', unitsPerHour: 12, startingStock: 40 },
+		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 10 },
+		{ displayName: 'Stone', unitsPerHour: 2, startingStock: 0 },
+		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 0 },
+		{ displayName: 'Iron ore', unitsPerHour: 0, startingStock: 0 }
 	])
 	.onConflictDoUpdate({
 		target: resource.displayName,
-		set: { unitsPerHour: sql`excluded.units_per_hour` }
+		set: {
+			unitsPerHour: sql`excluded.units_per_hour`,
+			startingStock: sql`excluded.starting_stock`
+		}
 	})
 	.returning();
 const res = Object.fromEntries(resources.map((r) => [r.displayName, r.id]));

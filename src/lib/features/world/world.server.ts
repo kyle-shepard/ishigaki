@@ -96,14 +96,17 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 			.insert(settlement)
 			.values({ playerId: p.id, x: START.hamletX, y: START.hamletY })
 			.returning();
-		// A row per resource at zero, present from the start rather than created on first gain:
-		// the accrual and the deduction are then both an UPDATE that either matches a row or
-		// does not, with no upsert and no "is this new or merely empty" question at the till.
-		// Zero, and not a grubstake: a fresh realm can forage, so it is not stuck, and starting
-		// at nothing is the state the whole economy has to be winnable from.
+		// A row per resource, present from the start rather than created on first gain: the
+		// accrual and the deduction are then both an UPDATE that either matches a row or does
+		// not, with no upsert and no "is this new or merely empty" question at the till.
+		// Seeded to each resource's startingStock (mostly zero) — a small runway so a new hamlet
+		// can eat and afford a first House before Food starts draining, without which a realm
+		// born at nothing would starve the moment growth lands (People epic, Slice 4).
 		await tx
 			.insert(stock)
-			.values(resources.map((r) => ({ settlementId: s.id, resourceId: r.id, quantity: 0 })));
+			.values(
+				resources.map((r) => ({ settlementId: s.id, resourceId: r.id, quantity: r.startingStock }))
+			);
 		await tx.insert(building).values([
 			{ playerId: p.id, x: START.hamletX, y: START.hamletY, buildingTypeId: house.id },
 			// The barn stores nothing yet and gates nothing — with no capacity there is nothing
