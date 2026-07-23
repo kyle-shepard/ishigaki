@@ -18,7 +18,7 @@ import {
 import {
 	accrue,
 	GRID_SIZE,
-	grow,
+	population,
 	travelSeconds,
 	type OrderReason,
 	type WorldPayload
@@ -195,7 +195,8 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			id: settlement.id,
 			x: settlement.x,
 			y: settlement.y,
-			populationAsOf: settlement.populationAsOf
+			populationAsOf: settlement.populationAsOf,
+			populationAccrued: settlement.populationAccrued
 		})
 		.from(settlement)
 		.where(eq(settlement.playerId, playerId))
@@ -294,14 +295,15 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			.where(eq(character.id, op.characterId));
 	}
 
-	// Population, integrated from the settlement's own anchor — the same integrate-on-read shape
-	// as the gather accrual above, no tick. Runs after the operations loop so a later slice's
-	// food drain reads a stock already credited with this pass's foraging (Slice 4's ordering).
+	// Population and food, integrated from the settlement's own anchor — the same integrate-on-read
+	// shape as the gather accrual above, no tick. Ordering is load-bearing: this runs AFTER the
+	// operations loop, so it reads a Food stock already credited with this pass's foraging. A
+	// hamlet with an active forager is fed from that forage rather than starved past it.
 	//
-	// Count all characters (a busy one still eats and still fills a bed), sum housing capacity
-	// over built buildings, and let `grow` decide how many settlers arrive and how far to move
-	// the anchor. New settlers materialize at the hamlet — profession-less rows, the same shape
-	// `ensurePlayer` seeds, so nothing downstream needs to know they were born rather than granted.
+	// ponytail: gather and population integrate from different anchors (accrued_at vs
+	// population_as_of), so a sub-interval where a forager arrives partway is approximate; at read
+	// cadence it's close, and seeding food_per_capita below a single forager's yield keeps the
+	// common case correct. Split the interval at each event if starvation ever feels wrong.
 	const [cfg] = await tx.select().from(gameConfig);
 	if (cfg) {
 		const [{ pop }] = await tx
@@ -313,13 +315,28 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			.from(building)
 			.innerJoin(buildingType, eq(building.buildingTypeId, buildingType.id))
 			.where(eq(building.playerId, playerId));
+		// The one sustenance resource's stock for this settlement — keyed on the flag, never on a
+		// display name (VISION #10). No row (a realm predating the resource) reads as zero food.
+		const [food] = await tx
+			.select({ resourceId: stock.resourceId, quantity: stock.quantity })
+			.from(stock)
+			.innerJoin(resource, eq(stock.resourceId, resource.id))
+			.where(and(eq(stock.settlementId, home.id), eq(resource.isSustenance, true)));
 
-		const { born, consumedSeconds } = grow(
+		const { born, died, foodDrained, accrued } = population(
 			pop,
 			cap,
-			cfg.growthPerHour,
+			food?.quantity ?? 0,
+			home.populationAccrued,
+			cfg,
 			(nowMs - home.populationAsOf.getTime()) / 1000
 		);
+
+		if (food && foodDrained > 0)
+			await tx
+				.update(stock)
+				.set({ quantity: sql`${stock.quantity} - ${foodDrained}` })
+				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, food.resourceId)));
 		if (born > 0)
 			await tx.insert(character).values(
 				Array.from({ length: born }, () => ({
@@ -329,16 +346,51 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 					speed: START.speed
 				}))
 			);
-		// Advance the anchor by only what `grow` consumed — the sub-settler remainder is carried
-		// by leaving the stored timestamp short, so it re-counts on the next read.
-		if (consumedSeconds > 0)
-			await tx
-				.update(settlement)
-				.set({
-					populationAsOf: sql`${settlement.populationAsOf} + ${`${consumedSeconds} seconds`}::interval`
-				})
-				.where(eq(settlement.id, home.id));
+		if (died > 0) await removeSettlers(tx, playerId, died);
+
+		// The anchor now advances fully to now every read (food must drain smoothly with the
+		// clock); the sub-person remainder rides in populationAccrued instead.
+		await tx
+			.update(settlement)
+			.set({ populationAsOf: sql`now()`, populationAccrued: accrued })
+			.where(eq(settlement.id, home.id));
 	}
+}
+
+/**
+ * Removes `n` settlers to starvation, respecting the operation FK. `operation.character_id` is
+ * NOT NULL and has no cascade, so a character with *any* operation row — in-progress or long
+ * completed — cannot be deleted until those rows are gone (this is why `deletePlayer` deletes
+ * operations first). Idle settlers go before working ones, so an active gather or build is only
+ * cut short when the hungry tail truly demands it; the chosen bodies' operations are deleted,
+ * then the bodies.
+ *
+ * ponytail: everyone is a settler this epic, so "idle before working" is the whole ordering.
+ * Slice 5 adds specialists — extend the sort key to take settlers before specialists too.
+ */
+async function removeSettlers(tx: Tx, playerId: number, n: number): Promise<void> {
+	if (n <= 0) return;
+	const busy = new Set(
+		(
+			await tx
+				.select({ id: operation.characterId })
+				.from(operation)
+				.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')))
+		).map((r) => r.id)
+	);
+	const all = await tx
+		.select({ id: character.id })
+		.from(character)
+		.where(eq(character.playerId, playerId));
+	// Idle (not in an in-progress op) first, then working — take the first n.
+	const victims = all
+		.sort((a, b) => Number(busy.has(a.id)) - Number(busy.has(b.id)))
+		.slice(0, n)
+		.map((c) => c.id);
+	if (victims.length === 0) return;
+	// FK: every operation referencing a culled character must go before the character does.
+	await tx.delete(operation).where(inArray(operation.characterId, victims));
+	await tx.delete(character).where(inArray(character.id, victims));
 }
 
 type TileYield = {

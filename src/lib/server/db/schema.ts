@@ -78,6 +78,11 @@ export const resource = pgTable('resource', {
 	// Zero means "seeded on the map but not yet wired"; assignment refuses those outright
 	// rather than letting a worker stand in a clay pit earning nothing forever.
 	unitsPerHour: real('units_per_hour').notNull().default(0),
+	// Whether population eats this. Exactly one resource is the settlement's food, and the drain
+	// keys on this flag — never on display_name, which is the reskin column (VISION #10) and
+	// would silently stop draining the day 'Food' becomes 'koku'. A boolean, seeded true on the
+	// one, so "what people live on" is data, not a hard-coded name in the resolve loop.
+	isSustenance: boolean('is_sustenance').notNull().default(false),
 	// What a fresh realm starts holding of this resource — a runway so a new hamlet can eat and
 	// afford its first House before forage ramps (and, once population drains Food, before it
 	// starves). Content, not code (VISION #10): retuning the runway is an UPDATE. Default 0, so
@@ -126,7 +131,17 @@ export const settlement = pgTable('settlement', {
 	// same integrate-on-read trick `tile_stock.as_of` uses for regrowth, one timestamp for the
 	// whole settlement. Defaults to now so a fresh realm starts counting from creation; existing
 	// realms backfill to deploy time and grow from then, with no retroactive population.
-	populationAsOf: timestamp('population_as_of', { withTimezone: true }).notNull().defaultNow()
+	//
+	// Unlike Slice 3, this anchor now advances fully to `now` on every read: food is stored
+	// fractional and must drain smoothly with the clock, so the interval can't be held back the
+	// way whole-settler growth once was. The sub-person growth/starvation remainder is carried
+	// in populationAccrued instead — two concerns, two fields, each integrated cleanly.
+	populationAsOf: timestamp('population_as_of', { withTimezone: true }).notNull().defaultNow(),
+	// Signed fractional population pressure carried between reads: positive is a birth pending,
+	// negative a departure pending. A person is whole but growth and starvation are rates, so the
+	// leftover under one person rides here — this is what makes the result independent of how
+	// often the world is read (a week away equals a hundred visits).
+	populationAccrued: real('population_accrued').notNull().default(0)
 });
 
 // Global scalars that shape play but aren't per-anything: growth rate now, food and skill
@@ -138,8 +153,14 @@ export const gameConfig = pgTable(
 	'game_config',
 	{
 		id: integer('id').primaryKey().default(1),
-		// Settlers gained per real hour while there is spare housing and (Slice 4) food.
-		growthPerHour: real('growth_per_hour').notNull()
+		// Settlers gained per real hour while there is spare housing and food.
+		growthPerHour: real('growth_per_hour').notNull(),
+		// Food each person eats per real hour. Seeded below one forager's yield so the common
+		// "one forager feeds the hamlet" case stays fed (see population()'s ponytail note).
+		foodPerCapitaHour: real('food_per_capita_hour').notNull().default(0),
+		// People lost per real hour while starving. Gentle by design — the loss eases the drain,
+		// so a hungry settlement self-corrects rather than dropping off a cliff.
+		starvePerHour: real('starve_per_hour').notNull().default(0)
 	},
 	(t) => [check('game_config_singleton', sql`${t.id} = 1`)]
 );

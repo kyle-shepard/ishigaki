@@ -120,48 +120,85 @@ export function accrue(
 	return { harvested, quantity };
 }
 
+export type PopulationConfig = {
+	growthPerHour: number;
+	foodPerCapitaHour: number;
+	starvePerHour: number;
+};
+
 /**
- * How many settlers a settlement has gained over an interval, and how far to advance its
- * growth anchor. Pure and database-free for the same reason as `accrue`: population moves in
- * real time whether or not anyone is watching, so a week away must equal a hundred short
- * visits, and that property is only checkable where `npm test` can reach it.
+ * How a settlement's population and its food move over an interval. Pure and database-free for
+ * the same reason as `accrue`: this runs in real time whether or not anyone is watching, so the
+ * arithmetic has to live where `npm test` can reach it.
  *
- * People arrive to fill spare housing and stop at the cap — build a House, room opens, settlers
- * come. Growth is fractional (a rate per hour) but a person is whole, so births are only booked
- * as the accumulator crosses an integer. The un-booked remainder is carried not in a stored
- * fraction but in the *anchor we decline to advance*: `consumedSeconds` moves the anchor forward
- * only by the whole-settler portion, so the leftover time is re-counted on the next read. That
- * is what makes the result independent of how often it is called.
+ * One interval, three coupled things:
+ *  - **Food** drains at `pop × foodPerCapitaHour`. It is stored fractional and drained smoothly
+ *    over the whole elapsed interval, so the number on screen always agrees with the clock.
+ *  - **Growth**: while there is spare housing *and* food, settlers accrue at `growthPerHour`.
+ *  - **Starvation**: once food runs out, people leave at `starvePerHour` — gently, which lessens
+ *    the drain and lets the settlement self-correct. No hard cliff.
  *
- * The two clamp cases both sync the anchor fully to now (`consumedSeconds = elapsedSeconds`),
- * and this is load-bearing: at or over the cap, time spent full must NOT bank as a backlog, or
- * a House built after a week at capacity would fill instantly from stored-up time instead of
- * gradually. Over-cap time is discarded, not owed.
+ * Piecewise, not a loop: food covers the first `fedSeconds` of the interval (the whole of it, or
+ * up to the single crossover instant `food / drainRate`), and the settlement starves for the
+ * rest. Growth pressure accrues over the fed part, starvation pressure over the hungry part.
  *
- * ponytail: always-fed. Food does not enter yet — Slice 4 replaces this with a piecewise
- * fed/starving integrator. Don't over-fit callers to this shape.
+ * People are whole but the pressures are fractional, so the sub-person remainder is carried in
+ * `accrued` — a *signed* accumulator (positive = a birth pending, negative = a departure pending)
+ * threaded back in by the caller. That carry, not the interval length, is what makes the result
+ * independent of how often it is called. Two backlog clamps mirror `grow`'s old ones: at the cap
+ * positive pressure is discarded (a House built after a week full fills gradually, not instantly),
+ * and at zero population negative pressure is discarded (an emptied realm doesn't owe deaths).
+ *
+ * ponytail: within one interval `pop` is treated as constant for the food crossover — births and
+ * deaths that land mid-interval don't retroactively re-rate the drain. Exact only when pop holds
+ * (at the cap, or with no food crossover); elsewhere it is close at read cadence, and seeding
+ * `foodPerCapitaHour` below one forager's yield keeps the common "a forager feeds the hamlet"
+ * case correct. Split the interval at each birth/death if starvation ever feels wrong.
  */
-export function grow(
-	currentPop: number,
+export function population(
+	pop: number,
 	capacity: number,
-	ratePerHour: number,
+	food: number,
+	accrued: number,
+	config: PopulationConfig,
 	elapsedSeconds: number
-): { born: number; consumedSeconds: number } {
-	// Nothing to integrate — leave the anchor where it is so no sliver of time is lost.
-	if (elapsedSeconds <= 0 || ratePerHour <= 0) return { born: 0, consumedSeconds: 0 };
-	const room = capacity - currentPop;
-	// At or over the cap: no births, but sync the anchor to now so idle-at-capacity time can't
-	// accumulate into an instant fill when room later opens.
-	if (room <= 0) return { born: 0, consumedSeconds: elapsedSeconds };
+): { born: number; died: number; foodDrained: number; accrued: number } {
+	if (elapsedSeconds <= 0) return { born: 0, died: 0, foodDrained: 0, accrued };
 
-	const wanted = (ratePerHour * elapsedSeconds) / 3600;
-	// The cap is reached within this interval: take exactly the room, discard the excess time.
-	if (wanted >= room) return { born: room, consumedSeconds: elapsedSeconds };
+	// How long food lasts within this interval. pop constant across the interval (see ponytail).
+	const drainPerSecond = (pop * config.foodPerCapitaHour) / 3600;
+	const fedSeconds =
+		drainPerSecond > 0 ? Math.min(elapsedSeconds, food / drainPerSecond) : elapsedSeconds;
+	const foodDrained = drainPerSecond * fedSeconds; // = food when it runs out, else the full draw
+	const starveSeconds = elapsedSeconds - fedSeconds;
 
-	// Still below cap: book whole settlers only, and advance the anchor by just the time that
-	// produced them — the sub-settler remainder is carried by leaving the anchor short.
-	const born = Math.floor(wanted);
-	return { born, consumedSeconds: (born / ratePerHour) * 3600 };
+	let acc = accrued;
+	// Growth only where there is room *and* food. The `food > 0` gate is what stops an empty,
+	// unprovisioned settlement from conjuring settlers from nothing — with no mouths the drain is
+	// zero and `fedSeconds` spans the whole interval, so without it a realm at zero pop and zero
+	// food would still "grow". A stocked empty settlement does repopulate, which is the recovery
+	// path out of a starvation wipe. The fraction over the cap is not banked.
+	if (capacity - pop > 0 && food > 0) acc += (config.growthPerHour * fedSeconds) / 3600;
+	// Departures accrue over the hungry tail. Gentle by design — a low rate reads as "people
+	// drift away" rather than "the town dies at once".
+	acc -= (config.starvePerHour * starveSeconds) / 3600;
+
+	let born = 0;
+	let died = 0;
+	while (acc >= 1 && pop + born < capacity) {
+		born++;
+		acc -= 1;
+	}
+	while (acc <= -1 && pop - died > 0) {
+		died++;
+		acc += 1;
+	}
+	// No banking a backlog at either wall: full house discards surplus growth pressure, empty
+	// realm discards surplus starvation pressure. Between the walls the fraction is kept.
+	if (pop + born >= capacity && acc > 0) acc = 0;
+	if (pop - died <= 0 && acc < 0) acc = 0;
+
+	return { born, died, foodDrained, accrued: acc };
 }
 
 export type TravelLeg = {

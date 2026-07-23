@@ -77,13 +77,20 @@ const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 // The one global-scalar row. Upserted on the fixed id=1 so a live edit retunes the world in
 // place (VISION #10) rather than appending a second row the singleton CHECK would reject.
 // growthPerHour ~2 → a 4-room House fills from 3 settlers in about half an hour, slow enough
-// to feel real, fast enough to watch. Later slices add food/skill columns to this same row.
+// to feel real, fast enough to watch. foodPerCapitaHour 1 is well below one forager's 12/hr, so
+// a single forager keeps the hamlet fed with margin; the 40-Food runway lasts a few-mouth realm
+// ~10h unattended. starvePerHour 1 is gentle — a hungry realm sheds a person an hour and the
+// drain eases as it does, self-correcting rather than collapsing. All tunable live (VISION #10).
 await db
 	.insert(gameConfig)
-	.values([{ id: 1, growthPerHour: 2 }])
+	.values([{ id: 1, growthPerHour: 2, foodPerCapitaHour: 1, starvePerHour: 1 }])
 	.onConflictDoUpdate({
 		target: gameConfig.id,
-		set: { growthPerHour: sql`excluded.growth_per_hour` }
+		set: {
+			growthPerHour: sql`excluded.growth_per_hour`,
+			foodPerCapitaHour: sql`excluded.food_per_capita_hour`,
+			starvePerHour: sql`excluded.starve_per_hour`
+		}
 	});
 
 // units_per_hour is per worker, flat. Food is fast because forage is the bootstrap floor —
@@ -96,7 +103,7 @@ const resources = await db
 		// while forage ramps and enough Wood to afford a first House, so a new hamlet survives
 		// its first minutes before growth's Food drain lands (People epic, Slice 4). Everything
 		// else starts at zero — you go and take it.
-		{ displayName: 'Food', unitsPerHour: 12, startingStock: 40 },
+		{ displayName: 'Food', unitsPerHour: 12, startingStock: 40, isSustenance: true },
 		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 10 },
 		{ displayName: 'Stone', unitsPerHour: 2, startingStock: 0 },
 		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 0 },
@@ -106,7 +113,8 @@ const resources = await db
 		target: resource.displayName,
 		set: {
 			unitsPerHour: sql`excluded.units_per_hour`,
-			startingStock: sql`excluded.starting_stock`
+			startingStock: sql`excluded.starting_stock`,
+			isSustenance: sql`excluded.is_sustenance`
 		}
 	})
 	.returning();

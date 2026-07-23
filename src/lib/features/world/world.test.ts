@@ -1,7 +1,7 @@
 // Run: npm test  (node --test, no framework added)
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { accrue, grow, positionAt, travelFraction, travelSeconds } from './world.ts';
+import { accrue, population, positionAt, travelFraction, travelSeconds } from './world.ts';
 
 const leg = (startedAt: string, travelDoneAt: string) => ({
 	originX: 0,
@@ -151,51 +151,82 @@ test('the display path and the work path agree over the same interval', () => {
 	assert.equal(displayed.quantity, worked.quantity);
 });
 
-// Population growth. Like accrual, real-time and unwatchable at speed — pinned here.
+// Population and food. Like accrual, real-time and unwatchable at speed — pinned here.
+// Rates chosen so the common case holds: per-capita food (1/hr) below one forager's 12/hr yield.
+const FED = { growthPerHour: 2, foodPerCapitaHour: 1, starvePerHour: 2 };
+
+test('everyone eats, and a fed town below the cap grows', () => {
+	// 3 mouths for an hour is 3 food; 2/hr growth for that hour is two settlers, exactly.
+	const r = population(3, 10, 100, 0, FED, HOUR);
+	assert.equal(r.foodDrained, 3);
+	assert.equal(r.born, 2);
+	assert.equal(r.died, 0);
+	assert.ok(Math.abs(r.accrued - 0) < 1e-9, `carried ${r.accrued}`);
+});
 
 test('nobody is born before a whole settler has accrued', () => {
-	// 2/hr for half an hour is 1.0 settlers — but only just; a shade under is still zero.
-	assert.deepEqual(grow(3, 10, 2, HOUR / 2), { born: 1, consumedSeconds: HOUR / 2 });
-	assert.equal(grow(3, 10, 2, HOUR / 4).born, 0);
-	// And the anchor doesn't move while the fraction is still building, so it isn't lost.
-	assert.equal(grow(3, 10, 2, HOUR / 4).consumedSeconds, 0);
+	// Quarter hour at 2/hr is 0.5 — still nobody, and the fraction is held in `accrued`.
+	const r = population(3, 10, 100, 0, FED, HOUR / 4);
+	assert.equal(r.born, 0);
+	assert.ok(Math.abs(r.accrued - 0.5) < 1e-9);
 });
 
-test('growth stops at the housing cap', () => {
-	// Room for 2 more, but an hour at 2/hr wants 2 — exactly fills it.
-	assert.deepEqual(grow(8, 10, 2, HOUR), { born: 2, consumedSeconds: HOUR });
-	// Already full: no births, but the anchor syncs forward so full time cannot bank.
-	assert.deepEqual(grow(10, 10, 2, HOUR), { born: 0, consumedSeconds: HOUR });
-	// Over a long absence, still only the room — the extra time is discarded, not owed.
-	assert.deepEqual(grow(9, 10, 2, 100 * HOUR), { born: 1, consumedSeconds: 100 * HOUR });
+test('growth stops at the housing cap and banks no backlog', () => {
+	// At the cap, fed (food to spare): food still drains, but no births and no stored pressure.
+	const r = population(10, 10, 5000, 0, FED, 100 * HOUR);
+	assert.equal(r.born, 0);
+	assert.equal(r.accrued, 0, 'a hundred hours full does not bank into an instant fill later');
+	assert.equal(r.foodDrained, 1000, 'ten mouths at 1/hr still ate for a hundred hours');
 });
 
-test('no housing means no anchor drift into an instant fill', () => {
-	// A realm sat a week over/at capacity, then a House opens 4 rooms. The week must not
-	// have banked into four instant arrivals — the anchor was synced each read while full.
-	const away = grow(4, 4, 2, 7 * DAY); // at cap all week
-	assert.equal(away.born, 0);
-	assert.equal(away.consumedSeconds, 7 * DAY, 'anchor advanced to now, no backlog');
+// Starvation in isolation: growth switched off so the departure count is unambiguous. In play
+// the two net against each other in one interval (grew while fed, left while hungry).
+const STARVING = { ...FED, growthPerHour: 0 };
+
+test('food that runs out mid-interval starves the hungry tail', () => {
+	// 4 mouths at 1/hr drain 4 food/hr, so 6 food lasts 1.5h; the realm then starves for the
+	// remaining 0.5h at 2/hr — one departure, and every scrap of food is gone.
+	const r = population(4, 10, 6, 0, STARVING, 2 * HOUR);
+	assert.equal(r.foodDrained, 6, 'drained to empty, not below');
+	assert.equal(r.died, 1);
+	assert.equal(r.born, 0);
 });
 
-test('population growth is resolution-independent below the cap', () => {
-	// Far-off cap so nothing clamps: how often you look cannot change who is born. Clean
-	// half-hour steps at 1/hr keep every value exact, so this tests the model, not float drift.
-	const capacity = 1000;
-	const rate = 1;
-	const span = 10.5 * HOUR;
-	const away = grow(0, capacity, rate, span).born;
-	assert.equal(away, 10);
+test('an emptied realm owes no deaths once it hits zero', () => {
+	// One mouth, no food, long absence: it leaves, and the negative pressure is not banked
+	// into a debt that would kill the next arrival on sight.
+	const r = population(1, 10, 0, 0, FED, 7 * DAY);
+	assert.equal(r.died, 1);
+	assert.equal(r.accrued, 0);
+	assert.equal(r.foodDrained, 0, 'no food, nothing to drain');
+});
 
-	let pop = 0;
-	let carry = 0; // the time the anchor was left short of, re-counted next read
-	for (let i = 0; i < 21; i++) {
-		const elapsed = HOUR / 2 + carry;
-		const step = grow(pop, capacity, rate, elapsed);
-		pop += step.born;
-		carry = elapsed - step.consumedSeconds;
+test('an empty, unprovisioned settlement stays empty rather than conjuring settlers', () => {
+	// Zero pop means zero drain, so food never gates the interval — without the food check this
+	// would "grow" from nothing. With no food in store, it must not.
+	const r = population(0, 10, 0, 0, FED, DAY);
+	assert.deepEqual(r, { born: 0, died: 0, foodDrained: 0, accrued: 0 });
+});
+
+test('food drain is resolution-independent at a steady population', () => {
+	// At the cap with food to spare, pop holds all interval, so the drain is exactly linear and
+	// how often you look cannot change the total. Clean numbers keep it about the model, not float.
+	const span = 10 * HOUR;
+	const once = population(8, 8, 1000, 0, FED, span);
+	assert.equal(once.foodDrained, 8 * 10);
+	assert.equal(once.born, 0);
+
+	let food = 1000;
+	let drained = 0;
+	for (let i = 0; i < 40; i++) {
+		const step = population(8, 8, food, 0, FED, span / 40);
+		food -= step.foodDrained;
+		drained += step.foodDrained;
 	}
-	assert.equal(pop, away, 'same total whether watched once or twenty-one times');
+	assert.ok(
+		Math.abs(drained - once.foodDrained) < 1e-9,
+		`drifted by ${drained - once.foodDrained}`
+	);
 });
 
 test('a week away on a finite tile equals many visits', () => {
