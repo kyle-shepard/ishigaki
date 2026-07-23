@@ -59,8 +59,19 @@ export type PlayerSession = {
  */
 export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 	if (id !== null) {
-		const [found] = await db.select({ id: player.id }).from(player).where(eq(player.id, id));
-		if (found) return { playerId: found.id, worldReset: false };
+		// A usable realm is a player that still has a *settlement*, not merely a player row.
+		// resolveWorld opens by locking the settlement and dereferences it (home.id), so a
+		// player without one 500s on every read. App code never creates that state — player and
+		// settlement are made and destroyed together — but a save-breaking DB change can: the
+		// intended path deletes the player rows (see below), yet a partial rebuild that drops
+		// settlements while leaving players behind would strand every affected cookie in an
+		// unrecoverable retry loop. Checking the settlement here routes those cookies down the
+		// same mint-a-fresh-world-and-say-so path as a fully deleted realm.
+		const [home] = await db
+			.select({ id: settlement.id })
+			.from(settlement)
+			.where(eq(settlement.playerId, id));
+		if (home) return { playerId: id, worldReset: false };
 	}
 
 	const playerId = await db.transaction(async (tx) => {
