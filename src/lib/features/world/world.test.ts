@@ -8,6 +8,7 @@ import {
 	population,
 	positionAt,
 	rollStats,
+	skillValue,
 	STAT_MAX,
 	STAT_MIN,
 	travelFraction,
@@ -264,6 +265,39 @@ test('names prefer the unused, and never run dry', () => {
 	// Everyone taken: reuse rather than fail — a cosmetic collision, not an error.
 	const all = new Set(NAME_POOL);
 	assert.ok(NAME_POOL.includes(pickName(seeded(7), all)));
+});
+
+// Skill → quality. The whole "who does the job matters" mechanic, pinned so the 4–5× the design
+// asks for can't quietly erode. Baseline 0.15, curve 0.3 mirror the seeded game_config.
+const SKILL = { settlerBaseline: 0.15, skillCurve: 0.3 };
+const MID = (STAT_MIN + STAT_MAX) / 2;
+
+test('a settler works at the flat baseline, whatever the ground', () => {
+	// No bundle and no stats — the anonymous many all work the same.
+	assert.equal(skillValue(null, null, null, SKILL), 0.15);
+});
+
+test('an average-rolled specialist works at their trained value', () => {
+	// Governing stats at the middle of the range ⇒ no swing ⇒ exactly the bundle value.
+	assert.ok(Math.abs(skillValue(0.7, MID, MID, SKILL) - 0.7) < 1e-9);
+});
+
+test('a matched specialist beats a settler by the 4–5× the design asks for', () => {
+	// Worst and best rolls bracket the specialist band; both are ~4–5× the settler baseline.
+	const weak = skillValue(0.7, STAT_MIN, STAT_MIN, SKILL);
+	const strong = skillValue(0.7, STAT_MAX, STAT_MAX, SKILL);
+	assert.ok(weak > 0.55 && weak < 0.65, `weak specialist ${weak}`);
+	assert.ok(strong > 0.75 && strong < 0.85, `strong specialist ${strong}`);
+	assert.ok(strong > weak, 'a better roll is a better worker');
+	assert.ok(weak / SKILL.settlerBaseline >= 4, `${weak / SKILL.settlerBaseline}× is under 4`);
+	assert.ok(strong / SKILL.settlerBaseline <= 5.5, `${strong / SKILL.settlerBaseline}× over 5.5`);
+});
+
+test('a specialist off their craft falls back to the settler baseline', () => {
+	// A Mason foraging: no Foraging bundle ⇒ null ⇒ no better than a settler, so profession bites.
+	assert.equal(skillValue(null, STAT_MAX, STAT_MAX, SKILL), 0.15);
+	// And even a wretched roll at your own trade never drops below a settler.
+	assert.equal(skillValue(0.1, STAT_MIN, STAT_MIN, SKILL), 0.15);
 });
 
 test('a week away on a finite tile equals many visits', () => {

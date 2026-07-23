@@ -217,7 +217,12 @@ export const gameConfig = pgTable(
 		foodPerCapitaHour: real('food_per_capita_hour').notNull().default(0),
 		// People lost per real hour while starving. Gentle by design — the loss eases the drain,
 		// so a hungry settlement self-corrects rather than dropping off a cliff.
-		starvePerHour: real('starve_per_hour').notNull().default(0)
+		starvePerHour: real('starve_per_hour').notNull().default(0),
+		// What an untrained settler works at, as a multiplier on a job's flat rate (~0.15). The
+		// floor the whole quality curve is measured against.
+		settlerBaseline: real('settler_baseline').notNull().default(1),
+		// How much a specialist's governing stats swing their output around their trained value.
+		skillCurve: real('skill_curve').notNull().default(0)
 	},
 	(t) => [check('game_config_singleton', sql`${t.id} = 1`)]
 );
@@ -389,6 +394,13 @@ export const operation = pgTable(
 		// carries the calling the settler will emerge with. Edge-triggered like a build, so it
 		// also carries a complete_at (see the CHECK).
 		professionId: integer('profession_id').references(() => profession.id),
+		// The assigned worker's quality, snapshotted at assignment — a build divides its time by
+		// this, a gather multiplies its rate by it. Snapshotted (not re-derived on read) so "skills
+		// are fixed at training" holds for an in-flight job and the read path stays a plain multiply;
+		// the derivation from the live bundle happens once, at assignment. Default 1 (a train row,
+		// or the pre-quality flat rate). CHECK > 0 because a zero would divide-by-zero the build
+		// time and zero out a gather.
+		qualityMultiplier: real('quality_multiplier').notNull().default(1),
 		startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
 		travelDoneAt: timestamp('travel_done_at', { withTimezone: true }).notNull(),
 		// Null means "never finishes on its own" — a gather runs until it is recalled.
@@ -407,6 +419,7 @@ export const operation = pgTable(
 			sql`${t.type} <> 'build' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
 		),
 		check('operation_gather_accrues', sql`${t.type} <> 'gather' OR ${t.accruedAt} IS NOT NULL`),
+		check('operation_quality_positive', sql`${t.qualityMultiplier} > 0`),
 		// A train row is edge-triggered like a build and names the profession it will grant — both
 		// dereferenced on completion, so both are required at the DB rather than by convention.
 		check(

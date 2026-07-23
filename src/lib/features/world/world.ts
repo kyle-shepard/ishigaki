@@ -282,6 +282,45 @@ export function pickName(rng: () => number, taken: Set<string> = new Set()): str
 	return pool[Math.floor(rng() * pool.length)];
 }
 
+export type SkillConfig = {
+	// What an untrained settler works at — a flat multiplier on the reference rate.
+	settlerBaseline: number;
+	// How much a specialist's two governing stats swing their output around the trained value.
+	skillCurve: number;
+};
+
+/**
+ * The multiplier a worker applies to a job's flat rate — the whole "who does it changes the
+ * result" mechanic in one pure function, so it can be pinned in `npm test` rather than felt for.
+ *
+ * A settler (no skill bundle for this work, or no rolled stats) works at `settlerBaseline` — slow
+ * and poor, the same for every anonymous body. A specialist trained for this skill works at their
+ * `bundleValue`, swung by how their two governing stats compare to the middle of the roll range:
+ * a strong-for-the-job specialist beats a weak one, and both beat a settler by roughly the 4–5×
+ * the design asks for (baseline ~0.15 against a bundle ~0.7).
+ *
+ * A specialist doing work *outside* their profession — a Mason sent to forage — has no bundle
+ * for it and falls to the settler baseline, so profession is a real choice, not a free upgrade.
+ * The floor keeps even a poorly-rolled specialist from dropping below a settler at their own craft.
+ *
+ * Derived, never stored: the caller recomputes this from the live bundle at each assignment and
+ * snapshots only the result onto the operation, so retuning a profession reaches the next job a
+ * specialist takes (the design's "a balance edit still moves them") without rewriting history.
+ */
+export function skillValue(
+	bundleValue: number | null,
+	statA: number | null,
+	statB: number | null,
+	config: SkillConfig
+): number {
+	if (bundleValue === null || statA === null || statB === null) return config.settlerBaseline;
+	const mid = (STAT_MIN + STAT_MAX) / 2;
+	const statAvg = (statA + statB) / 2;
+	const mult = bundleValue * (1 + (config.skillCurve * (statAvg - mid)) / mid);
+	// Never worse at your own trade than an untrained settler, whatever the roll.
+	return Math.max(config.settlerBaseline, mult);
+}
+
 export type TravelLeg = {
 	originX: number;
 	originY: number;

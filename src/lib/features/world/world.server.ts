@@ -9,8 +9,10 @@ import {
 	operation,
 	player,
 	profession,
+	professionSkill,
 	resource,
 	settlement,
+	skill,
 	stock,
 	terrainType,
 	tile,
@@ -22,6 +24,7 @@ import {
 	pickName,
 	population,
 	rollStats,
+	skillValue,
 	travelSeconds,
 	type OrderReason,
 	type WorldPayload
@@ -258,8 +261,10 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 							agedSeconds: held ? (nowMs - held.asOf.getTime()) / 1000 : 0
 						}
 					: null;
+			// The flat rate scaled by who is working it — a matched specialist takes more per hour
+			// than an untrained settler. The multiplier was snapshotted at assignment.
 			const { harvested, quantity } = accrue(
-				yielded.unitsPerHour,
+				yielded.unitsPerHour * op.qualityMultiplier,
 				(nowMs - op.accruedAt!.getTime()) / 1000,
 				finite
 			);
@@ -433,6 +438,8 @@ async function removeSettlers(tx: Tx, playerId: number, n: number): Promise<void
 type TileYield = {
 	resourceId: number;
 	unitsPerHour: number;
+	/** Which action-skill takes this — how a gather ranks workers. Null if the resource is unwired. */
+	skillId: number | null;
 	/** Null is gathered — a person is enough. Set means the structure comes first. */
 	requiresBuildingTypeId: number | null;
 	/** Both null together where the deposit is infinite — the seed holds that invariant. */
@@ -448,6 +455,7 @@ async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 			y: tile.y,
 			resourceId: resource.id,
 			unitsPerHour: resource.unitsPerHour,
+			skillId: resource.skillId,
 			requiresBuildingTypeId: resource.requiresBuildingTypeId,
 			capacity: tile.quantity,
 			regrowSeconds: terrainType.regrowSeconds
@@ -456,6 +464,77 @@ async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
 		.innerJoin(resource, eq(terrainType.yieldsResourceId, resource.id));
 	return new Map(rows.map((r) => [r.y * GRID_SIZE + r.x, r]));
+}
+
+type BestWorker = { character: typeof character.$inferSelect; multiplier: number };
+
+/**
+ * The idle worker who does `skillId` best, and the quality multiplier they'd bring. This is the
+ * "who does the job changes the result" pick: a settler works at the flat baseline, a specialist
+ * at their derived skillValue, so auto-assign takes the best-skilled body by default and holding
+ * your best one back is a real choice. Returns null when nobody is idle.
+ *
+ * Derived from the *live* bundle every call (design decision: a profession retune reaches the next
+ * job a specialist takes); the caller snapshots only the resulting multiplier onto the operation.
+ */
+async function pickBestWorker(
+	tx: Tx,
+	playerId: number,
+	skillId: number
+): Promise<BestWorker | null> {
+	const busy = tx
+		.select({ id: operation.characterId })
+		.from(operation)
+		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+	const idle = await tx
+		.select()
+		.from(character)
+		.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)));
+	if (idle.length === 0) return null;
+
+	const [cfg] = await tx.select().from(gameConfig);
+	const config = {
+		settlerBaseline: cfg?.settlerBaseline ?? 1,
+		skillCurve: cfg?.skillCurve ?? 0
+	};
+	const [sk] = await tx.select().from(skill).where(eq(skill.id, skillId));
+	// profession → its trained value for this skill; absent means the profession doesn't carry it.
+	const bundle = new Map(
+		(await tx.select().from(professionSkill).where(eq(professionSkill.skillId, skillId))).map(
+			(r) => [r.professionId, r.value]
+		)
+	);
+	// The rolled value of a named base stat, or null for a settler (all stats null).
+	const statOf = (c: typeof character.$inferSelect, name: string) =>
+		name === 'strength'
+			? c.strength
+			: name === 'dexterity'
+				? c.dexterity
+				: name === 'constitution'
+					? c.constitution
+					: c.intelligence;
+
+	let best = idle[0];
+	let bestMult = -1;
+	for (const c of idle) {
+		const bundleValue = c.professionId !== null ? (bundle.get(c.professionId) ?? null) : null;
+		const mult = skillValue(bundleValue, statOf(c, sk.statA), statOf(c, sk.statB), config);
+		if (mult > bestMult) {
+			bestMult = mult;
+			best = c;
+		}
+	}
+	return { character: best, multiplier: bestMult };
+}
+
+/** The Construction skill's id — the relevant skill for every build. Looked up by its seed name. */
+async function constructionSkillId(tx: Tx): Promise<number> {
+	const [sk] = await tx
+		.select({ id: skill.id })
+		.from(skill)
+		.where(eq(skill.displayName, 'Construction'));
+	if (!sk) throw new Error('no Construction skill row — run `npm run seed` against this database');
+	return sk.id;
 }
 
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
@@ -548,16 +627,11 @@ export async function createBuildOrder(
 			);
 		if (pending) return { ok: false, reason: 'TILE_OCCUPIED' };
 
-		const busy = tx
-			.select({ id: operation.characterId })
-			.from(operation)
-			.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
-		const [idle] = await tx
-			.select()
-			.from(character)
-			.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)))
-			.limit(1);
-		if (!idle) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+		// The best builder, not merely the first idle body — a skilled worker builds faster
+		// (quality folds into the completion time below). Every build ranks by Construction.
+		const pick = await pickBestWorker(tx, playerId, await constructionSkillId(tx));
+		if (!pick) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+		const idle = pick.character;
 
 		// Cost comes last, because it is the only check that writes: a refusal on any earlier
 		// ground has to leave stock untouched. Deducted at order rather than on completion —
@@ -597,6 +671,9 @@ export async function createBuildOrder(
 			idle.speed,
 			(cx, cy) => groundAt(cx, cy).movementCost
 		);
+		// Build time divides by the worker's quality: a better builder finishes sooner. The
+		// multiplier is snapshotted so an in-flight build keeps the pace it started at.
+		const buildSeconds = type.buildSeconds / pick.multiplier;
 		await tx.insert(operation).values({
 			playerId,
 			characterId: idle.id,
@@ -607,9 +684,10 @@ export async function createBuildOrder(
 			destX: x,
 			destY: y,
 			buildingTypeId,
+			qualityMultiplier: pick.multiplier,
 			startedAt: sql`now()`,
 			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
-			completeAt: sql`now() + ${`${travel + type.buildSeconds} seconds`}::interval`
+			completeAt: sql`now() + ${`${travel + buildSeconds} seconds`}::interval`
 		});
 
 		return { ok: true, world: await readWorld(tx, playerId) };
@@ -655,16 +733,25 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 			if (!structure) return { ok: false, reason: 'MISSING_REQUIRED_BUILDING' };
 		}
 
-		const busy = tx
-			.select({ id: operation.characterId })
-			.from(operation)
-			.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
-		const [idle] = await tx
-			.select()
-			.from(character)
-			.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)))
-			.limit(1);
-		if (!idle) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+		// The best gatherer for this resource's skill, not merely the first idle body — a matched
+		// specialist takes more per hour (the rate scales by this multiplier in resolveWorld).
+		// A takeable resource always has a skill wired; fall back to a flat rank if somehow not.
+		const pick = yielded.skillId
+			? await pickBestWorker(tx, playerId, yielded.skillId)
+			: await (async () => {
+					const busy = tx
+						.select({ id: operation.characterId })
+						.from(operation)
+						.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+					const [c] = await tx
+						.select()
+						.from(character)
+						.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)))
+						.limit(1);
+					return c ? { character: c, multiplier: 1 } : null;
+				})();
+		if (!pick) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+		const idle = pick.character;
 
 		const grid = await loadGrid(tx);
 		const travel = travelSeconds(idle.x, idle.y, x, y, idle.speed, (cx, cy) => {
@@ -682,6 +769,8 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 			destX: x,
 			destY: y,
 			buildingTypeId: null,
+			// Snapshotted so the gather runs at the pace it began — skills are fixed once assigned.
+			qualityMultiplier: pick.multiplier,
 			startedAt: sql`now()`,
 			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
 			// Never finishes on its own.

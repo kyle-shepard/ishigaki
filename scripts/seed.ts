@@ -83,19 +83,34 @@ const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 // The one global-scalar row. Upserted on the fixed id=1 so a live edit retunes the world in
 // place (VISION #10) rather than appending a second row the singleton CHECK would reject.
 // growthPerHour ~2 → a 4-room House fills from 3 settlers in about half an hour, slow enough
-// to feel real, fast enough to watch. foodPerCapitaHour 1 is well below one forager's 12/hr, so
-// a single forager keeps the hamlet fed with margin; the 40-Food runway lasts a few-mouth realm
-// ~10h unattended. starvePerHour 1 is gentle — a hungry realm sheds a person an hour and the
-// drain eases as it does, self-correcting rather than collapsing. All tunable live (VISION #10).
+// to feel real, fast enough to watch. foodPerCapitaHour 0.4 is set against the *settler* forage
+// rate now that quality (Slice 6) applies: an untrained forager only yields ~12×0.15 ≈ 1.8/hr,
+// so per-capita must sit below that for a schoolless hamlet to survive on settler labor — a
+// trained Forager (~8/hr) then feeds a growing town easily. starvePerHour 1 is gentle — a hungry
+// realm sheds a person an hour and the drain eases as it does. All tunable live (VISION #10).
+// settlerBaseline 0.15 and skillCurve 0.3 set the quality band: a settler works at 0.15 of the
+// reference rate, a matched specialist at ~0.6–0.85 (their ~0.7 bundle swung by rolled stats) —
+// the ~4–5× the Q asks for. Both tunable live (VISION #10).
 await db
 	.insert(gameConfig)
-	.values([{ id: 1, growthPerHour: 2, foodPerCapitaHour: 1, starvePerHour: 1 }])
+	.values([
+		{
+			id: 1,
+			growthPerHour: 2,
+			foodPerCapitaHour: 0.4,
+			starvePerHour: 1,
+			settlerBaseline: 0.15,
+			skillCurve: 0.3
+		}
+	])
 	.onConflictDoUpdate({
 		target: gameConfig.id,
 		set: {
 			growthPerHour: sql`excluded.growth_per_hour`,
 			foodPerCapitaHour: sql`excluded.food_per_capita_hour`,
-			starvePerHour: sql`excluded.starve_per_hour`
+			starvePerHour: sql`excluded.starve_per_hour`,
+			settlerBaseline: sql`excluded.settler_baseline`,
+			skillCurve: sql`excluded.skill_curve`
 		}
 	});
 
