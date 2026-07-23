@@ -39,6 +39,19 @@
 	// Which profession to train at a School. Defaults to the first once a world arrives.
 	let chosenProfession = $state<number | null>(null);
 
+	// Light/dark. The real source of truth is documentElement.dataset.theme (set pre-paint in
+	// app.html); this mirrors it so the toggle button re-renders. Persisted to localStorage.
+	let theme = $state<'light' | 'dark'>('light');
+	function toggleTheme() {
+		theme = theme === 'dark' ? 'light' : 'dark';
+		document.documentElement.dataset.theme = theme;
+		try {
+			localStorage.setItem('theme', theme);
+		} catch {
+			// Private mode or blocked storage — the toggle still works for this session.
+		}
+	}
+
 	let world = $state<WorldPayload | null>(null);
 	let message = $state('');
 	// Sticky: the server reports a lost realm on one response only, and a heartbeat refresh
@@ -96,6 +109,9 @@
 	const settled = new Set<number>();
 
 	onMount(() => {
+		// Mirror whatever app.html's pre-paint script settled on.
+		theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+
 		let frame: number;
 
 		// Runs on a timer, not on rAF: a backgrounded tab suspends animation frames entirely,
@@ -344,194 +360,244 @@
 	const specialists = $derived(world?.characters.filter((c) => c.professionId !== null) ?? []);
 </script>
 
-<h1>石垣 Ishigaki</h1>
+<header class="topbar">
+	<div class="frame topbar-inner">
+		<h1>石垣 Ishigaki</h1>
+		<button class="theme-toggle" onclick={toggleTheme} aria-label="Toggle light or dark mode">
+			{theme === 'dark' ? '☀ Light' : '☾ Dark'}
+		</button>
+	</div>
+</header>
 
-{#if updated.current}
-	<p class="notice">
-		A new version of the world has been deployed.
-		<!-- Full reload, not goto(): the point is to drop the old JS this tab is running. -->
-		<button onclick={() => location.reload()}>Refresh</button>
-	</p>
-{/if}
+<main class="frame">
+	{#if updated.current}
+		<p class="notice">
+			A new version of the world has been deployed.
+			<!-- Full reload, not goto(): the point is to drop the old JS this tab is running. -->
+			<button onclick={() => location.reload()}>Refresh</button>
+		</p>
+	{/if}
 
-{#if worldReset}
-	<p class="notice">
-		Your previous realm couldn't be carried across a change to how the world works, so this is a
-		fresh start. Sorry — the world is still being built.
-	</p>
-{/if}
+	{#if worldReset}
+		<p class="notice">
+			Your previous realm couldn't be carried across a change to how the world works, so this is a
+			fresh start. Sorry — the world is still being built.
+		</p>
+	{/if}
 
-{#if world}
-	<Sprites />
-	<!-- Floored, not rounded: showing 5 Wood when you hold 4.9 and then refusing a 5-Wood
+	{#if world}
+		<Sprites />
+		<!-- Floored, not rounded: showing 5 Wood when you hold 4.9 and then refusing a 5-Wood
 	     build would read as the server lying. -->
-	<p class="stock">
-		{#each world.stock as s (s.resourceId)}
-			<span><b>{resourceName.get(s.resourceId)}</b> {Math.floor(s.quantity)}</span>
-		{/each}
-	</p>
-	<div class="layout">
-		<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
-			{#each tiles as t, i (t.x + ',' + t.y)}
-				<button
-					class="tile"
-					class:blocked={terrainAt(i)?.buildable === false}
-					class:selected={selected?.x === t.x && selected?.y === t.y}
-					style="background: {terrainAt(i)?.color}"
-					onclick={() => selectTile(t.x, t.y)}
-					aria-label={tileLabel(i, t.x, t.y)}
-				>
-					<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
-				     Parity of x+y rather than of the index, or the flips line up into stripes. -->
-					<svg
-						class="art"
-						viewBox="0 0 32 32"
-						style:transform={(t.x + t.y) % 2 ? 'scaleX(-1)' : null}
+		<p class="stock">
+			{#each world.stock as s (s.resourceId)}
+				<span><b>{resourceName.get(s.resourceId)}</b> {Math.floor(s.quantity)}</span>
+			{/each}
+		</p>
+		<div class="layout">
+			<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
+				{#each tiles as t, i (t.x + ',' + t.y)}
+					<button
+						class="tile"
+						class:blocked={terrainAt(i)?.buildable === false}
+						class:selected={selected?.x === t.x && selected?.y === t.y}
+						style="background: {terrainAt(i)?.color}"
+						onclick={() => selectTile(t.x, t.y)}
+						aria-label={tileLabel(i, t.x, t.y)}
 					>
-						<use href="#i-{terrainAt(i)?.icon}" />
+						<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
+				     Parity of x+y rather than of the index, or the flips line up into stripes. -->
+						<svg
+							class="art"
+							viewBox="0 0 32 32"
+							style:transform={(t.x + t.y) % 2 ? 'scaleX(-1)' : null}
+						>
+							<use href="#i-{terrainAt(i)?.icon}" />
+						</svg>
+					</button>
+				{/each}
+				{#each world.buildings as b (b.id)}
+					<svg
+						class="over"
+						viewBox="0 0 32 32"
+						style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
+					>
+						<use href="#i-{typeIcon(b.buildingTypeId)}" />
 					</svg>
-				</button>
-			{/each}
-			{#each world.buildings as b (b.id)}
-				<svg
-					class="over"
-					viewBox="0 0 32 32"
-					style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
-				>
-					<use href="#i-{typeIcon(b.buildingTypeId)}" />
-				</svg>
-			{/each}
-			<!-- Under construction is drawn from the operation: a building row only exists once
+				{/each}
+				<!-- Under construction is drawn from the operation: a building row only exists once
 		     built, so presence in `buildings` means finished. Same art, ghosted and pegged out —
 		     what's coming is legible before it's there. Builds only: a gather has no building
 		     type, and would otherwise paint an empty dashed square wherever someone is working. -->
-			{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
-				<svg
-					class="over site"
-					viewBox="0 0 32 32"
-					style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
-				>
-					<use href="#i-{typeIcon(o.buildingTypeId!)}" />
-				</svg>
-			{/each}
-			{#each dots as d (d.id)}
-				{@const off = slotOffset(d.slot)}
-				<svg
-					class="over"
-					viewBox="0 0 32 32"
-					style="transform: translate({d.x * CELL}px, {d.y * CELL}px)"
-				>
-					<circle class="dot" cx={16 + off[0]} cy={16 + off[1]} r="5" />
-				</svg>
-			{/each}
-			<!-- Specialists are pawns, not dots — a named individual reads as a body, not one of a
+				{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
+					<svg
+						class="over site"
+						viewBox="0 0 32 32"
+						style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
+					>
+						<use href="#i-{typeIcon(o.buildingTypeId!)}" />
+					</svg>
+				{/each}
+				{#each dots as d (d.id)}
+					{@const off = slotOffset(d.slot)}
+					<svg
+						class="over"
+						viewBox="0 0 32 32"
+						style="transform: translate({d.x * CELL}px, {d.y * CELL}px)"
+					>
+						<circle class="dot" cx={16 + off[0]} cy={16 + off[1]} r="5" />
+					</svg>
+				{/each}
+				<!-- Specialists are pawns, not dots — a named individual reads as a body, not one of a
 			     crowd. Distinct from the settler dots by silhouette. -->
-			{#each specialists as c (c.id)}
-				<svg
-					class="over"
-					viewBox="0 0 32 32"
-					style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
-				>
-					<use href="#i-pawn" />
-				</svg>
-			{/each}
+				{#each specialists as c (c.id)}
+					<svg
+						class="over"
+						viewBox="0 0 32 32"
+						style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
+					>
+						<use href="#i-pawn" />
+					</svg>
+				{/each}
+			</div>
+
+			<!-- The inspector: one surface for a tile's facts and every action it affords. Which buttons
+	     show is the tile's decision, not a mode the player has to set first. -->
+			<aside class="panel">
+				{#if !selected}
+					<p class="hint">Click a tile to inspect it.</p>
+				{:else}
+					<h2>Tile {selected.x}, {selected.y}</h2>
+					<p>
+						{selTerrain?.displayName ?? 'Unknown ground'}
+						{#if selYields !== null}
+							— yields {resourceName.get(selYields)}
+							{#if world.tileQuantity[selIndex] !== null && world.tileCapacity[selIndex] !== null}
+								({Math.floor(world.tileQuantity[selIndex]!)} of {world.tileCapacity[selIndex]} left)
+							{/if}
+						{/if}
+					</p>
+
+					{#if selBuilt}
+						<p><b>{typeName(selBuilt.buildingTypeId)}</b> stands here.</p>
+					{:else if selSite}
+						<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
+					{/if}
+
+					{#if present.length}
+						<h3>Workers here</h3>
+						<ul class="present">
+							{#each present as c (c.id)}
+								{@const op = opFor(c.id)}
+								<li>
+									{#if c.name}<b>{c.name}</b> ({professionName.get(c.professionId!)}) —
+									{/if}{doing(c)}
+									{#if op?.type === 'gather' && op.destX === selected.x && op.destY === selected.y}
+										<button onclick={() => recall(op.id)}>Recall</button>
+									{/if}
+								</li>
+							{/each}
+						</ul>
+					{/if}
+
+					{#if canBuild}
+						<h3>Build here</h3>
+						<ul class="build-picker">
+							{#each world.buildingTypes as bt (bt.id)}
+								<li>
+									<label>
+										<input type="radio" bind:group={chosen} value={bt.id} />
+										{bt.displayName}
+										<span class="price">{priceOf(bt.id)}</span>
+									</label>
+								</li>
+							{/each}
+						</ul>
+						<button onclick={buildHere} disabled={chosen === null}>Build</button>
+					{/if}
+
+					{#if selYields !== null}
+						<p><button onclick={gatherHere}>Send someone to gather</button></p>
+					{/if}
+
+					{#if selIsSchool}
+						<h3>Train a specialist</h3>
+						<ul class="build-picker">
+							{#each world.professions as p (p.id)}
+								<li>
+									<label>
+										<input type="radio" bind:group={chosenProfession} value={p.id} />
+										{p.displayName}
+									</label>
+								</li>
+							{/each}
+						</ul>
+						<button onclick={trainHere} disabled={chosenProfession === null}>Train a settler</button
+						>
+					{/if}
+				{/if}
+
+				{#if message}<p class="error">{message}</p>{/if}
+			</aside>
 		</div>
 
-		<!-- The inspector: one surface for a tile's facts and every action it affords. Which buttons
-	     show is the tile's decision, not a mode the player has to set first. -->
-		<aside class="panel">
-			{#if !selected}
-				<p class="hint">Click a tile to inspect it.</p>
-			{:else}
-				<h2>Tile {selected.x}, {selected.y}</h2>
-				<p>
-					{selTerrain?.displayName ?? 'Unknown ground'}
-					{#if selYields !== null}
-						— yields {resourceName.get(selYields)}
-						{#if world.tileQuantity[selIndex] !== null && world.tileCapacity[selIndex] !== null}
-							({Math.floor(world.tileQuantity[selIndex]!)} of {world.tileCapacity[selIndex]} left)
-						{/if}
-					{/if}
-				</p>
-
-				{#if selBuilt}
-					<p><b>{typeName(selBuilt.buildingTypeId)}</b> stands here.</p>
-				{:else if selSite}
-					<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
-				{/if}
-
-				{#if present.length}
-					<h3>Workers here</h3>
-					<ul class="present">
-						{#each present as c (c.id)}
-							{@const op = opFor(c.id)}
-							<li>
-								{#if c.name}<b>{c.name}</b> ({professionName.get(c.professionId!)}) —
-								{/if}{doing(c)}
-								{#if op?.type === 'gather' && op.destX === selected.x && op.destY === selected.y}
-									<button onclick={() => recall(op.id)}>Recall</button>
-								{/if}
-							</li>
-						{/each}
-					</ul>
-				{/if}
-
-				{#if canBuild}
-					<h3>Build here</h3>
-					<ul class="build-picker">
-						{#each world.buildingTypes as bt (bt.id)}
-							<li>
-								<label>
-									<input type="radio" bind:group={chosen} value={bt.id} />
-									{bt.displayName}
-									<span class="price">{priceOf(bt.id)}</span>
-								</label>
-							</li>
-						{/each}
-					</ul>
-					<button onclick={buildHere} disabled={chosen === null}>Build</button>
-				{/if}
-
-				{#if selYields !== null}
-					<p><button onclick={gatherHere}>Send someone to gather</button></p>
-				{/if}
-
-				{#if selIsSchool}
-					<h3>Train a specialist</h3>
-					<ul class="build-picker">
-						{#each world.professions as p (p.id)}
-							<li>
-								<label>
-									<input type="radio" bind:group={chosenProfession} value={p.id} />
-									{p.displayName}
-								</label>
-							</li>
-						{/each}
-					</ul>
-					<button onclick={trainHere} disabled={chosenProfession === null}>Train a settler</button>
-				{/if}
-			{/if}
-
-			{#if message}<p class="error">{message}</p>{/if}
-		</aside>
-	</div>
-
-	{#if specialists.length}
-		<!-- The specialist roster: find one by name even when they're out working the map. -->
-		<h3 class="roster-title">Specialists</h3>
-		<ul class="roster">
-			{#each specialists as c (c.id)}
-				<li>{who(c)} — {doing(c)}</li>
-			{/each}
-		</ul>
+		{#if specialists.length}
+			<!-- The specialist roster: find one by name even when they're out working the map. -->
+			<h3 class="roster-title">Specialists</h3>
+			<ul class="roster">
+				{#each specialists as c (c.id)}
+					<li>{who(c)} — {doing(c)}</li>
+				{/each}
+			</ul>
+		{/if}
+	{:else}
+		<p>Loading…</p>
 	{/if}
-{:else}
-	<p>Loading…</p>
-{/if}
 
-<p><button onclick={newGame}>New game</button></p>
+	<p><button onclick={newGame}>New game</button></p>
+</main>
 
 <style>
+	/* One shared width, centred — the header band's contents and the game frame line up. */
+	.frame {
+		max-width: 920px;
+		margin: 0 auto;
+		padding: 0 1rem;
+		box-sizing: border-box;
+	}
+	/* The offcolour header band, full-bleed, with the title and the theme toggle. */
+	.topbar {
+		background: var(--header-bg);
+		border-bottom: 1px solid var(--border);
+		margin-bottom: 1.25rem;
+	}
+	.topbar-inner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		padding-top: 0.6rem;
+		padding-bottom: 0.6rem;
+	}
+	.topbar h1 {
+		margin: 0;
+		font-size: 1.5rem;
+	}
+	.theme-toggle {
+		background: var(--panel-bg);
+		color: var(--text);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 0.35rem 0.7rem;
+		cursor: pointer;
+		font: inherit;
+	}
+	.theme-toggle:hover {
+		filter: brightness(0.97);
+	}
+	main.frame {
+		padding-bottom: 2rem;
+	}
 	.grid {
 		position: relative;
 		display: grid;
@@ -603,6 +669,10 @@
 	.panel {
 		min-width: 15rem;
 		max-width: 20rem;
+		background: var(--panel-bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 0.75rem 1rem;
 	}
 	.panel h2 {
 		margin: 0 0 0.25rem;
@@ -611,7 +681,7 @@
 		margin: 1rem 0 0.25rem;
 	}
 	.hint {
-		color: #6b7280;
+		color: var(--muted);
 	}
 	.roster-title {
 		margin: 1.25rem 0 0.25rem;
@@ -641,7 +711,7 @@
 		z-index: 1;
 	}
 	.price {
-		color: #6b7280;
+		color: var(--muted);
 	}
 	.error {
 		color: #b91c1c;
