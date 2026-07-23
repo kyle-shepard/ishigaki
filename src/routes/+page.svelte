@@ -8,6 +8,7 @@
 	import {
 		GRID_SIZE,
 		positionAt,
+		travelFraction,
 		type OrderReason,
 		type WorldPayload
 	} from '$lib/features/world/world';
@@ -26,9 +27,11 @@
 		UNKNOWN_OPERATION: 'Nobody is working there.'
 	};
 
-	// What a click on a tile means. Two verbs, one map.
-	let mode = $state<'build' | 'gather'>('build');
-	// Which building. Null until the first world arrives, then the first type in the catalog.
+	// A click selects a tile; the inspector panel to the right of the map owns the verbs. No
+	// mode toggle — the tile decides which actions are offered (buildable+empty ⇒ Build, yields
+	// something ⇒ Gather), and the panel shows them together.
+	let selected = $state<{ x: number; y: number } | null>(null);
+	// Which building to raise. Null until the first world arrives, then the first type in the catalog.
 	let chosen = $state<number | null>(null);
 
 	let world = $state<WorldPayload | null>(null);
@@ -154,13 +157,23 @@
 		}
 	}
 
-	function clickTile(x: number, y: number) {
-		if (mode === 'gather') {
-			act('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
-			return;
-		}
-		if (chosen === null) return;
+	// A click no longer acts — it selects. The panel's buttons act on the selection. Clearing
+	// any prior refusal so a stale "everyone is busy" doesn't hang over a freshly picked tile.
+	function selectTile(x: number, y: number) {
+		selected = { x, y };
+		if (message !== TROUBLE) message = '';
+	}
+
+	function buildHere() {
+		if (!selected || chosen === null) return;
+		const { x, y } = selected;
 		act('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId: chosen }) });
+	}
+
+	function gatherHere() {
+		if (!selected) return;
+		const { x, y } = selected;
+		act('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
 	}
 
 	const recall = (id: number) => act(`/api/assignments/${id}`, { method: 'DELETE' });
@@ -219,7 +232,6 @@
 		return `Tile ${x}, ${y} — ${t.displayName}${yield_}${on}`;
 	}
 	const typeName = (id: number) => buildingTypeById.get(id)?.displayName ?? '?';
-	const gathering = $derived(world?.operations.filter((o) => o.type === 'gather') ?? []);
 	// A building with no cost rows is free, and says so rather than showing an empty bracket.
 	function priceOf(id: number) {
 		const parts = (world?.buildingCosts ?? [])
@@ -240,32 +252,46 @@
 		const op = world?.operations.find((o) => o.characterId === c.id);
 		return op ? positionAt(op, nowMs) : c;
 	}
+	const opFor = (id: number) => world?.operations.find((o) => o.characterId === id);
+	// What a worker is doing right now, for the panel. Walking is derived from the travel leg,
+	// not a stored status — a worker mid-trip reads as walking whatever they'll do on arrival.
+	function doing(c: { id: number }): string {
+		const op = opFor(c.id);
+		if (!op) return 'idle';
+		if (travelFraction(op, nowMs) < 1) return `walking to ${op.destX}, ${op.destY}`;
+		if (op.type === 'build') return `building ${typeName(op.buildingTypeId!)}`;
+		return `gathering ${resourceAt(op.destX, op.destY)}`;
+	}
+
+	// Everything the panel reads off the selected tile. Derived, so a build landing or a worker
+	// arriving updates the open panel with no re-click. `present` keys on live position, so it
+	// recomputes as nowMs advances and workers walk on and off the tile.
+	const selIndex = $derived(selected ? selected.y * GRID_SIZE + selected.x : -1);
+	const selTerrain = $derived(selected ? terrainAt(selIndex) : undefined);
+	const selYields = $derived(selTerrain?.yieldsResourceId ?? null);
+	const selBuilt = $derived(
+		selected ? world?.buildings.find((b) => b.x === selected!.x && b.y === selected!.y) : undefined
+	);
+	const selSite = $derived(
+		selected
+			? world?.operations.find(
+					(o) => o.type === 'build' && o.destX === selected!.x && o.destY === selected!.y
+				)
+			: undefined
+	);
+	// Build is offered only where the ground allows it and nothing already stands or is rising.
+	const canBuild = $derived(!!selected && selTerrain?.buildable === true && !selBuilt && !selSite);
+	const present = $derived(
+		selected && world
+			? world.characters.filter((c) => {
+					const p = at(c);
+					return Math.round(p.x) === selected!.x && Math.round(p.y) === selected!.y;
+				})
+			: []
+	);
 </script>
 
 <h1>石垣 Ishigaki</h1>
-
-<p class="modes">
-	<label><input type="radio" bind:group={mode} value="build" /> Build</label>
-	<label><input type="radio" bind:group={mode} value="gather" /> Send someone to gather</label>
-</p>
-
-{#if world && mode === 'build'}
-	<p class="modes">
-		{#each world.buildingTypes as t (t.id)}
-			<label>
-				<input type="radio" bind:group={chosen} value={t.id} />
-				{t.displayName}
-				<span class="price">{priceOf(t.id)}</span>
-			</label>
-		{/each}
-	</p>
-{/if}
-
-<p>
-	{mode === 'build'
-		? 'Click an empty tile to order it there.'
-		: 'Click ground that yields something to put someone to work on it.'}
-</p>
 
 {#if updated.current}
 	<p class="notice">
@@ -291,74 +317,126 @@
 			<span><b>{resourceName.get(s.resourceId)}</b> {Math.floor(s.quantity)}</span>
 		{/each}
 	</p>
-	<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
-		{#each tiles as t, i (t.x + ',' + t.y)}
-			<button
-				class="tile"
-				class:blocked={terrainAt(i)?.buildable === false}
-				style="background: {terrainAt(i)?.color}"
-				onclick={() => clickTile(t.x, t.y)}
-				aria-label={tileLabel(i, t.x, t.y)}
-			>
-				<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
-				     Parity of x+y rather than of the index, or the flips line up into stripes. -->
-				<svg
-					class="art"
-					viewBox="0 0 32 32"
-					style:transform={(t.x + t.y) % 2 ? 'scaleX(-1)' : null}
+	<div class="layout">
+		<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
+			{#each tiles as t, i (t.x + ',' + t.y)}
+				<button
+					class="tile"
+					class:blocked={terrainAt(i)?.buildable === false}
+					class:selected={selected?.x === t.x && selected?.y === t.y}
+					style="background: {terrainAt(i)?.color}"
+					onclick={() => selectTile(t.x, t.y)}
+					aria-label={tileLabel(i, t.x, t.y)}
 				>
-					<use href="#i-{terrainAt(i)?.icon}" />
+					<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
+				     Parity of x+y rather than of the index, or the flips line up into stripes. -->
+					<svg
+						class="art"
+						viewBox="0 0 32 32"
+						style:transform={(t.x + t.y) % 2 ? 'scaleX(-1)' : null}
+					>
+						<use href="#i-{terrainAt(i)?.icon}" />
+					</svg>
+				</button>
+			{/each}
+			{#each world.buildings as b (b.id)}
+				<svg
+					class="over"
+					viewBox="0 0 32 32"
+					style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
+				>
+					<use href="#i-{typeIcon(b.buildingTypeId)}" />
 				</svg>
-			</button>
-		{/each}
-		{#each world.buildings as b (b.id)}
-			<svg
-				class="over"
-				viewBox="0 0 32 32"
-				style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
-			>
-				<use href="#i-{typeIcon(b.buildingTypeId)}" />
-			</svg>
-		{/each}
-		<!-- Under construction is drawn from the operation: a building row only exists once
+			{/each}
+			<!-- Under construction is drawn from the operation: a building row only exists once
 		     built, so presence in `buildings` means finished. Same art, ghosted and pegged out —
 		     what's coming is legible before it's there. Builds only: a gather has no building
 		     type, and would otherwise paint an empty dashed square wherever someone is working. -->
-		{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
-			<svg
-				class="over site"
-				viewBox="0 0 32 32"
-				style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
-			>
-				<use href="#i-{typeIcon(o.buildingTypeId!)}" />
-			</svg>
-		{/each}
-		{#each world.characters as c (c.id)}
-			<svg
-				class="over"
-				viewBox="0 0 32 32"
-				style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
-			>
-				<use href="#i-pawn" />
-			</svg>
-		{/each}
+			{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
+				<svg
+					class="over site"
+					viewBox="0 0 32 32"
+					style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
+				>
+					<use href="#i-{typeIcon(o.buildingTypeId!)}" />
+				</svg>
+			{/each}
+			{#each world.characters as c (c.id)}
+				<svg
+					class="over"
+					viewBox="0 0 32 32"
+					style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
+				>
+					<use href="#i-pawn" />
+				</svg>
+			{/each}
+		</div>
+
+		<!-- The inspector: one surface for a tile's facts and every action it affords. Which buttons
+	     show is the tile's decision, not a mode the player has to set first. -->
+		<aside class="panel">
+			{#if !selected}
+				<p class="hint">Click a tile to inspect it.</p>
+			{:else}
+				<h2>Tile {selected.x}, {selected.y}</h2>
+				<p>
+					{selTerrain?.displayName ?? 'Unknown ground'}
+					{#if selYields !== null}
+						— yields {resourceName.get(selYields)}
+						{#if world.tileQuantity[selIndex] !== null && world.tileCapacity[selIndex] !== null}
+							({Math.floor(world.tileQuantity[selIndex]!)} of {world.tileCapacity[selIndex]} left)
+						{/if}
+					{/if}
+				</p>
+
+				{#if selBuilt}
+					<p><b>{typeName(selBuilt.buildingTypeId)}</b> stands here.</p>
+				{:else if selSite}
+					<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
+				{/if}
+
+				{#if present.length}
+					<h3>Workers here</h3>
+					<ul class="present">
+						{#each present as c (c.id)}
+							{@const op = opFor(c.id)}
+							<li>
+								{doing(c)}
+								{#if op?.type === 'gather' && op.destX === selected.x && op.destY === selected.y}
+									<button onclick={() => recall(op.id)}>Recall</button>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				{/if}
+
+				{#if canBuild}
+					<h3>Build here</h3>
+					<ul class="build-picker">
+						{#each world.buildingTypes as bt (bt.id)}
+							<li>
+								<label>
+									<input type="radio" bind:group={chosen} value={bt.id} />
+									{bt.displayName}
+									<span class="price">{priceOf(bt.id)}</span>
+								</label>
+							</li>
+						{/each}
+					</ul>
+					<button onclick={buildHere} disabled={chosen === null}>Build</button>
+				{/if}
+
+				{#if selYields !== null}
+					<p><button onclick={gatherHere}>Send someone to gather</button></p>
+				{/if}
+			{/if}
+
+			{#if message}<p class="error">{message}</p>{/if}
+		</aside>
 	</div>
 {:else}
 	<p>Loading…</p>
 {/if}
-
-{#if gathering.length}
-	<ul class="crew">
-		{#each gathering as o (o.id)}
-			<li>
-				Gathering {resourceAt(o.destX, o.destY)} at {o.destX}, {o.destY}
-				<button onclick={() => recall(o.id)}>Recall</button>
-			</li>
-		{/each}
-	</ul>
-{/if}
-
-{#if message}<p class="error">{message}</p>{/if}
 
 <p><button onclick={newGame}>New game</button></p>
 
@@ -418,16 +496,46 @@
 		gap: 1rem;
 		font-variant-numeric: tabular-nums;
 	}
-	.modes {
+	/* Map and inspector side by side; the panel wraps under the map on a narrow screen. */
+	.layout {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 1rem;
+		gap: 1.5rem;
+		align-items: flex-start;
+	}
+	.panel {
+		min-width: 15rem;
+		max-width: 20rem;
+	}
+	.panel h2 {
+		margin: 0 0 0.25rem;
+	}
+	.panel h3 {
+		margin: 1rem 0 0.25rem;
+	}
+	.hint {
+		color: #6b7280;
+	}
+	.present,
+	.build-picker {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+	}
+	.build-picker label {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	/* A ring on the selected tile — outline so it sits over the art without shrinking it, same
+	   trick as .site. Drawn above neighbours so the ring isn't clipped by the next cell's border. */
+	.tile.selected {
+		outline: 2px solid #1d4ed8;
+		outline-offset: -2px;
+		z-index: 1;
 	}
 	.price {
 		color: #6b7280;
-	}
-	.crew {
-		padding-left: 1.2rem;
 	}
 	.error {
 		color: #b91c1c;
