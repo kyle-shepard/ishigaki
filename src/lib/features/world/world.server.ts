@@ -7,6 +7,7 @@ import {
 	character,
 	gameConfig,
 	operation,
+	operationWorker,
 	player,
 	profession,
 	professionSkill,
@@ -57,6 +58,20 @@ const STARTING_CHARACTERS = 3;
 const TRAIN_SECONDS = 30;
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Who is unavailable — every body on an in-progress operation, as a subquery to filter against.
+ * Idle is the complement, and is *derived* rather than stored: there is no busy flag to fall out
+ * of sync with reality. Written once here rather than three times inline, because "who is on this
+ * op" now means a membership row and a second copy of that join is a second thing to get wrong.
+ */
+function busyCharacterIds(tx: Tx, playerId: number) {
+	return tx
+		.select({ id: operationWorker.characterId })
+		.from(operationWorker)
+		.innerJoin(operation, eq(operationWorker.operationId, operation.id))
+		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+}
 
 export type PlayerSession = {
 	playerId: number;
@@ -234,6 +249,22 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')))
 		.for('update');
 
+	// The crews, in one read rather than one per operation. Keyed by operation id; a gather or a
+	// training always has exactly one member, a build may have several.
+	const crews = new Map<number, (typeof operationWorker.$inferSelect)[]>();
+	if (active.length) {
+		const rows = await tx
+			.select()
+			.from(operationWorker)
+			.where(
+				inArray(
+					operationWorker.operationId,
+					active.map((op) => op.id)
+				)
+			);
+		for (const r of rows) crews.set(r.operationId, [...(crews.get(r.operationId) ?? []), r]);
+	}
+
 	const gathers = active.filter((op) => op.type === 'gather');
 	// One catalog read, and only when somebody is actually working.
 	const yields = gathers.length ? await tileYields(tx) : new Map();
@@ -305,6 +336,10 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 		if (op.completeAt!.getTime() > nowMs) continue;
 		await tx.update(operation).set({ status: 'completed' }).where(eq(operation.id, op.id));
 
+		// The bodies that worked it. Empty would mean a crewless operation survived the starvation
+		// sweep — nothing to move, and nothing that makes a building any less finished.
+		const crew = crews.get(op.id) ?? [];
+
 		if (op.type === 'train') {
 			// The settler becomes a named specialist of the trained profession, standing at the
 			// School. Stats are rolled and a name picked here — the one place Math.random enters,
@@ -316,6 +351,8 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 				.from(character)
 				.where(and(eq(character.playerId, playerId), sql`${character.name} IS NOT NULL`));
 			const stats = rollStats(Math.random);
+			// A training's crew is the one settler being taught.
+			if (!crew.length) continue;
 			await tx
 				.update(character)
 				.set({
@@ -328,7 +365,7 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 					x: op.destX,
 					y: op.destY
 				})
-				.where(eq(character.id, op.characterId));
+				.where(eq(character.id, crew[0].characterId));
 			continue;
 		}
 
@@ -338,10 +375,17 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			y: op.destY,
 			buildingTypeId: op.buildingTypeId!
 		});
-		await tx
-			.update(character)
-			.set({ x: op.destX, y: op.destY })
-			.where(eq(character.id, op.characterId));
+		// The whole crew ends up standing at the site they raised.
+		if (crew.length)
+			await tx
+				.update(character)
+				.set({ x: op.destX, y: op.destY })
+				.where(
+					inArray(
+						character.id,
+						crew.map((m) => m.characterId)
+					)
+				);
 	}
 
 	// Population and food, integrated from the settlement's own anchor — the same integrate-on-read
@@ -406,27 +450,77 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 	}
 }
 
+/** Puts a build's full cost back — the placement deduction run with `+` instead of `-`. */
+async function refundBuild(tx: Tx, settlementId: number, buildingTypeId: number): Promise<void> {
+	const costs = await tx
+		.select()
+		.from(buildingCost)
+		.where(eq(buildingCost.buildingTypeId, buildingTypeId));
+	for (const c of costs) {
+		await tx
+			.update(stock)
+			.set({ quantity: sql`${stock.quantity} + ${c.quantity}` })
+			.where(and(eq(stock.settlementId, settlementId), eq(stock.resourceId, c.resourceId)));
+	}
+}
+
 /**
- * Removes `n` settlers to starvation, respecting the operation FK. `operation.character_id` is
- * NOT NULL and has no cascade, so a character with *any* operation row — in-progress or long
- * completed — cannot be deleted until those rows are gone (this is why `deletePlayer` deletes
- * operations first). Idle settlers go before working ones, so an active gather or build is only
- * cut short when the hungry tail truly demands it; the chosen bodies' operations are deleted,
- * then the bodies.
+ * Deletes any in-progress operation left with nobody on it, refunding the builds among them.
  *
- * ponytail: everyone is a settler this epic, so "idle before working" is the whole ordering.
- * Slice 5 adds specialists — extend the sort key to take settlers before specialists too.
+ * An operation *is* its crew — with the crew gone there is nobody to move on completion and
+ * nobody to pay, so leaving the row would strand a build that completes into a building nobody
+ * raised, or a gather quietly accruing into stock with nobody working it. Only reachable through
+ * starvation today (its one caller), which is exactly why it is a named function rather than two
+ * lines inside one: it is the invariant, not a step of the famine.
+ *
+ * Scoped to in-progress on purpose: a *completed* operation whose members were later culled is
+ * history, and refunding it would pay a second time for a building that stands.
+ */
+async function deleteCrewlessOperations(tx: Tx, playerId: number): Promise<void> {
+	const crewless = await tx
+		.select({ id: operation.id, type: operation.type, buildingTypeId: operation.buildingTypeId })
+		.from(operation)
+		.where(
+			and(
+				eq(operation.playerId, playerId),
+				eq(operation.status, 'in-progress'),
+				notInArray(
+					operation.id,
+					tx.select({ id: operationWorker.operationId }).from(operationWorker)
+				)
+			)
+		);
+	if (crewless.length === 0) return;
+
+	const builds = crewless.filter((op) => op.type === 'build');
+	if (builds.length) {
+		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
+		if (!home) throw new Error(`player ${playerId} has no settlement`);
+		for (const b of builds) await refundBuild(tx, home.id, b.buildingTypeId!);
+	}
+	// The membership rows go with it by cascade — there are none left to go.
+	await tx.delete(operation).where(
+		inArray(
+			operation.id,
+			crewless.map((op) => op.id)
+		)
+	);
+}
+
+/**
+ * Removes `n` settlers to starvation, respecting the operation_worker FK. `character_id` there is
+ * deliberately uncascaded, so a character on *any* operation — in-progress or long completed —
+ * cannot be deleted until those membership rows are gone. Idle settlers go before working ones and
+ * crew members go last, so an active build is only cut short when the hungry tail truly demands it.
+ *
+ * ponytail: a cull does not re-solve the survivors' `complete_at` — a build finishes on its
+ * original schedule with one fewer body. Re-solving would push recomputation into `resolveWorld`
+ * and cost it the compute-once-at-order property. Solve on the remaining crew here the day a
+ * famine mid-build reads as wrong.
  */
 async function removeSettlers(tx: Tx, playerId: number, n: number): Promise<void> {
 	if (n <= 0) return;
-	const busy = new Set(
-		(
-			await tx
-				.select({ id: operation.characterId })
-				.from(operation)
-				.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')))
-		).map((r) => r.id)
-	);
+	const busy = new Set((await busyCharacterIds(tx, playerId)).map((r) => r.id));
 	const all = await tx
 		.select({ id: character.id })
 		.from(character)
@@ -437,8 +531,9 @@ async function removeSettlers(tx: Tx, playerId: number, n: number): Promise<void
 		.slice(0, n)
 		.map((c) => c.id);
 	if (victims.length === 0) return;
-	// FK: every operation referencing a culled character must go before the character does.
-	await tx.delete(operation).where(inArray(operation.characterId, victims));
+	// FK: every membership row naming a culled character must go before the character does.
+	await tx.delete(operationWorker).where(inArray(operationWorker.characterId, victims));
+	await deleteCrewlessOperations(tx, playerId);
 	await tx.delete(character).where(inArray(character.id, victims));
 }
 
@@ -489,14 +584,15 @@ async function pickBestWorker(
 	playerId: number,
 	skillId: number
 ): Promise<BestWorker | null> {
-	const busy = tx
-		.select({ id: operation.characterId })
-		.from(operation)
-		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
 	const idle = await tx
 		.select()
 		.from(character)
-		.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)));
+		.where(
+			and(
+				eq(character.playerId, playerId),
+				notInArray(character.id, busyCharacterIds(tx, playerId))
+			)
+		);
 	if (idle.length === 0) return null;
 
 	const [cfg] = await tx.select().from(gameConfig);
@@ -724,20 +820,27 @@ export async function createBuildOrder(
 		// Build time divides by the worker's quality: a better builder finishes sooner. The
 		// multiplier is snapshotted so an in-flight build keeps the pace it started at.
 		const buildSeconds = type.buildSeconds / pick.multiplier;
-		await tx.insert(operation).values({
-			playerId,
+		const [op] = await tx
+			.insert(operation)
+			.values({
+				playerId,
+				type: 'build',
+				status: 'in-progress',
+				destX: x,
+				destY: y,
+				buildingTypeId,
+				qualityMultiplier: pick.multiplier,
+				startedAt: sql`now()`,
+				completeAt: sql`now() + ${`${travel + buildSeconds} seconds`}::interval`
+			})
+			.returning({ id: operation.id });
+		await tx.insert(operationWorker).values({
+			operationId: op.id,
 			characterId: idle.id,
-			type: 'build',
-			status: 'in-progress',
+			qualityMultiplier: pick.multiplier,
 			originX: idle.x,
 			originY: idle.y,
-			destX: x,
-			destY: y,
-			buildingTypeId,
-			qualityMultiplier: pick.multiplier,
-			startedAt: sql`now()`,
-			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
-			completeAt: sql`now() + ${`${travel + buildSeconds} seconds`}::interval`
+			arrivesAt: sql`now() + ${`${travel} seconds`}::interval`
 		});
 
 		return { ok: true, world: await readWorld(tx, playerId) };
@@ -789,14 +892,15 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		const pick = yielded.skillId
 			? await pickBestWorker(tx, playerId, yielded.skillId)
 			: await (async () => {
-					const busy = tx
-						.select({ id: operation.characterId })
-						.from(operation)
-						.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
 					const [c] = await tx
 						.select()
 						.from(character)
-						.where(and(eq(character.playerId, playerId), notInArray(character.id, busy)))
+						.where(
+							and(
+								eq(character.playerId, playerId),
+								notInArray(character.id, busyCharacterIds(tx, playerId))
+							)
+						)
 						.limit(1);
 					return c ? { character: c, multiplier: 1 } : null;
 				})();
@@ -809,25 +913,32 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 			if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
 			return g.movementCost;
 		});
-		await tx.insert(operation).values({
-			playerId,
+		const [op] = await tx
+			.insert(operation)
+			.values({
+				playerId,
+				type: 'gather',
+				status: 'in-progress',
+				destX: x,
+				destY: y,
+				buildingTypeId: null,
+				// Snapshotted so the gather runs at the pace it began — skills are fixed once assigned.
+				qualityMultiplier: pick.multiplier,
+				startedAt: sql`now()`,
+				// Never finishes on its own.
+				completeAt: null,
+				// Work starts on arrival. Distance therefore costs the trip and nothing else — two
+				// identical forests pay the same however far apart they are.
+				accruedAt: sql`now() + ${`${travel} seconds`}::interval`
+			})
+			.returning({ id: operation.id });
+		await tx.insert(operationWorker).values({
+			operationId: op.id,
 			characterId: idle.id,
-			type: 'gather',
-			status: 'in-progress',
+			qualityMultiplier: pick.multiplier,
 			originX: idle.x,
 			originY: idle.y,
-			destX: x,
-			destY: y,
-			buildingTypeId: null,
-			// Snapshotted so the gather runs at the pace it began — skills are fixed once assigned.
-			qualityMultiplier: pick.multiplier,
-			startedAt: sql`now()`,
-			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
-			// Never finishes on its own.
-			completeAt: null,
-			// Work starts on arrival. Distance therefore costs the trip and nothing else — two
-			// identical forests pay the same however far apart they are.
-			accruedAt: sql`now() + ${`${travel} seconds`}::interval`
+			arrivesAt: sql`now() + ${`${travel} seconds`}::interval`
 		});
 
 		return { ok: true, world: await readWorld(tx, playerId) };
@@ -880,10 +991,6 @@ export async function assignTraining(
 
 		// A settler specifically — a specialist is already trained, and this is what makes holding
 		// one back a real choice. Idle (in no in-progress operation) and profession-less.
-		const busy = tx
-			.select({ id: operation.characterId })
-			.from(operation)
-			.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
 		const [settler] = await tx
 			.select()
 			.from(character)
@@ -891,7 +998,7 @@ export async function assignTraining(
 				and(
 					eq(character.playerId, playerId),
 					isNull(character.professionId),
-					notInArray(character.id, busy)
+					notInArray(character.id, busyCharacterIds(tx, playerId))
 				)
 			)
 			.limit(1);
@@ -903,21 +1010,29 @@ export async function assignTraining(
 			if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
 			return g.movementCost;
 		});
-		await tx.insert(operation).values({
-			playerId,
+		const [op] = await tx
+			.insert(operation)
+			.values({
+				playerId,
+				type: 'train',
+				status: 'in-progress',
+				destX: x,
+				destY: y,
+				buildingTypeId: null,
+				professionId,
+				startedAt: sql`now()`,
+				// Edge-triggered: finishes on its own once travel plus the training time is up.
+				completeAt: sql`now() + ${`${travel + TRAIN_SECONDS} seconds`}::interval`
+			})
+			.returning({ id: operation.id });
+		await tx.insert(operationWorker).values({
+			operationId: op.id,
 			characterId: settler.id,
-			type: 'train',
-			status: 'in-progress',
+			// A training has no workmanship of its own — the settler is the work, not the worker.
+			qualityMultiplier: 1,
 			originX: settler.x,
 			originY: settler.y,
-			destX: x,
-			destY: y,
-			buildingTypeId: null,
-			professionId,
-			startedAt: sql`now()`,
-			travelDoneAt: sql`now() + ${`${travel} seconds`}::interval`,
-			// Edge-triggered: finishes on its own once travel plus the training time is up.
-			completeAt: sql`now() + ${`${travel + TRAIN_SECONDS} seconds`}::interval`
+			arrivesAt: sql`now() + ${`${travel} seconds`}::interval`
 		});
 
 		return { ok: true, world: await readWorld(tx, playerId) };
@@ -948,7 +1063,15 @@ export async function recallWorker(playerId: number, operationId: number): Promi
 		await tx
 			.update(character)
 			.set({ x: op.destX, y: op.destY })
-			.where(eq(character.id, op.characterId));
+			.where(
+				inArray(
+					character.id,
+					tx
+						.select({ id: operationWorker.characterId })
+						.from(operationWorker)
+						.where(eq(operationWorker.operationId, op.id))
+				)
+			);
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});
@@ -992,16 +1115,7 @@ export async function cancelBuild(playerId: number, operationId: number): Promis
 
 		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
 		if (!home) throw new Error(`player ${playerId} has no settlement`);
-		const costs = await tx
-			.select()
-			.from(buildingCost)
-			.where(eq(buildingCost.buildingTypeId, cancelled.buildingTypeId!));
-		for (const c of costs) {
-			await tx
-				.update(stock)
-				.set({ quantity: sql`${stock.quantity} + ${c.quantity}` })
-				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, c.resourceId)));
-		}
+		await refundBuild(tx, home.id, cancelled.buildingTypeId!);
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});
@@ -1037,6 +1151,20 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		.select()
 		.from(operation)
 		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+	// The crews, grouped by operation. One read for all of them rather than one per operation.
+	const crews = new Map<number, (typeof operationWorker.$inferSelect)[]>();
+	if (operations.length) {
+		const rows = await tx
+			.select()
+			.from(operationWorker)
+			.where(
+				inArray(
+					operationWorker.operationId,
+					operations.map((o) => o.id)
+				)
+			);
+		for (const r of rows) crews.set(r.operationId, [...(crews.get(r.operationId) ?? []), r]);
+	}
 
 	// Built by index, not by sort order: `terrain` is positional, so one missing row would
 	// shift every tile after it and render a wrong-but-plausible map. The check is that the
@@ -1130,18 +1258,20 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		})),
 		operations: operations.map((o) => ({
 			id: o.id,
-			characterId: o.characterId,
 			type: o.type,
 			buildingTypeId: o.buildingTypeId,
 			professionId: o.professionId,
-			originX: o.originX,
-			originY: o.originY,
 			destX: o.destX,
 			destY: o.destY,
 			startedAt: o.startedAt.toISOString(),
-			travelDoneAt: o.travelDoneAt.toISOString(),
 			// Null on a gather, and that is the wire's way of saying "this never ends by itself".
-			completeAt: o.completeAt?.toISOString() ?? null
+			completeAt: o.completeAt?.toISOString() ?? null,
+			workers: (crews.get(o.id) ?? []).map((w) => ({
+				characterId: w.characterId,
+				originX: w.originX,
+				originY: w.originY,
+				arrivesAt: w.arrivesAt.toISOString()
+			}))
 		}))
 	};
 }

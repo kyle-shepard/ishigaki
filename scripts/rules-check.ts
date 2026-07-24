@@ -142,7 +142,9 @@ for (const [x, y, label] of [
 	const r = await order(x, y, free);
 	const op = r.body.operations?.[0];
 	if (!op) throw new Error(`order (${x},${y}) was refused: ${JSON.stringify(r.body)}`);
-	legs[label] = (Date.parse(op.travelDoneAt) - Date.parse(op.startedAt)) / 1000;
+	// The travel leg is per-worker now — each member of a crew leaves from their own tile. One
+	// worker on this order, so its arrival *is* the leg.
+	legs[label] = (Date.parse(op.workers[0].arrivesAt) - Date.parse(op.startedAt)) / 1000;
 }
 // A ratio, not the literals — the spread survives future cost tuning, the numbers wouldn't.
 check(

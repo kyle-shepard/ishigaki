@@ -91,19 +91,20 @@ export type WorldPayload = {
 	}[];
 	operations: {
 		id: number;
-		characterId: number;
 		type: OperationType;
 		// Both null on a gather: it builds nothing, and it never finishes on its own.
 		buildingTypeId: number | null;
 		// The profession a train operation will grant; null on build/gather.
 		professionId: number | null;
-		originX: number;
-		originY: number;
 		destX: number;
 		destY: number;
 		startedAt: string;
-		travelDoneAt: string;
 		completeAt: string | null;
+		// The crew. One entry for a gather or a training; a build may have several. Origin and
+		// arrival are per-body because members leave from their own tiles — the client composes
+		// one TravelLeg per worker from `{originX, originY, op.destX, op.destY, op.startedAt,
+		// travelDoneAt: arrivesAt}`.
+		workers: { characterId: number; originX: number; originY: number; arrivesAt: string }[];
 	}[];
 };
 

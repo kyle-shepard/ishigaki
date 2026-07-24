@@ -10,6 +10,7 @@
 		positionAt,
 		travelFraction,
 		type OrderReason,
+		type TravelLeg,
 		type WorldPayload
 	} from '$lib/features/world/world';
 
@@ -280,25 +281,44 @@
 	// An unknown key resolves to no symbol and draws nothing — a tile missing its art, not a
 	// broken page.
 	const typeIcon = (id: number) => buildingTypeById.get(id)?.icon ?? '';
+	// Each member of a crew walks their own leg — from their own tile, arriving at their own time —
+	// so a travel leg is composed per worker rather than read off the operation.
+	type Op = WorldPayload['operations'][number];
+	function legFor(op: Op, characterId: number): TravelLeg | undefined {
+		const w = op.workers.find((w) => w.characterId === characterId);
+		if (!w) return undefined;
+		return {
+			originX: w.originX,
+			originY: w.originY,
+			destX: op.destX,
+			destY: op.destY,
+			startedAt: op.startedAt,
+			travelDoneAt: w.arrivesAt
+		};
+	}
 	// A character with an in-progress operation is walking or building; its stored tile is
 	// where it left from, so the live position comes from the operation instead.
 	function at(c: { id: number; x: number; y: number }) {
-		const op = world?.operations.find((o) => o.characterId === c.id);
-		return op ? positionAt(op, nowMs) : c;
+		const op = opFor(c.id);
+		const leg = op && legFor(op, c.id);
+		return leg ? positionAt(leg, nowMs) : c;
 	}
 	const professionName = $derived(
 		new Map(world?.professions.map((p) => [p.id, p.displayName]) ?? [])
 	);
+	const characterById = $derived(new Map(world?.characters.map((c) => [c.id, c]) ?? []));
 	// A body's name if it's a specialist, else "a settler" — how the panel and roster label it.
 	const who = (c: { name: string | null; professionId: number | null }) =>
 		c.name ? `${c.name} (${professionName.get(c.professionId!)})` : 'a settler';
-	const opFor = (id: number) => world?.operations.find((o) => o.characterId === id);
+	const opFor = (id: number) =>
+		world?.operations.find((o) => o.workers.some((w) => w.characterId === id));
 	// What a worker is doing right now, for the panel. Walking is derived from the travel leg,
 	// not a stored status — a worker mid-trip reads as walking whatever they'll do on arrival.
 	function doing(c: { id: number }): string {
 		const op = opFor(c.id);
 		if (!op) return 'idle';
-		if (travelFraction(op, nowMs) < 1) return `walking to ${op.destX}, ${op.destY}`;
+		const leg = legFor(op, c.id);
+		if (leg && travelFraction(leg, nowMs) < 1) return `walking to ${op.destX}, ${op.destY}`;
 		if (op.type === 'build') return `building ${typeName(op.buildingTypeId!)}`;
 		if (op.type === 'train') return `training as ${professionName.get(op.professionId!)}`;
 		return `gathering ${resourceAt(op.destX, op.destY)}`;
@@ -507,6 +527,16 @@
 						<p><b>{typeName(selBuilt.buildingTypeId)}</b> stands here.</p>
 					{:else if selSite}
 						<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
+						<!-- Who is raising it. The crew is the operation's own membership, so this says the
+					     same thing the server acted on rather than guessing from who's standing nearby. -->
+						<p class="crew">
+							Raised by {selSite.workers
+								.map((w) => {
+									const c = characterById.get(w.characterId);
+									return c ? who(c) : 'someone';
+								})
+								.join(', ')}
+						</p>
 						<p><button onclick={() => cancelSite(selSite.id)}>Cancel — full refund</button></p>
 					{/if}
 
@@ -711,6 +741,9 @@
 		margin: 1rem 0 0.25rem;
 	}
 	.hint {
+		color: var(--muted);
+	}
+	.crew {
 		color: var(--muted);
 	}
 	.roster-title {

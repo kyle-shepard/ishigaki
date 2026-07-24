@@ -6,6 +6,7 @@ import {
 	check,
 	doublePrecision,
 	foreignKey,
+	index,
 	integer,
 	pgTable,
 	primaryKey,
@@ -390,16 +391,11 @@ export const operation = pgTable(
 		playerId: integer('player_id')
 			.notNull()
 			.references(() => player.id),
-		characterId: integer('character_id')
-			.notNull()
-			.references(() => character.id),
 		// Typed unions, not bare text: a misspelled status would compile fine and strand the
 		// character busy forever, with no error to notice. Still `text` in Postgres so a new
 		// type costs no migration.
 		type: text('type').$type<WireOperationType>().notNull(),
 		status: text('status').$type<OperationStatus>().notNull(),
-		originX: integer('origin_x').notNull(),
-		originY: integer('origin_y').notNull(),
 		destX: integer('dest_x').notNull(),
 		destY: integer('dest_y').notNull(),
 		buildingTypeId: integer('building_type_id').references(() => buildingType.id),
@@ -407,15 +403,14 @@ export const operation = pgTable(
 		// carries the calling the settler will emerge with. Edge-triggered like a build, so it
 		// also carries a complete_at (see the CHECK).
 		professionId: integer('profession_id').references(() => profession.id),
-		// The assigned worker's quality, snapshotted at assignment — a build divides its time by
-		// this, a gather multiplies its rate by it. Snapshotted (not re-derived on read) so "skills
-		// are fixed at training" holds for an in-flight job and the read path stays a plain multiply;
-		// the derivation from the live bundle happens once, at assignment. Default 1 (a train row,
-		// or the pre-quality flat rate). CHECK > 0 because a zero would divide-by-zero the build
-		// time and zero out a gather.
+		// The crew's workmanship, snapshotted at assignment — a gather multiplies its rate by it,
+		// and a build's completion time is solved from it. Snapshotted (not re-derived on read) so
+		// "skills are fixed at training" holds for an in-flight job and the read path stays a plain
+		// multiply; the derivation from the live bundle happens once, at assignment. For a
+		// one-member crew this is simply that worker's own multiplier. Default 1 (a train row, or
+		// the pre-quality flat rate). CHECK > 0 because a zero would zero out a gather.
 		qualityMultiplier: real('quality_multiplier').notNull().default(1),
 		startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
-		travelDoneAt: timestamp('travel_done_at', { withTimezone: true }).notNull(),
 		// Null means "never finishes on its own" — a gather runs until it is recalled.
 		completeAt: timestamp('complete_at', { withTimezone: true }),
 		// How much of a gather has already been paid into stock. Starts at travel_done_at, so
@@ -439,5 +434,41 @@ export const operation = pgTable(
 			'operation_train_is_complete',
 			sql`${t.type} <> 'train' OR (${t.professionId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
 		)
+	]
+);
+
+// Who is working an operation. One row per body, and the *only* answer to "who is on this op" —
+// `operation.character_id` is gone rather than kept alongside for gather/train, because two
+// sources would make every idle/busy derivation a UNION of two truths that can disagree. Gather
+// and train simply always have exactly one row.
+//
+// Travel is per-body: members of a crew leave from their own tiles and arrive at their own times,
+// so origin and the arrival clock live here rather than on the operation.
+export const operationWorker = pgTable(
+	'operation_worker',
+	{
+		// Cascade because a membership row is genuinely a child of its operation — meaningless
+		// without one. The schema's standing "no cascade for rows a player spent real time on" is
+		// about buildings and characters; `character_id` below keeps that rule, so a cull has to
+		// deal with its crews deliberately.
+		operationId: integer('operation_id')
+			.notNull()
+			.references(() => operation.id, { onDelete: 'cascade' }),
+		characterId: integer('character_id')
+			.notNull()
+			.references(() => character.id),
+		/** This body's own workmanship — see operation.quality_multiplier for the combined one. */
+		qualityMultiplier: real('quality_multiplier').notNull(),
+		/** When this body reaches the site. Its travel leg is (origin_x, origin_y) → the op's dest. */
+		arrivesAt: timestamp('arrives_at', { withTimezone: true }).notNull(),
+		originX: integer('origin_x').notNull(),
+		originY: integer('origin_y').notNull()
+	},
+	(t) => [
+		primaryKey({ columns: [t.operationId, t.characterId] }),
+		// The PK leads with operation_id, so without this every DELETE FROM character (starvation,
+		// deletePlayer) seq-scans this table to check the FK. Convention, not optimisation.
+		index('operation_worker_character_idx').on(t.characterId),
+		check('operation_worker_quality_positive', sql`${t.qualityMultiplier} > 0`)
 	]
 );
