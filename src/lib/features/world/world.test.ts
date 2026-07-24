@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
 	accrue,
+	crewBuild,
+	crewRate,
 	eligibleTypeIds,
 	NAME_POOL,
 	pickName,
@@ -358,4 +360,123 @@ test('a deposit with no extractor yet offers nothing', () => {
 test('unbuildable ground offers nothing, subsuming the old buildable check', () => {
 	const mountain = { buildable: false, isDeposit: false, yieldsResourceId: null };
 	assert.deepEqual(eligibleTypeIds(mountain, CATALOG, RES), []);
+});
+
+// ---- The crew ---------------------------------------------------------------------------------
+// The four feel invariants, as assertions rather than something felt for in a browser. Numbers are
+// the design's reference case: a 300-second building, a settler at 0.15, a Mason at 0.60.
+const BUILD = 300;
+const SETTLER = 0.15;
+const MASON = 0.6;
+// Everyone on the site from the off, unless a case says otherwise — travel is the *other* thing
+// crewBuild folds in, and it gets its own cases below.
+const together = (...multipliers: number[]) =>
+	multipliers.map((multiplier) => ({ multiplier, arrivesAtSeconds: 0 }));
+const build = (...multipliers: number[]) => {
+	const { seconds, quality } = crewBuild(together(...multipliers), BUILD);
+	return { seconds: Math.round(seconds), quality: Number(quality.toFixed(2)) };
+};
+const settlers = (n: number) => build(...new Array(n).fill(SETTLER));
+
+test('a one-member crew is exactly the old arithmetic — solo builds keep their numbers', () => {
+	assert.deepEqual(build(SETTLER), { seconds: BUILD / SETTLER, quality: SETTLER });
+	assert.deepEqual(build(MASON), { seconds: BUILD / MASON, quality: MASON });
+	// And the travel leg is simply carried: the clock is the whole time from the order.
+	const { seconds } = crewBuild([{ multiplier: MASON, arrivesAtSeconds: 90 }], BUILD);
+	assert.equal(seconds, 90 + BUILD / MASON);
+});
+
+test('more bodies is faster, and visibly flattening — the whole no-cap argument', () => {
+	const times = [1, 2, 4, 8, 12].map((n) => settlers(n).seconds);
+	assert.deepEqual(times, [2000, 1172, 718, 458, 356]);
+	// Monotone (a body never slows the site) with shrinking gains (so piling on self-punishes).
+	const gains = times.slice(1).map((t, i) => times[i] - t);
+	assert.ok(gains.every((g) => g > 0));
+	assert.ok(gains.every((g, i) => i === 0 || g < gains[i - 1]));
+	// Quality is untouched by headcount when everyone is equally unskilled.
+	assert.ok([1, 2, 4, 8, 12].every((n) => settlers(n).quality === SETTLER));
+});
+
+test('a lone specialist beats a crowd of settlers on workmanship, and 4 of them outright', () => {
+	assert.deepEqual(build(MASON), { seconds: 500, quality: 0.6 });
+	assert.ok(build(MASON).seconds < settlers(4).seconds);
+	// The trade stated the other way: enough bodies do beat him on speed, at a quarter the quality.
+	assert.ok(settlers(12).seconds < build(MASON).seconds);
+	assert.ok(settlers(12).quality < build(MASON).quality);
+});
+
+test('bodies buy speed and cost workmanship — the trade, made visible', () => {
+	assert.deepEqual(build(MASON, SETTLER), { seconds: 425, quality: 0.53 });
+	assert.deepEqual(build(MASON, SETTLER, SETTLER, SETTLER, SETTLER), {
+		seconds: 321,
+		quality: 0.44
+	});
+	// Each settler added to the Mason is faster than the last crew and worse than it.
+	const crews = [build(MASON), build(MASON, SETTLER), build(MASON, SETTLER, SETTLER)];
+	assert.ok(
+		crews.every(
+			(c, i) => i === 0 || (c.seconds < crews[i - 1].seconds && c.quality < crews[i - 1].quality)
+		)
+	);
+});
+
+test('specialists are the only lever that buys speed without paying quality', () => {
+	assert.deepEqual(build(MASON, MASON), { seconds: 293, quality: 0.6 });
+	assert.deepEqual(build(MASON, MASON, MASON), { seconds: 219, quality: 0.6 });
+	// Faster than the Mason alone *and* holding his quality — "fast AND good", the epic's point.
+	assert.ok(build(MASON, MASON).seconds < build(MASON).seconds);
+	assert.equal(build(MASON, MASON).quality, build(MASON).quality);
+});
+
+test('the better specialist leads, and the crew reads above its second-best', () => {
+	assert.deepEqual(build(0.68, 0.6), { seconds: 272, quality: 0.65 });
+	// Order in is irrelevant — competence decides the rank, not argument position.
+	assert.deepEqual(build(0.6, 0.68), build(0.68, 0.6));
+});
+
+test('a late member contributes from arrival, and a no-show not at all', () => {
+	const late = (delay: number) =>
+		crewBuild(
+			[
+				{ multiplier: MASON, arrivesAtSeconds: 0 },
+				{ multiplier: MASON, arrivesAtSeconds: delay }
+			],
+			BUILD
+		);
+	// 60s late: slower than arriving together (293s), faster than working alone (500s).
+	assert.equal(Math.round(late(60).seconds), 318);
+	// 600s late: the build finished at 500s without them, so they never touched it — and the
+	// quality is the first Mason's alone, with no special case written to say so.
+	assert.equal(Math.round(late(600).seconds), 500);
+	assert.equal(Number(late(600).quality.toFixed(2)), MASON);
+	// A member who misses the whole build cannot drag the workmanship either way.
+	const noShow = crewBuild(
+		[
+			{ multiplier: MASON, arrivesAtSeconds: 0 },
+			{ multiplier: SETTLER, arrivesAtSeconds: 600 }
+		],
+		BUILD
+	);
+	assert.equal(Number(noShow.quality.toFixed(2)), MASON);
+});
+
+test('adding a body never slows a build, however late it lands', () => {
+	const solo = crewBuild([{ multiplier: SETTLER, arrivesAtSeconds: 0 }], BUILD).seconds;
+	for (const delay of [0, 1, 50, 500, 1999, 2000, 5000]) {
+		const pair = crewBuild(
+			[
+				{ multiplier: SETTLER, arrivesAtSeconds: 0 },
+				{ multiplier: MASON, arrivesAtSeconds: delay }
+			],
+			BUILD
+		).seconds;
+		assert.ok(pair <= solo, `a helper arriving at ${delay}s made it slower`);
+	}
+});
+
+test('crewRate is the 1/√k rule and nothing else', () => {
+	assert.equal(crewRate([SETTLER]), SETTLER);
+	assert.equal(crewRate([MASON, MASON]), MASON + MASON / Math.SQRT2);
+	// Sorted descending, so the ranking is by competence rather than by the order handed in.
+	assert.equal(crewRate([0.1, 0.9]), 0.9 + 0.1 / Math.SQRT2);
 });

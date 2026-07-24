@@ -134,15 +134,22 @@ const skills = await db
 	.returning();
 const sk = Object.fromEntries(skills.map((s) => [s.displayName, s.id]));
 
-// The five professions and their skill bundles. A Mason carries two skills; everyone else one.
+// The professions and their skill bundles. A Mason carries two skills; everyone else one.
 // value ~0.7 is the trained competence (Slice 6 scales output by it against a ~0.15 settler
 // baseline — the ~4–5× the Q asks for); Mason's Construction is a touch lower, a jack of two.
+//
+// Three trades carry Construction, at different competences. That spread is what makes a *mixed*
+// crew of specialists mean anything: with only one carrier every other specialist on a build site
+// scores the flat settler baseline, so "more specialists → faster and better" would have nothing
+// to express itself with.
 const professions = await db
 	.insert(profession)
 	.values([
 		{ displayName: 'Forager' },
 		{ displayName: 'Woodcutter' },
 		{ displayName: 'Mason' },
+		{ displayName: 'Carpenter' },
+		{ displayName: 'Thatcher' },
 		{ displayName: 'Digger' },
 		{ displayName: 'Miner' }
 	])
@@ -158,6 +165,10 @@ const BUNDLE = [
 	{ profession: 'Woodcutter', skill: 'Woodcutting', value: 0.7 },
 	{ profession: 'Mason', skill: 'Quarrying', value: 0.7 },
 	{ profession: 'Mason', skill: 'Construction', value: 0.6 },
+	// The other two build trades. A Carpenter is the better builder outright; a Thatcher is
+	// modest but still well clear of an untrained settler.
+	{ profession: 'Carpenter', skill: 'Construction', value: 0.7 },
+	{ profession: 'Thatcher', skill: 'Construction', value: 0.55 },
 	{ profession: 'Digger', skill: 'Digging', value: 0.7 },
 	{ profession: 'Miner', skill: 'Mining', value: 0.7 }
 ];

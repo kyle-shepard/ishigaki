@@ -23,8 +23,8 @@ async function api(path: string, init?: RequestInit) {
 	return { status: res.status, body: await res.json() };
 }
 
-const order = (x: number, y: number, buildingTypeId: number) =>
-	api('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId }) });
+const order = (x: number, y: number, buildingTypeId: number, crewSize?: number) =>
+	api('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId, crewSize }) });
 
 let failures = 0;
 function check(name: string, actual: unknown, expected: unknown) {
@@ -275,6 +275,40 @@ check(
 	[400, 'MISSING_REQUIRED_BUILDING']
 );
 check('(11,1) forest still needs no building at all', (await assign(11, 1)).status, 200);
+
+// Crews. A build takes more than one body now, and more bodies must actually finish it sooner.
+// Asserted off the payload's own clock rather than by waiting a build out — a fresh sandbox for
+// each size, same tile, so the only thing that differs is the headcount. (A realm starts with
+// three, which is why 3 is the crowd here.)
+const crewed: Record<number, { workers: number; seconds: number }> = {};
+for (const size of [1, 3]) {
+	cookie = '';
+	await api('/api/world');
+	const r = await order(14, 9, free, size);
+	const op = r.body.operations?.[0];
+	if (!op) throw new Error(`crew-of-${size} order was refused: ${JSON.stringify(r.body)}`);
+	crewed[size] = {
+		workers: op.workers.length,
+		seconds: (Date.parse(op.completeAt) - Date.parse(op.startedAt)) / 1000
+	};
+}
+check('a crew of 3 puts three bodies on one operation', crewed[3].workers, 3);
+check('a crew of 1 is still exactly one body', crewed[1].workers, 1);
+check(
+	`three raise it faster than one (${crewed[3].seconds}s vs ${crewed[1].seconds}s)`,
+	crewed[3].seconds < crewed[1].seconds,
+	true
+);
+// crewSize is a maximum, not a demand: asking for more bodies than the realm holds takes
+// everyone rather than refusing. Without this, a hopeful number would be a dead end.
+cookie = '';
+const small = await api('/api/world');
+const everyone = await order(14, 9, free, 99);
+check(
+	'asking for more hands than you have sends everyone, rather than refusing',
+	everyone.body.operations?.[0]?.workers.length,
+	small.body.characters.length
+);
 
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

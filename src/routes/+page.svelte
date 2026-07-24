@@ -40,6 +40,9 @@
 	let chosen = $state<number | null>(null);
 	// Which profession to train at a School. Defaults to the first once a world arrives.
 	let chosenProfession = $state<number | null>(null);
+	// How many bodies to send. A maximum, not a demand — the order takes up to this many of whoever
+	// is free. Persists across tiles like `chosen` does, so a chosen crew size sticks.
+	let crewSize = $state(1);
 
 	// Light/dark. The real source of truth is documentElement.dataset.theme (set pre-paint in
 	// app.html); this mirrors it so the toggle button re-renders. Persisted to localStorage.
@@ -191,7 +194,10 @@
 	function buildHere() {
 		if (!selected || chosen === null) return;
 		const { x, y } = selected;
-		act('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId: chosen }) });
+		act('/api/orders', {
+			method: 'POST',
+			body: JSON.stringify({ x, y, buildingTypeId: chosen, crewSize })
+		});
 	}
 
 	function gatherHere() {
@@ -570,6 +576,14 @@
 								</li>
 							{/each}
 						</ul>
+						<!-- A native number input: the browser already ships the stepper, the keyboard
+					     handling and the mobile numeric pad. `max` is how many bodies you actually
+					     have — more than that is a number with nobody behind it. -->
+						<label class="crew-size">
+							Crew
+							<input type="number" min="1" max={world.characters.length} bind:value={crewSize} />
+							<span class="price">more hands, less craft</span>
+						</label>
 						<button onclick={buildHere} disabled={!chosenOk}>Build</button>
 					{/if}
 
@@ -745,6 +759,16 @@
 	}
 	.crew {
 		color: var(--muted);
+	}
+	.crew-size {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin: 0.5rem 0;
+	}
+	.crew-size input {
+		width: 4rem;
+		font: inherit;
 	}
 	.roster-title {
 		margin: 1.25rem 0 0.25rem;

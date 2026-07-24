@@ -22,7 +22,10 @@ export type OrderReason =
 	| 'MISSING_SCHOOL'
 	| 'UNKNOWN_PROFESSION';
 
-export type OrderRequest = { x: number; y: number; buildingTypeId: number };
+// crewSize is how many bodies to send — a *maximum*, not a requirement: the order takes up to that
+// many of the qualifying idle workers and is happy with fewer. Optional on the wire so an older
+// client, and every existing caller, still means "one".
+export type OrderRequest = { x: number; y: number; buildingTypeId: number; crewSize?: number };
 export type TrainRequest = { x: number; y: number; professionId: number };
 
 // ponytail: the whole world, every read. Terrain now dominates the payload — 256 small ints
@@ -336,6 +339,86 @@ export function skillValue(
 	const mult = bundleValue * (1 + (config.skillCurve * (statAvg - mid)) / mid);
 	// Never worse at your own trade than an untrained settler, whatever the roll.
 	return Math.max(config.settlerBaseline, mult);
+}
+
+/**
+ * Each member's effort per second, in the order given. The whole crew rule lives here: sort by
+ * competence, and the *k*-th best works at `1/√k` of their own pace.
+ *
+ * Two things fall out of that one weighting, and they are the epic's feel:
+ *  - **Diminishing returns without a cap.** The 8th body adds a third of what the 1st does, so
+ *    piling bodies on is self-punishing and no rule has to say "at most N".
+ *  - **The best worker leads at full weight.** Your Mason runs the site and the rest fetch and
+ *    carry — legible without a rule that says so.
+ */
+function memberRates(multipliers: number[]): number[] {
+	const byCompetence = multipliers.map((_, i) => i).sort((a, b) => multipliers[b] - multipliers[a]);
+	const rates = new Array<number>(multipliers.length);
+	byCompetence.forEach((i, k) => (rates[i] = multipliers[i] / Math.sqrt(k + 1)));
+	return rates;
+}
+
+/** How much effort a crew delivers per second, all together. */
+export function crewRate(multipliers: number[]): number {
+	return memberRates(multipliers).reduce((sum, r) => sum + r, 0);
+}
+
+/**
+ * When a crew finishes a build, and how well they build it. Pure and database-free like `accrue`
+ * and `population`, so the four feel invariants are assertions in `npm test` rather than something
+ * felt for in a browser.
+ *
+ * A build needs `buildSeconds` of effort. Members arrive at their own times (they walk from their
+ * own tiles), so the site's rate is piecewise-constant, stepping up as each one lands — and the
+ * weighting is re-applied among **whoever is present**, not among the whole crew. That matters:
+ * ranked against absent betters, an early arrival would dawdle at half pace on an empty site, and
+ * adding a body could make a build slower. Ranking the present keeps it monotone.
+ *
+ * `arrivesAtSeconds` and the returned `seconds` are both measured from the order, so the answer is
+ * the whole clock — travel included — and the caller stamps one `complete_at` from it. Every
+ * arrival is already known at order time, so this is solved **once** and never revisited: nothing
+ * in the resolve loop has to recompute a build's schedule.
+ *
+ * Quality is the effort-weighted mean of the members' own multipliers — you get out the average of
+ * whoever actually did the work. A member who arrives after the last stone is laid delivers zero
+ * effort and therefore has zero influence, with no special case to write it.
+ *
+ * A one-member crew is exactly the old arithmetic: `arrivesAt + buildSeconds / multiplier`, quality
+ * `multiplier`. Solo builds keep the numbers they had.
+ */
+export function crewBuild(
+	members: { multiplier: number; arrivesAtSeconds: number }[],
+	buildSeconds: number
+): { seconds: number; quality: number } {
+	// An operation is its crew; a crewless one is a corrupt call, not a game rule (the writer
+	// refuses an order with nobody on it long before this).
+	if (members.length === 0) throw new Error('crewBuild needs at least one member');
+
+	const crew = [...members].sort((a, b) => a.arrivesAtSeconds - b.arrivesAtSeconds);
+	const effort = new Array<number>(crew.length).fill(0);
+	let remaining = buildSeconds;
+	let t = crew[0].arrivesAtSeconds;
+	let arrived = 0;
+	let present: number[] = [];
+
+	while (remaining > 0) {
+		while (arrived < crew.length && crew[arrived].arrivesAtSeconds <= t) present.push(arrived++);
+		const rates = memberRates(present.map((i) => crew[i].multiplier));
+		const rate = rates.reduce((sum, r) => sum + r, 0);
+		// This phase ends when the next member lands, or when the work does — whichever first.
+		const untilNext = arrived < crew.length ? crew[arrived].arrivesAtSeconds - t : Infinity;
+		const untilDone = remaining / rate;
+		const span = Math.min(untilDone, untilNext);
+		present.forEach((i, k) => (effort[i] += rates[k] * span));
+		t += span;
+		// Subtracting `rate * span` instead would leave a float crumb behind and spin one more
+		// zero-length phase; the work is done when the span that finishes it is the shorter one.
+		if (untilDone <= untilNext) break;
+		remaining -= rate * untilNext;
+	}
+
+	const quality = effort.reduce((sum, e, i) => sum + e * crew[i].multiplier, 0) / buildSeconds;
+	return { seconds: t, quality };
 }
 
 export type TravelLeg = {
