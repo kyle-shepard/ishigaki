@@ -879,20 +879,45 @@
 		gap: 1rem;
 		font-variant-numeric: tabular-nums;
 	}
-	/* Map and inspector side by side; the panel wraps under the map on a narrow screen. */
+	/* Holds the map. The inspector used to sit here beside it and is now out of flow — see .panel. */
 	.layout {
 		display: flex;
-		flex-wrap: wrap;
-		gap: 1.5rem;
 		align-items: flex-start;
 	}
+	/* Pinned to the window's right edge rather than laid out beside the map.
+
+	   It used to be a flex sibling that wrapped underneath as soon as the window got narrow, which
+	   put the verbs for the tile you had just clicked below the fold — the panel disappeared exactly
+	   when the screen was too small to spare it. Fixed instead: always in the same place, always
+	   reachable, and it stays put while the page scrolls down to the roster.
+
+	   Overlapping the map on a narrow window is deliberate. Covering a few tiles costs less than
+	   losing the panel, and the map is the thing that can give way — you can still click what is
+	   left of it, and the panel keeps describing whatever you pick. */
 	.panel {
-		min-width: 15rem;
-		max-width: 20rem;
+		position: fixed;
+		/* Clear of the header band (54px) with a little air beneath it. */
+		top: 4.5rem;
+		right: 0;
+		/* Never wider than the window it is pinned to, however small that gets. border-box so that
+		   bound counts the padding and the border — otherwise it is the *content* that is capped and
+		   the panel still runs past the edge it was meant to fit inside. */
+		box-sizing: border-box;
+		width: min(20rem, calc(100vw - 2rem));
+		/* A tall panel scrolls itself instead of running off the bottom of the window. */
+		max-height: calc(100vh - 6rem);
+		overflow-y: auto;
+		/* Above the map's own overlays, which sit at 2. */
+		z-index: 10;
 		background: var(--panel-bg);
 		border: 1px solid var(--border);
-		border-radius: 8px;
+		/* Flush with the edge, so only the left corners are rounded and the right border is gone —
+		   it reads as attached to the window rather than floating loose next to it. */
+		border-right: none;
+		border-radius: 8px 0 0 8px;
 		padding: 0.75rem 1rem;
+		/* Lifts it off whatever it is covering, so the overlap reads as intended. */
+		box-shadow: 0 2px 12px rgb(0 0 0 / 0.12);
 	}
 	.panel h2 {
 		margin: 0 0 0.25rem;
