@@ -576,6 +576,20 @@ async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 type RankedWorker = { character: typeof character.$inferSelect; multiplier: number };
 
 /**
+ * Whether an order restricted to `allowed` will take this body. Null or empty is no restriction;
+ * a settler carries no profession and so is never admitted by a filter that names any (S3 — you
+ * hold a good worker back by not picking them, not by naming settlers).
+ *
+ * **The same predicate at two moments**: narrowing the idle set when an order is placed, and
+ * admitting a freed worker when a queued one starts itself. Authored once so those two can't drift
+ * — an order that would accept a body but whose queue wouldn't is a build that waits forever.
+ */
+function admits(allowed: number[] | null | undefined, professionId: number | null): boolean {
+	if (!allowed || allowed.length === 0) return true;
+	return professionId !== null && allowed.includes(professionId);
+}
+
+/**
  * Every idle worker ranked by how well they do `skillId`, best first, each with the quality
  * multiplier they'd bring. This is the "who does the job changes the result" pick: a settler works
  * at the flat baseline, a specialist at their derived skillValue, so the best-skilled body leads
@@ -587,16 +601,23 @@ type RankedWorker = { character: typeof character.$inferSelect; multiplier: numb
  * Derived from the *live* bundle every call (design decision: a profession retune reaches the next
  * job a specialist takes); the caller snapshots only the resulting multipliers.
  */
-async function rankIdleWorkers(tx: Tx, playerId: number, skillId: number): Promise<RankedWorker[]> {
-	const idle = await tx
-		.select()
-		.from(character)
-		.where(
-			and(
-				eq(character.playerId, playerId),
-				notInArray(character.id, busyCharacterIds(tx, playerId))
+async function rankIdleWorkers(
+	tx: Tx,
+	playerId: number,
+	skillId: number,
+	allowed: number[] | null = null
+): Promise<RankedWorker[]> {
+	const idle = (
+		await tx
+			.select()
+			.from(character)
+			.where(
+				and(
+					eq(character.playerId, playerId),
+					notInArray(character.id, busyCharacterIds(tx, playerId))
+				)
 			)
-		);
+	).filter((c) => admits(allowed, c.professionId));
 	if (idle.length === 0) return [];
 
 	const [cfg] = await tx.select().from(gameConfig);
@@ -697,6 +718,8 @@ export type BuildPlan = {
 	quality: number;
 	costs: { resourceId: number; quantity: number }[];
 	settlementId: number;
+	/** The filter as stored — normalised, so null genuinely means "anyone". */
+	allowed: number[] | null;
 };
 export type PlanResult = { ok: true; plan: BuildPlan } | { ok: false; reason: OrderReason };
 
@@ -720,12 +743,16 @@ async function planBuild(
 	x: number,
 	y: number,
 	buildingTypeId: number,
-	crewSize: number
+	crewSize: number,
+	allowedProfessionIds: number[] | null | undefined
 ): Promise<PlanResult> {
 	// Clamped rather than refused: a crew size is a dial, not a claim about the world, and there is
 	// no sentence to show a player whose stepper sent 0. Absent means one, which is what every
 	// caller meant before crews existed.
 	const wanted = Number.isFinite(crewSize) ? Math.max(1, Math.floor(crewSize)) : 1;
+	// Empty means unrestricted, so it is normalised away here rather than stored as a filter that
+	// admits nobody. Everything downstream then only has to know null-or-a-real-list.
+	const allowed = allowedProfessionIds?.length ? allowedProfessionIds : null;
 
 	if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
 	if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
@@ -733,6 +760,17 @@ async function planBuild(
 
 	const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
 	if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
+
+	// The integrity check Postgres can't do for us (see the column's comment): an array element
+	// takes no foreign key, so a filter naming a profession that doesn't exist has to fail loudly
+	// *here*. Silently it would match nobody, read as "everyone is busy", and once a filter can
+	// queue, become an order waiting forever for a worker who cannot exist.
+	if (allowed) {
+		const known = new Set(
+			(await tx.select({ id: profession.id }).from(profession)).map((p) => p.id)
+		);
+		if (allowed.some((id) => !known.has(id))) return { ok: false, reason: 'UNKNOWN_PROFESSION' };
+	}
 
 	// Realm-wide prerequisite: a type that names another must have one of that other standing
 	// *anywhere* the player owns before it can be placed at all (a Stone wall needs a Quarry).
@@ -807,7 +845,9 @@ async function planBuild(
 	// `crewSize` is a **maximum**: the order takes up to that many of the ranked idle bodies and
 	// is happy with fewer. Asking for four when two are free starts with two — waiting for the
 	// full four would be a second kind of waiting, and nothing asks for one.
-	const ranked = await rankIdleWorkers(tx, playerId, await constructionSkillId(tx));
+	const ranked = await rankIdleWorkers(tx, playerId, await constructionSkillId(tx), allowed);
+	// ponytail: a filter nobody satisfies refuses here. Phase 6 makes it queue instead, which is
+	// what the design actually asks for — this is the interim seam, one slice wide.
 	if (ranked.length === 0) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
 	const crew = ranked.slice(0, wanted);
 
@@ -860,7 +900,8 @@ async function planBuild(
 			seconds: Math.round(seconds),
 			quality,
 			costs: costs.map((c) => ({ resourceId: c.resourceId, quantity: c.quantity })),
-			settlementId: home.id
+			settlementId: home.id,
+			allowed
 		}
 	};
 }
@@ -878,16 +919,25 @@ export async function createBuildOrder(
 	x: number,
 	y: number,
 	buildingTypeId: number,
-	crewSize: number = 1
+	crewSize: number = 1,
+	allowedProfessionIds: number[] | null = null
 ): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
 		// An order is a read-then-write: without this it could be rejected as NO_IDLE_CHARACTER
 		// by an operation that finished ten seconds ago, or judged against stale stock.
 		await resolveWorld(tx, playerId);
 
-		const planned = await planBuild(tx, playerId, x, y, buildingTypeId, crewSize);
+		const planned = await planBuild(
+			tx,
+			playerId,
+			x,
+			y,
+			buildingTypeId,
+			crewSize,
+			allowedProfessionIds
+		);
 		if (!planned.ok) return { ok: false, reason: planned.reason };
-		const { crew, seconds, quality, costs, settlementId } = planned.plan;
+		const { crew, seconds, quality, costs, settlementId, allowed } = planned.plan;
 
 		for (const c of costs) {
 			await tx
@@ -910,6 +960,9 @@ export async function createBuildOrder(
 				// The crew's combined workmanship. Duration is baked into `complete_at` and no longer
 				// divides by this — for a one-member crew the two are the same number anyway.
 				qualityMultiplier: quality,
+				// Stored even though the crew is already chosen: phase 6's auto-start reads it back
+				// minutes later to decide who may take over a build that had to wait.
+				allowedProfessionIds: allowed,
 				startedAt: sql`now()`,
 				completeAt: sql`now() + ${`${seconds} seconds`}::interval`
 			})
@@ -942,11 +995,20 @@ export async function estimateBuild(
 	x: number,
 	y: number,
 	buildingTypeId: number,
-	crewSize: number = 1
+	crewSize: number = 1,
+	allowedProfessionIds: number[] | null = null
 ): Promise<EstimateResult> {
 	return db.transaction(async (tx): Promise<EstimateResult> => {
 		await resolveWorld(tx, playerId);
-		const planned = await planBuild(tx, playerId, x, y, buildingTypeId, crewSize);
+		const planned = await planBuild(
+			tx,
+			playerId,
+			x,
+			y,
+			buildingTypeId,
+			crewSize,
+			allowedProfessionIds
+		);
 		if (!planned.ok) return { ok: false, reason: planned.reason };
 		const { crew, seconds, quality } = planned.plan;
 		return {

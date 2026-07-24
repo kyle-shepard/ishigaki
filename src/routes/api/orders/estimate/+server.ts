@@ -10,7 +10,15 @@ import type { EstimateRequest } from '$lib/features/world/world';
 // POST rather than GET because it runs `resolveWorld` — the read that catches the world up to now
 // — and a GET that writes is a worse lie than a POST that only reads.
 export const POST: RequestHandler = async ({ request, locals }) => {
-	const { x, y, buildingTypeId, crewSize } = (await request.json()) as EstimateRequest;
-	const result = await estimateBuild(locals.playerId, x, y, buildingTypeId, crewSize);
+	const { x, y, buildingTypeId, crewSize, allowedProfessionIds } =
+		(await request.json()) as EstimateRequest;
+	const result = await estimateBuild(
+		locals.playerId,
+		x,
+		y,
+		buildingTypeId,
+		crewSize,
+		allowedProfessionIds
+	);
 	return result.ok ? json(result.estimate) : json({ reason: result.reason }, { status: 400 });
 };

@@ -25,7 +25,17 @@ export type OrderReason =
 // crewSize is how many bodies to send — a *maximum*, not a requirement: the order takes up to that
 // many of the qualifying idle workers and is happy with fewer. Optional on the wire so an older
 // client, and every existing caller, still means "one".
-export type OrderRequest = { x: number; y: number; buildingTypeId: number; crewSize?: number };
+//
+// allowedProfessionIds narrows who may work it. Absent, null or empty all mean anyone — an empty
+// list is a player who unchecked everything, and reading that as "nobody may build this" would be
+// a rule they didn't ask for.
+export type OrderRequest = {
+	x: number;
+	y: number;
+	buildingTypeId: number;
+	crewSize?: number;
+	allowedProfessionIds?: number[] | null;
+};
 export type TrainRequest = { x: number; y: number; professionId: number };
 
 // The same shape as an order, because it asks the same question — it just doesn't spend.

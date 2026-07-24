@@ -387,5 +387,42 @@ check(
 	null
 );
 
+// Restrict-by-specialty. The filter is the entry point to the whole worker-selection UX, and its
+// two ends are what matter: naming a trade the realm has none of turns the order away, and naming
+// one it has narrows the crew to exactly those bodies.
+const restricted = (x: number, y: number, ids: number[] | null, crewSize = 3) =>
+	api('/api/orders', {
+		method: 'POST',
+		body: JSON.stringify({ x, y, buildingTypeId: free, crewSize, allowedProfessionIds: ids })
+	});
+const professionId = (name: string) => {
+	const p = world.body.professions.find((q: { displayName: string }) => q.displayName === name);
+	if (!p) throw new Error(`no '${name}' profession — seed the database`);
+	return p.id;
+};
+
+cookie = '';
+await api('/api/world');
+// A fresh realm is three settlers, so it has no Mason at all.
+const noMason = await restricted(14, 9, [professionId('Mason')]);
+check(
+	'an order restricted to a trade nobody has is refused',
+	[noMason.status, noMason.body.reason],
+	[400, 'NO_IDLE_CHARACTER']
+);
+// An id no profession carries must fail loudly at order time — Postgres cannot foreign-key an
+// array element, so this refusal *is* the referential integrity for that column. Silently it
+// would match nobody and read as "everyone is busy".
+const bogus = await restricted(14, 9, [999999]);
+check(
+	'a filter naming a profession that does not exist is refused as unknown, not as "everyone is busy"',
+	[bogus.status, bogus.body.reason],
+	[400, 'UNKNOWN_PROFESSION']
+);
+// Unchecking everything is not "nobody may build this".
+cookie = '';
+await api('/api/world');
+check('an empty filter means anyone, not nobody', (await restricted(14, 9, [])).status, 200);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

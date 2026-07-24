@@ -45,6 +45,10 @@
 	// How many bodies to send. A maximum, not a demand — the order takes up to this many of whoever
 	// is free. Persists across tiles like `chosen` does, so a chosen crew size sticks.
 	let crewSize = $state(1);
+	// Which professions may work the order. Empty is the common case and means anyone; settlers are
+	// not on the list, because a settler has no profession to name — you hold your good worker back
+	// by not picking them, not by asking for settlers.
+	let allowedProfessionIds = $state<number[]>([]);
 
 	// Light/dark. The real source of truth is documentElement.dataset.theme (set pre-paint in
 	// app.html); this mirrors it so the toggle button re-renders. Persisted to localStorage.
@@ -198,7 +202,7 @@
 		const { x, y } = selected;
 		act('/api/orders', {
 			method: 'POST',
-			body: JSON.stringify({ x, y, buildingTypeId: chosen, crewSize })
+			body: JSON.stringify({ x, y, buildingTypeId: chosen, crewSize, allowedProfessionIds })
 		});
 	}
 
@@ -433,6 +437,9 @@
 		const target = selected;
 		const type = chosen;
 		const size = crewSize;
+		// Read here, in the effect's synchronous part, so it is a tracked dependency: ticking a
+		// profession has to re-quote, not sit on a stale number.
+		const only = [...allowedProfessionIds];
 		if (!target || type === null || !canBuild) {
 			estimate = null;
 			estimateRefusal = null;
@@ -443,7 +450,13 @@
 				const res = await fetch('/api/orders/estimate', {
 					method: 'POST',
 					headers: { 'content-type': 'application/json' },
-					body: JSON.stringify({ x: target.x, y: target.y, buildingTypeId: type, crewSize: size })
+					body: JSON.stringify({
+						x: target.x,
+						y: target.y,
+						buildingTypeId: type,
+						crewSize: size,
+						allowedProfessionIds: only
+					})
 				});
 				if (res.status === 400) {
 					estimate = null;
@@ -647,6 +660,31 @@
 							<input type="number" min="1" max={world.characters.length} bind:value={crewSize} />
 							<span class="price">more hands, less craft</span>
 						</label>
+						<!-- Who may work it. Nothing ticked is the ordinary case and means anyone; the whole
+					     profession catalog is offered because the payload deliberately ships no skill
+					     bundles, so the client cannot know which trades build well — the estimate is
+					     what tells you that, and it re-quotes as you tick. -->
+						<details class="only">
+							<summary>
+								Only certain trades
+								{#if allowedProfessionIds.length}
+									<span class="price">({allowedProfessionIds.length} picked)</span>
+								{/if}
+							</summary>
+							<ul class="build-picker">
+								{#each world.professions as p (p.id)}
+									<li>
+										<label>
+											<input
+												type="checkbox"
+												value={p.id}
+												bind:group={allowedProfessionIds}
+											/>{p.displayName}
+										</label>
+									</li>
+								{/each}
+							</ul>
+						</details>
 						<!-- The numbers, before you commit. They move as the crew moves — the whole point
 					     of the epic, and the thing Lands of Lords only tells you after you've spent
 					     the bodies. The raw quality rides in the title; the sentence gets the band. -->
@@ -854,6 +892,15 @@
 	}
 	.estimate span {
 		display: block;
+	}
+	/* Collapsed by default — an unrestricted order is the common one, and seven checkboxes should
+	   not be the first thing in the way of the Build button. */
+	.only {
+		margin: 0.4rem 0;
+	}
+	.only summary {
+		cursor: pointer;
+		color: var(--muted);
 	}
 	.roster-title {
 		margin: 1.25rem 0 0.25rem;

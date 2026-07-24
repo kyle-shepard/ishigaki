@@ -4,7 +4,15 @@ import { createBuildOrder } from '$lib/features/world/world.server';
 import type { OrderRequest } from '$lib/features/world/world';
 
 export const POST: RequestHandler = async ({ request, locals }) => {
-	const { x, y, buildingTypeId, crewSize } = (await request.json()) as OrderRequest;
-	const result = await createBuildOrder(locals.playerId, x, y, buildingTypeId, crewSize);
+	const { x, y, buildingTypeId, crewSize, allowedProfessionIds } =
+		(await request.json()) as OrderRequest;
+	const result = await createBuildOrder(
+		locals.playerId,
+		x,
+		y,
+		buildingTypeId,
+		crewSize,
+		allowedProfessionIds
+	);
 	return result.ok ? json(result.world) : json({ reason: result.reason }, { status: 400 });
 };

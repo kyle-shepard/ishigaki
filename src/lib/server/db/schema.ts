@@ -430,7 +430,20 @@ export const operation = pgTable(
 		// How much of a gather has already been paid into stock. Starts at travel_done_at, so
 		// `now - accrued_at` is the *worked* interval and travel needs no special case: distance
 		// costs a trip, not a yield.
-		accruedAt: timestamp('accrued_at', { withTimezone: true })
+		accruedAt: timestamp('accrued_at', { withTimezone: true }),
+		// Which professions may work this order. Null means anyone, which is every order that
+		// doesn't ask. Settlers are not expressible — a filter is a list of professions and a
+		// settler has none — so any filter at all excludes them; holding your good worker back is
+		// already a choice you make by not picking them.
+		//
+		// An array rather than a join table because it is only ever read whole; a join would buy
+		// relational querying nobody does. The cost is that **Postgres cannot put a foreign key on
+		// an array element**, so this is the one place in the schema where referential integrity is
+		// the writer's job — it validates the ids against the profession catalog and refuses
+		// UNKNOWN_PROFESSION. Without that a typo'd id matches nobody, which reads as "everyone is
+		// busy" and, once a filter can queue, becomes an order waiting forever for a worker who
+		// cannot exist.
+		allowedProfessionIds: integer('allowed_profession_ids').array()
 	},
 	(t) => [
 		// The two columns above went nullable so a gather row could exist, but the build path

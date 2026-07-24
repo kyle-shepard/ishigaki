@@ -134,6 +134,13 @@
       "when": 1784911961703,
       "tag": "0018_aberrant_maria_hill",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1784912644525,
+      "tag": "0019_nasty_the_stranger",
+      "breakpoints": true
     }
   ]
 }
