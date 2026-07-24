@@ -403,12 +403,15 @@ const professionId = (name: string) => {
 
 cookie = '';
 await api('/api/world');
-// A fresh realm is three settlers, so it has no Mason at all.
+// A fresh realm is three settlers, so it has no Mason at all. This *queues* rather than refusing —
+// an unsatisfiable filter and a realm where everyone is busy are the same situation, and both
+// resolve themselves the moment a qualifying worker exists.
 const noMason = await restricted(14, 9, [professionId('Mason')]);
+const waiting = noMason.body.operations?.find((o: { type: string }) => o.type === 'build');
 check(
-	'an order restricted to a trade nobody has is refused',
-	[noMason.status, noMason.body.reason],
-	[400, 'NO_IDLE_CHARACTER']
+	'an order restricted to a trade nobody has waits instead of bouncing',
+	[noMason.status, waiting?.startedAt, waiting?.completeAt, waiting?.workers.length],
+	[200, null, null, 0]
 );
 // An id no profession carries must fail loudly at order time — Postgres cannot foreign-key an
 // array element, so this refusal *is* the referential integrity for that column. Silently it
@@ -423,6 +426,77 @@ check(
 cookie = '';
 await api('/api/world');
 check('an empty filter means anyone, not nobody', (await restricted(14, 9, [])).status, 200);
+
+// The queue. Placing a build with everyone busy no longer bounces: it holds the tile and the cost
+// it has already paid, and starts itself when a worker frees. Reserving at queue time is the whole
+// point — deducting at start would reintroduce the silent-failure-while-away this model avoids.
+const occupyEveryone = async () => {
+	for (const [gx, gy] of [
+		[11, 1],
+		[12, 1],
+		[11, 2]
+	] as const)
+		await assign(gx, gy);
+};
+
+cookie = '';
+const busyRealm = await api('/api/world');
+const woodBefore = woodHeld(busyRealm.body);
+await occupyEveryone();
+const heldUp = await order(9, 9, house);
+const parked = heldUp.body.operations?.find((o: { type: string }) => o.type === 'build');
+check(
+	'with everyone busy the build queues rather than refusing',
+	[heldUp.status, parked?.startedAt, parked?.completeAt, parked?.workers.length],
+	[200, null, null, 0]
+);
+check(
+	'a queued build reserves its cost up front, so it cannot fail later while you are away',
+	woodHeld(heldUp.body),
+	woodBefore - 6
+);
+check(
+	'a queued build holds its tile — a second order cannot stack on it',
+	(await order(9, 9, house)).body.reason,
+	'TILE_OCCUPIED'
+);
+// Free one gatherer, and the waiting build takes them on the very next read.
+const gathering2 = (await api('/api/world')).body.operations.filter(
+	(o: { type: string }) => o.type === 'gather'
+);
+await api(`/api/assignments/${gathering2[0].id}`, { method: 'DELETE' });
+const startedItself = (await api('/api/world')).body.operations.find(
+	(o: { id: number }) => o.id === parked.id
+);
+check(
+	'freeing a worker starts the waiting build by itself',
+	[
+		startedItself?.startedAt !== null,
+		startedItself?.completeAt !== null,
+		startedItself?.workers.length
+	],
+	[true, true, 1]
+);
+
+// Cancelling a queued build is the same delete-and-refund path, and just as un-duplicable.
+cookie = '';
+const q2 = await api('/api/world');
+const woodQ2 = woodHeld(q2.body);
+await occupyEveryone();
+const toCancel = (await order(9, 9, house)).body.operations?.find(
+	(o: { type: string }) => o.type === 'build'
+);
+const refunded = await api(`/api/orders/${toCancel.id}`, { method: 'DELETE' });
+check(
+	'cancelling a queued build refunds it in full',
+	[refunded.status, woodHeld(refunded.body)],
+	[200, woodQ2]
+);
+check(
+	'cancelling a queued build twice is refused, not a second refund',
+	(await api(`/api/orders/${toCancel.id}`, { method: 'DELETE' })).body.reason,
+	'UNKNOWN_OPERATION'
+);
 
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

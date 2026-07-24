@@ -144,7 +144,11 @@
 			// excluded because they never come due; they are collected by the idle heartbeat
 			// above, which is also what keeps the resource bar creeping upward.
 			const due = world?.operations.filter(
-				(o) => o.type === 'build' && Date.parse(o.completeAt!) <= nowMs && !settled.has(o.id)
+				(o) =>
+					o.type === 'build' &&
+					o.completeAt !== null &&
+					Date.parse(o.completeAt) <= nowMs &&
+					!settled.has(o.id)
 			);
 			if (due?.length) {
 				for (const o of due) settled.add(o.id);
@@ -298,13 +302,14 @@
 	type Op = WorldPayload['operations'][number];
 	function legFor(op: Op, characterId: number): TravelLeg | undefined {
 		const w = op.workers.find((w) => w.characterId === characterId);
-		if (!w) return undefined;
+		// A queued build has neither: nobody is walking anywhere yet.
+		if (!w || op.startedAt === null) return undefined;
 		return {
 			originX: w.originX,
 			originY: w.originY,
 			destX: op.destX,
 			destY: op.destY,
-			startedAt: op.startedAt,
+			startedAt: op.startedAt!,
 			travelDoneAt: w.arrivesAt
 		};
 	}
@@ -424,6 +429,14 @@
 	// A refusal the estimate saw — shown inline by the numbers rather than as a page-level error,
 	// because nothing has been attempted yet.
 	let estimateRefusal = $state<OrderReason | null>(null);
+
+	// The quote, narrowed once. A build with nobody free answers with nulls — a real answer, not a
+	// missing one — and splitting it here keeps the template from re-asking on every field.
+	const quote = $derived(
+		estimate && estimate.seconds !== null && estimate.quality !== null
+			? { seconds: estimate.seconds, quality: estimate.quality, crew: estimate.crew }
+			: null
+	);
 
 	function duration(seconds: number) {
 		const m = Math.floor(seconds / 60);
@@ -550,6 +563,7 @@
 				{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
 					<svg
 						class="over site"
+						class:waiting={o.startedAt === null}
 						viewBox="0 0 32 32"
 						style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
 					>
@@ -607,6 +621,10 @@
 									>{qualityBand(selBuilt.quality)} work.</span
 								>{/if}
 						</p>
+					{:else if selSite && selSite.startedAt === null}
+						<p><b>{typeName(selSite.buildingTypeId!)}</b> — waiting for a builder.</p>
+						<p class="crew">Starts itself as soon as someone is free.</p>
+						<p><button onclick={() => cancelSite(selSite.id)}>Cancel — full refund</button></p>
 					{:else if selSite}
 						<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
 						<!-- Who is raising it. The crew is the operation's own membership, so this says the
@@ -688,14 +706,21 @@
 						<!-- The numbers, before you commit. They move as the crew moves — the whole point
 					     of the epic, and the thing Lands of Lords only tells you after you've spent
 					     the bodies. The raw quality rides in the title; the sentence gets the band. -->
-						{#if estimate}
+						{#if quote}
 							<p class="estimate">
-								<b title="quality {estimate.quality.toFixed(2)}">
-									≈ {duration(estimate.seconds)} · {qualityBand(estimate.quality)}
+								<b title="quality {quote.quality.toFixed(2)}">
+									≈ {duration(quote.seconds)} · {qualityBand(quote.quality)}
 								</b>
 								<span class="price">
-									sending {estimate.crew.map((c) => c.name ?? 'a settler').join(', ')}
+									sending {quote.crew.map((c) => c.name ?? 'a settler').join(', ')}
 								</span>
+							</p>
+						{:else if estimate}
+							<!-- Nobody free, or nobody the filter admits. Worth placing anyway: the order
+						     holds the tile and the cost, and starts itself when someone frees. -->
+							<p class="estimate">
+								<b>Nobody is free</b>
+								<span class="price">this will wait, and start itself when someone is</span>
 							</p>
 						{:else if estimateRefusal}
 							<p class="estimate price">{REASON_TEXT[estimateRefusal] ?? estimateRefusal}</p>
@@ -843,6 +868,11 @@
 		opacity: 0.45;
 		outline: 2px dashed #4a3520;
 		outline-offset: -2px;
+	}
+	/* Queued: fainter still, and a dotted outline rather than a dashed one — nobody is on it yet. */
+	.site.waiting {
+		opacity: 0.22;
+		outline-style: dotted;
 	}
 	.stock {
 		display: flex;

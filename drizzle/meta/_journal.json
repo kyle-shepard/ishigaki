@@ -141,6 +141,13 @@
       "when": 1784912644525,
       "tag": "0019_nasty_the_stranger",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1784913449183,
+      "tag": "0020_chief_kid_colt",
+      "breakpoints": true
     }
   ]
 }

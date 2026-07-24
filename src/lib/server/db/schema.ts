@@ -390,7 +390,9 @@ export const character = pgTable(
 // Defined next to the wire types rather than here: the client branches on it too, and two
 // copies of a union is one copy waiting to fall behind.
 export type { OperationType } from '$lib/features/world/world';
-export type OperationStatus = 'in-progress' | 'completed';
+// 'queued' is a build placed when nobody was free: it holds its tile and its paid-for cost, has no
+// crew and no schedule, and starts itself the moment a qualifying worker frees.
+export type OperationStatus = 'queued' | 'in-progress' | 'completed';
 
 // ponytail: travel is a phase of the operation rather than its own operation row.
 //
@@ -424,7 +426,9 @@ export const operation = pgTable(
 		// one-member crew this is simply that worker's own multiplier. Default 1 (a train row, or
 		// the pre-quality flat rate). CHECK > 0 because a zero would zero out a gather.
 		qualityMultiplier: real('quality_multiplier').notNull().default(1),
-		startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+		// Nullable because a queued build genuinely has not started — stamping a fake now() would
+		// read as a bug later, and the CHECK below keeps it required everywhere it means something.
+		startedAt: timestamp('started_at', { withTimezone: true }),
 		// Null means "never finishes on its own" — a gather runs until it is recalled.
 		completeAt: timestamp('complete_at', { withTimezone: true }),
 		// How much of a gather has already been paid into stock. Starts at travel_done_at, so
@@ -443,15 +447,27 @@ export const operation = pgTable(
 		// UNKNOWN_PROFESSION. Without that a typo'd id matches nobody, which reads as "everyone is
 		// busy" and, once a filter can queue, becomes an order waiting forever for a worker who
 		// cannot exist.
-		allowedProfessionIds: integer('allowed_profession_ids').array()
+		allowedProfessionIds: integer('allowed_profession_ids').array(),
+		// How many bodies the order asked for. Until a build could queue, the crew was resolved at
+		// order time and never needed remembering; a queued one has to carry the number so that
+		// auto-start can honour it minutes later. This is its first reader, so this is where it
+		// belongs — a maximum, as everywhere else.
+		crewSize: integer('crew_size').notNull().default(1)
 	},
 	(t) => [
 		// The two columns above went nullable so a gather row could exist, but the build path
 		// still dereferences both. Without these, a malformed build row would fail deep inside a
 		// transaction on somebody's read — the least debuggable place in this codebase.
+		// A queued build is exempt: it is precisely the row that has a building type but no
+		// completion time yet, and this CHECK demanding one unconditionally is why a queued build
+		// could not be written before.
 		check(
 			'operation_build_is_complete',
-			sql`${t.type} <> 'build' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
+			sql`${t.type} <> 'build' OR ${t.status} = 'queued' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
+		),
+		check(
+			'operation_in_progress_has_started',
+			sql`${t.status} <> 'in-progress' OR ${t.startedAt} IS NOT NULL`
 		),
 		check('operation_gather_accrues', sql`${t.type} <> 'gather' OR ${t.accruedAt} IS NOT NULL`),
 		check('operation_quality_positive', sql`${t.qualityMultiplier} > 0`),

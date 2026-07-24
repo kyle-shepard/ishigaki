@@ -41,9 +41,13 @@ export type TrainRequest = { x: number; y: number; professionId: number };
 // The same shape as an order, because it asks the same question — it just doesn't spend.
 export type EstimateRequest = OrderRequest;
 export type EstimateResponse = {
-	/** Whole seconds from placing the order to the finished building, travel included. */
-	seconds: number;
-	quality: number;
+	/**
+	 * Whole seconds from placing the order to the finished building, travel included — and null
+	 * with an empty crew, which is the honest answer to "when?" for a build that has nobody to do
+	 * it yet. It will queue, and the panel says so instead of quoting a time it cannot know.
+	 */
+	seconds: number | null;
+	quality: number | null;
 	/** The bodies that would go, best first. `name`/`professionId` null for a settler. */
 	crew: { characterId: number; name: string | null; professionId: number | null }[];
 };
@@ -148,7 +152,9 @@ export type WorldPayload = {
 		professionId: number | null;
 		destX: number;
 		destY: number;
-		startedAt: string;
+		// Both null on a queued build: it is holding its tile and its paid-for cost, waiting for a
+		// worker to free. It has no crew, so it has no travel legs to draw either.
+		startedAt: string | null;
 		completeAt: string | null;
 		// The crew. One entry for a gather or a training; a build may have several. Origin and
 		// arrival are per-body because members leave from their own tiles — the client composes

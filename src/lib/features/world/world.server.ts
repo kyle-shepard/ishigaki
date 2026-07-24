@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, lte, notInArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, lte, ne, notInArray, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import {
 	building,
@@ -393,6 +393,10 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 				);
 	}
 
+	// Builds that were waiting for a body. This is the one *starting* responsibility resolveWorld
+	// has — everything above it finishes work, and finishing is what frees the workers this reads.
+	await startQueuedBuilds(tx, playerId);
+
 	// Population and food, integrated from the settlement's own anchor — the same integrate-on-read
 	// shape as the gather accrual above, no tick. Ordering is load-bearing: this runs AFTER the
 	// operations loop, so it reads a Food stock already credited with this pass's foraging. A
@@ -513,6 +517,76 @@ async function deleteCrewlessOperations(tx: Tx, playerId: number): Promise<void>
 }
 
 /**
+ * Starts any queued build that a worker has since freed up for. Runs inside `resolveWorld`, so it
+ * happens on every read — which is what makes a build start itself while nobody is looking.
+ *
+ * **It must cost nothing when nothing is queued**, because every read pays for it: one indexed
+ * query, and an early return. When there *is* work, the idle set and the ranking inputs load once
+ * and claimed bodies are struck off in memory, rather than re-querying per build.
+ *
+ * FIFO by `id`, which is `serial` — the build that has waited longest goes first, for free.
+ *
+ * Concurrency: this is the second writer of worker assignment, but not a second *lock*. Every
+ * writer calls `resolveWorld`, which opens by taking the settlement `FOR UPDATE`, so an auto-start
+ * and a hand-placed order serialise behind the same row. No new race surface.
+ */
+async function startQueuedBuilds(tx: Tx, playerId: number): Promise<void> {
+	const queued = await tx
+		.select()
+		.from(operation)
+		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'queued')))
+		.orderBy(asc(operation.id));
+	if (queued.length === 0) return;
+
+	let free = await idleBodies(tx, playerId);
+	if (free.length === 0) return;
+
+	const rank = await loadRanker(tx, await constructionSkillId(tx));
+	const grid = await loadGrid(tx);
+	const buildSecondsOf = new Map(
+		(
+			await tx
+				.select({ id: buildingType.id, seconds: buildingType.buildSeconds })
+				.from(buildingType)
+		).map((t) => [t.id, t.seconds])
+	);
+
+	for (const op of queued) {
+		const eligible = free.filter((c) => admits(op.allowedProfessionIds, c.professionId));
+		if (eligible.length === 0) continue;
+		const crew = rank(eligible).slice(0, op.crewSize);
+
+		const solved = solveCrew(
+			crew,
+			buildSecondsOf.get(op.buildingTypeId!)!,
+			op.destX,
+			op.destY,
+			(cx, cy) => {
+				const g = grid.get(cy * GRID_SIZE + cx);
+				if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
+				return g.movementCost;
+			}
+		);
+		await tx
+			.update(operation)
+			.set({
+				status: 'in-progress',
+				qualityMultiplier: solved.quality!,
+				startedAt: sql`now()`,
+				completeAt: sql`now() + ${`${solved.seconds} seconds`}::interval`
+			})
+			.where(eq(operation.id, op.id));
+		await insertCrew(tx, op.id, solved.crew);
+
+		// Struck off in memory rather than re-queried, so two queued builds can't both claim the
+		// same body in one pass.
+		const taken = new Set(crew.map((m) => m.character.id));
+		free = free.filter((c) => !taken.has(c.id));
+		if (free.length === 0) break;
+	}
+}
+
+/**
  * Removes `n` settlers to starvation, respecting the operation_worker FK. `character_id` there is
  * deliberately uncascaded, so a character on *any* operation — in-progress or long completed —
  * cannot be deleted until those membership rows are gone. Idle settlers go before working ones and
@@ -601,25 +675,20 @@ function admits(allowed: number[] | null | undefined, professionId: number | nul
  * Derived from the *live* bundle every call (design decision: a profession retune reaches the next
  * job a specialist takes); the caller snapshots only the resulting multipliers.
  */
-async function rankIdleWorkers(
+/**
+ * Loads everything the ranking depends on — the tuning config, the skill's two governing stats, and
+ * the profession bundle — and hands back a *pure* function over bodies.
+ *
+ * Split out because the auto-start pass ranks repeatedly, once per queued build, and re-reading
+ * three catalogs each time would put that cost on every world read. Load once, rank many.
+ *
+ * Derived from the *live* bundle each time the loader runs (design decision: a profession retune
+ * reaches the next job a specialist takes); the caller snapshots only the resulting multipliers.
+ */
+async function loadRanker(
 	tx: Tx,
-	playerId: number,
-	skillId: number,
-	allowed: number[] | null = null
-): Promise<RankedWorker[]> {
-	const idle = (
-		await tx
-			.select()
-			.from(character)
-			.where(
-				and(
-					eq(character.playerId, playerId),
-					notInArray(character.id, busyCharacterIds(tx, playerId))
-				)
-			)
-	).filter((c) => admits(allowed, c.professionId));
-	if (idle.length === 0) return [];
-
+	skillId: number
+): Promise<(bodies: (typeof character.$inferSelect)[]) => RankedWorker[]> {
 	const [cfg] = await tx.select().from(gameConfig);
 	const config = {
 		settlerBaseline: cfg?.settlerBaseline ?? 1,
@@ -642,17 +711,51 @@ async function rankIdleWorkers(
 					? c.constitution
 					: c.intelligence;
 
-	return idle
-		.map((c) => ({
-			character: c,
-			multiplier: skillValue(
-				c.professionId !== null ? (bundle.get(c.professionId) ?? null) : null,
-				statOf(c, sk.statA),
-				statOf(c, sk.statB),
-				config
+	return (bodies) =>
+		bodies
+			.map((c) => ({
+				character: c,
+				multiplier: skillValue(
+					c.professionId !== null ? (bundle.get(c.professionId) ?? null) : null,
+					statOf(c, sk.statA),
+					statOf(c, sk.statB),
+					config
+				)
+			}))
+			.sort((a, b) => b.multiplier - a.multiplier);
+}
+
+/** Every body not currently on an in-progress operation. Idle is derived, never stored. */
+async function idleBodies(tx: Tx, playerId: number) {
+	return tx
+		.select()
+		.from(character)
+		.where(
+			and(
+				eq(character.playerId, playerId),
+				notInArray(character.id, busyCharacterIds(tx, playerId))
 			)
-		}))
-		.sort((a, b) => b.multiplier - a.multiplier);
+		);
+}
+
+/**
+ * Every idle worker who may work this order, ranked by how well they do `skillId`, best first. This
+ * is the "who does the job changes the result" pick: a settler works at the flat baseline, a
+ * specialist at their derived skillValue, so the best-skilled body leads by default and holding
+ * your best one back is a real choice. Empty when nobody qualifies.
+ *
+ * The whole ranking rather than just the winner, because a crew takes the top *n* — and a gather,
+ * which still wants exactly one body, simply takes the first.
+ */
+async function rankIdleWorkers(
+	tx: Tx,
+	playerId: number,
+	skillId: number,
+	allowed: number[] | null = null
+): Promise<RankedWorker[]> {
+	const idle = (await idleBodies(tx, playerId)).filter((c) => admits(allowed, c.professionId));
+	if (idle.length === 0) return [];
+	return (await loadRanker(tx, skillId))(idle);
 }
 
 /** The Construction skill's id — the relevant skill for every build. Looked up by its seed name. */
@@ -710,16 +813,46 @@ async function loadGrid(tx: Tx): Promise<
 	);
 }
 
+/**
+ * Turns a chosen crew into one schedule and one workmanship: each member's own travel leg from
+ * their own tile, handed to `crewBuild`. Empty crew ⇒ no schedule at all, which is a queued build.
+ *
+ * Shared by the order path and by the auto-start pass, because they are the same arithmetic done at
+ * two different moments — a build that starts itself twenty minutes late must be solved exactly the
+ * way it would have been had a worker been free at order time.
+ */
+function solveCrew(
+	crew: RankedWorker[],
+	buildSeconds: number,
+	destX: number,
+	destY: number,
+	cost: (x: number, y: number) => number
+): { crew: BuildPlan['crew']; seconds: number | null; quality: number | null } {
+	const arrivals = crew.map((m) =>
+		travelSeconds(m.character.x, m.character.y, destX, destY, m.character.speed, cost)
+	);
+	const members = crew.map((m, i) => ({ ...m, arrivesAt: arrivals[i] }));
+	if (members.length === 0) return { crew: members, seconds: null, quality: null };
+	const { seconds, quality } = crewBuild(
+		members.map((m) => ({ multiplier: m.multiplier, arrivesAtSeconds: m.arrivesAt })),
+		buildSeconds
+	);
+	return { crew: members, seconds: Math.round(seconds), quality };
+}
+
 /** A build as it *would* happen: who goes, how long it takes, how well it comes out. */
 export type BuildPlan = {
+	/** Empty when nobody qualifies — the order waits, and starts itself when someone frees. */
 	crew: { character: typeof character.$inferSelect; multiplier: number; arrivesAt: number }[];
-	/** Whole seconds from the order to the finished building, travel included. */
-	seconds: number;
-	quality: number;
+	/** Whole seconds from the order to the finished building, travel included. Null while it waits. */
+	seconds: number | null;
+	quality: number | null;
 	costs: { resourceId: number; quantity: number }[];
 	settlementId: number;
 	/** The filter as stored — normalised, so null genuinely means "anyone". */
 	allowed: number[] | null;
+	/** How many bodies were asked for, remembered so a queued build can be started later. */
+	crewSize: number;
 };
 export type PlanResult = { ok: true; plan: BuildPlan } | { ok: false; reason: OrderReason };
 
@@ -822,16 +955,17 @@ async function planBuild(
 		.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
 	if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
 
-	// In-progress builds count as occupancy too, or two orders stack on one tile. Gathers
-	// don't: a worker standing on a tile is not a thing built on it, and refusing to build
-	// where someone happens to be foraging would be a rule nobody could guess.
+	// Unfinished builds count as occupancy too, or two orders stack on one tile — *including*
+	// queued ones, which hold their tile while they wait. Gathers don't: a worker standing on a
+	// tile is not a thing built on it, and refusing to build where someone happens to be foraging
+	// would be a rule nobody could guess.
 	const [pending] = await tx
 		.select()
 		.from(operation)
 		.where(
 			and(
 				eq(operation.playerId, playerId),
-				eq(operation.status, 'in-progress'),
+				ne(operation.status, 'completed'),
 				eq(operation.type, 'build'),
 				eq(operation.destX, x),
 				eq(operation.destY, y)
@@ -845,10 +979,11 @@ async function planBuild(
 	// `crewSize` is a **maximum**: the order takes up to that many of the ranked idle bodies and
 	// is happy with fewer. Asking for four when two are free starts with two — waiting for the
 	// full four would be a second kind of waiting, and nothing asks for one.
+	// Nobody qualifying is no longer a refusal: the build waits. An unsatisfiable filter and a
+	// realm where everyone is busy are the same situation, and both resolve themselves the moment a
+	// worker frees — so NO_IDLE_CHARACTER has left the build path entirely (gather still uses it,
+	// because a gather has nothing to wait on).
 	const ranked = await rankIdleWorkers(tx, playerId, await constructionSkillId(tx), allowed);
-	// ponytail: a filter nobody satisfies refuses here. Phase 6 makes it queue instead, which is
-	// what the design actually asks for — this is the interim seam, one slice wide.
-	if (ranked.length === 0) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
 	const crew = ranked.slice(0, wanted);
 
 	// Cost is judged last and, in the writer, spent last: a refusal on any earlier ground has
@@ -873,37 +1008,47 @@ async function planBuild(
 	// Every member walks their own leg, from their own tile — so a crew necessarily arrives
 	// staggered, and each arrival is already known here. The grid loaded for the buildable
 	// check is the same one the paths are priced against: one read, many uses.
-	const arrivals = crew.map((m) =>
-		travelSeconds(
-			m.character.x,
-			m.character.y,
-			x,
-			y,
-			m.character.speed,
-			(cx, cy) => groundAt(cx, cy).movementCost
-		)
-	);
-	// One duration and one workmanship out of the whole crew, solved once — every arrival being
-	// known at order time is what lets `complete_at` be stamped now and never revisited.
-	const { seconds, quality } = crewBuild(
-		crew.map((m, i) => ({ multiplier: m.multiplier, arrivesAtSeconds: arrivals[i] })),
-		type.buildSeconds
+	const solved = solveCrew(
+		crew,
+		type.buildSeconds,
+		x,
+		y,
+		(cx, cy) => groundAt(cx, cy).movementCost
 	);
 
 	return {
 		ok: true,
 		plan: {
-			crew: crew.map((m, i) => ({ ...m, arrivesAt: arrivals[i] })),
+			crew: solved.crew,
 			// Whole seconds, because that is what the preview shows and what the wire carries;
 			// quoting 320.94 and stamping 320.94 would still read as a mismatch to anyone
 			// comparing the two on screen.
-			seconds: Math.round(seconds),
-			quality,
+			seconds: solved.seconds,
+			quality: solved.quality,
 			costs: costs.map((c) => ({ resourceId: c.resourceId, quantity: c.quantity })),
 			settlementId: home.id,
-			allowed
+			allowed,
+			crewSize: wanted
 		}
 	};
+}
+
+/**
+ * Writes a crew's membership rows, each with its own origin and its own arrival. Every timestamp is
+ * computed by Postgres, so the client's interpolation is exact by construction — Node's clock never
+ * stamps anything.
+ */
+async function insertCrew(tx: Tx, operationId: number, crew: BuildPlan['crew']): Promise<void> {
+	await tx.insert(operationWorker).values(
+		crew.map((m) => ({
+			operationId,
+			characterId: m.character.id,
+			qualityMultiplier: m.multiplier,
+			originX: m.character.x,
+			originY: m.character.y,
+			arrivesAt: sql`now() + ${`${m.arrivesAt} seconds`}::interval`
+		}))
+	);
 }
 
 /**
@@ -937,7 +1082,7 @@ export async function createBuildOrder(
 			allowedProfessionIds
 		);
 		if (!planned.ok) return { ok: false, reason: planned.reason };
-		const { crew, seconds, quality, costs, settlementId, allowed } = planned.plan;
+		const { crew, seconds, quality, costs, settlementId, allowed, crewSize: wanted } = planned.plan;
 
 		for (const c of costs) {
 			await tx
@@ -946,37 +1091,32 @@ export async function createBuildOrder(
 				.where(and(eq(stock.settlementId, settlementId), eq(stock.resourceId, c.resourceId)));
 		}
 
-		// Every timestamp is computed by Postgres in this one statement. Node's clock never
-		// stamps anything, so the client's interpolation is exact by construction.
+		// No crew means nobody qualified, so the build waits: it holds its tile and the cost it has
+		// already paid, remembers how many bodies it wanted and who may work it, and `resolveWorld`
+		// starts it the moment a worker frees. Reserving the cost now rather than at start is what
+		// keeps it from failing silently while the player is away — the same reasoning the
+		// pay-at-order model rests on.
+		const queued = crew.length === 0;
 		const [op] = await tx
 			.insert(operation)
 			.values({
 				playerId,
 				type: 'build',
-				status: 'in-progress',
+				status: queued ? 'queued' : 'in-progress',
 				destX: x,
 				destY: y,
 				buildingTypeId,
 				// The crew's combined workmanship. Duration is baked into `complete_at` and no longer
-				// divides by this — for a one-member crew the two are the same number anyway.
-				qualityMultiplier: quality,
-				// Stored even though the crew is already chosen: phase 6's auto-start reads it back
-				// minutes later to decide who may take over a build that had to wait.
+				// divides by this — for a one-member crew the two are the same number anyway. A queued
+				// build has no crew yet, so it keeps the column's default until it starts.
+				...(queued ? {} : { qualityMultiplier: quality! }),
 				allowedProfessionIds: allowed,
-				startedAt: sql`now()`,
-				completeAt: sql`now() + ${`${seconds} seconds`}::interval`
+				crewSize: wanted,
+				startedAt: queued ? null : sql`now()`,
+				completeAt: queued ? null : sql`now() + ${`${seconds} seconds`}::interval`
 			})
 			.returning({ id: operation.id });
-		await tx.insert(operationWorker).values(
-			crew.map((m) => ({
-				operationId: op.id,
-				characterId: m.character.id,
-				qualityMultiplier: m.multiplier,
-				originX: m.character.x,
-				originY: m.character.y,
-				arrivesAt: sql`now() + ${`${m.arrivesAt} seconds`}::interval`
-			}))
-		);
+		if (!queued) await insertCrew(tx, op.id, crew);
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});
@@ -1274,9 +1414,9 @@ export async function recallWorker(playerId: number, operationId: number): Promi
  */
 export async function cancelBuild(playerId: number, operationId: number): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
-		// resolveWorld may complete this very build first (turning it into a building); it is then no
-		// longer in-progress and the delete below matches nothing — correctly refusing to refund a
-		// build that already finished while the player was deciding.
+		// resolveWorld may complete this very build first (turning it into a building), or start a
+		// queued one; either way the delete below matches on "not completed", so a build that
+		// finished while the player was deciding is correctly refused rather than refunded.
 		await resolveWorld(tx, playerId);
 
 		const [cancelled] = await tx
@@ -1285,7 +1425,9 @@ export async function cancelBuild(playerId: number, operationId: number): Promis
 				and(
 					eq(operation.id, operationId),
 					eq(operation.playerId, playerId),
-					eq(operation.status, 'in-progress'),
+					// Queued as well as in-progress: a build you have got tired of waiting for is
+					// exactly the one you want to take back, and the refund is identical either way.
+					ne(operation.status, 'completed'),
 					eq(operation.type, 'build')
 				)
 			)
@@ -1329,7 +1471,9 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 	const operations = await tx
 		.select()
 		.from(operation)
-		.where(and(eq(operation.playerId, playerId), eq(operation.status, 'in-progress')));
+		// Not 'in-progress' but "not finished": a queued build has to reach the client so the tile
+		// can show that something is waiting there, and so it can be cancelled.
+		.where(and(eq(operation.playerId, playerId), ne(operation.status, 'completed')));
 	// The crews, grouped by operation. One read for all of them rather than one per operation.
 	const crews = new Map<number, (typeof operationWorker.$inferSelect)[]>();
 	if (operations.length) {
@@ -1443,7 +1587,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			professionId: o.professionId,
 			destX: o.destX,
 			destY: o.destY,
-			startedAt: o.startedAt.toISOString(),
+			startedAt: o.startedAt?.toISOString() ?? null,
 			// Null on a gather, and that is the wire's way of saying "this never ends by itself".
 			completeAt: o.completeAt?.toISOString() ?? null,
 			workers: (crews.get(o.id) ?? []).map((w) => ({
