@@ -352,5 +352,40 @@ check(
 	beforeQuote
 );
 
+// The whole chain, asserted in one go: what the preview promised is what the *building* carries.
+// Deliberately the slow case — it waits out a real build — because without it "preview = outcome"
+// is only ever proved as far as the operation, and the durable output this epic exists to capture
+// would have no check at all.
+cookie = '';
+await api('/api/world');
+const promised = await estimateOf(14, 9, free, 3);
+const raised = await order(14, 9, free, 3);
+const rising = raised.body.operations?.[0];
+if (!rising) throw new Error('the build-for-quality order was refused');
+const dueAt = Date.parse(rising.completeAt);
+let finished: { quality: number } | undefined;
+// Bounded: a 3-settler Barn is ~100s of build plus travel. Polling is what makes the building
+// appear at all — the server resolves on read, so nobody looking means nobody building.
+while (Date.now() < dueAt + 15_000) {
+	await new Promise((r) => setTimeout(r, 3000));
+	const w = await api('/api/world');
+	finished = w.body.buildings.find((b: { x: number; y: number }) => b.x === 14 && b.y === 9);
+	if (finished) break;
+}
+check(
+	`the finished building carries the quality the preview promised (${promised.body.quality})`,
+	finished ? Math.abs(finished.quality - promised.body.quality) < 1e-6 : 'never finished',
+	true
+);
+// The starting hamlet predates the column, so it is the honest null case: no band, no crash.
+const hamlet = (await api('/api/world')).body.buildings.find(
+	(b: { x: number; y: number }) => b.x === 7 && b.y === 8
+);
+check(
+	'a building raised before quality was recorded reports null, not a number',
+	hamlet.quality,
+	null
+);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

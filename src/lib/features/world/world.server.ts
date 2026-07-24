@@ -375,7 +375,10 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			playerId,
 			x: op.destX,
 			y: op.destY,
-			buildingTypeId: op.buildingTypeId!
+			buildingTypeId: op.buildingTypeId!,
+			// The crew's workmanship, carried onto the thing they made. This is the last moment it
+			// exists: the operation that knows it is about to be history.
+			quality: op.qualityMultiplier
 		});
 		// The whole crew ends up standing at the site they raised.
 		if (crew.length)
@@ -1360,7 +1363,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			id: b.id,
 			x: b.x,
 			y: b.y,
-			buildingTypeId: b.buildingTypeId
+			buildingTypeId: b.buildingTypeId,
+			quality: b.quality
 		})),
 		characters: characters.map((c) => ({
 			id: c.id,

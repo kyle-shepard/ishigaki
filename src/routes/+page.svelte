@@ -584,7 +584,16 @@
 					</p>
 
 					{#if selBuilt}
-						<p><b>{typeName(selBuilt.buildingTypeId)}</b> stands here.</p>
+						<!-- The same band the estimate quoted, from the same function — so what you were
+					     promised and what stands there can never read differently. A building raised
+					     before quality was recorded says nothing, rather than "unknown". -->
+						<p>
+							<b>{typeName(selBuilt.buildingTypeId)}</b> stands here.{#if selBuilt.quality !== null}{' '}<span
+									class="price"
+									title="quality {selBuilt.quality.toFixed(2)}"
+									>{qualityBand(selBuilt.quality)} work.</span
+								>{/if}
+						</p>
 					{:else if selSite}
 						<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
 						<!-- Who is raising it. The crew is the operation's own membership, so this says the

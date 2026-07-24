@@ -67,7 +67,21 @@ export const building = pgTable(
 		y: integer('y').notNull(),
 		buildingTypeId: integer('building_type_id')
 			.notNull()
-			.references(() => buildingType.id)
+			.references(() => buildingType.id),
+		// How well this was built, snapshotted from the crew that raised it. **The same scale and
+		// the same quantity as operation.quality_multiplier** — the name differs only because
+		// "multiplier" describes what it does to an in-flight operation, and a finished building
+		// doesn't multiply anything.
+		//
+		// Nullable with no default, deliberately: the scale runs from a settler's ~0.15 to a
+		// master's ~0.8, so DEFAULT 1 would backfill every building that predates this column as
+		// off-scale super-quality. Null honestly says "built before quality was recorded".
+		//
+		// Mechanically inert for now — stored and shown, nothing reads it. Its consumers are decay
+		// (better work degrades slower) and crafting (a workshop's quality feeds its output), both
+		// their own later epics. Captured now because it cannot be reconstructed afterwards: the
+		// operation that knows it is deleted the moment the building exists.
+		quality: real('quality')
 	},
 	// ponytail: scoped by player_id so each visitor gets an isolated sandbox on the shared
 	// map — see VISION #4's interim override. This REVERSES the original rule (a tile is a

@@ -116,7 +116,9 @@ export type WorldPayload = {
 		// none. The client greys a type whose prerequisite isn't owned, labelled with its name.
 		requiresBuildingTypeId: number | null;
 	}[];
-	buildings: { id: number; x: number; y: number; buildingTypeId: number }[];
+	// quality is how well it was built — null on anything raised before it was recorded, which
+	// reads as nothing at all rather than as "unknown".
+	buildings: { id: number; x: number; y: number; buildingTypeId: number; quality: number | null }[];
 	// professionId null ⇒ settler (a dot); set ⇒ a named specialist (drawn distinct). name is
 	// the specialist's, null for a settler.
 	characters: {
