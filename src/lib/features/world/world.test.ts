@@ -10,6 +10,7 @@ import {
 	pickName,
 	population,
 	positionAt,
+	qualityBand,
 	rollStats,
 	skillValue,
 	STAT_MAX,
@@ -479,4 +480,33 @@ test('crewRate is the 1/√k rule and nothing else', () => {
 	assert.equal(crewRate([MASON, MASON]), MASON + MASON / Math.SQRT2);
 	// Sorted descending, so the ranking is by competence rather than by the order handed in.
 	assert.equal(crewRate([0.1, 0.9]), 0.9 + 0.1 / Math.SQRT2);
+});
+
+test('quality reads as a word, and the words are ordered', () => {
+	// A raw 0.44 tells nobody anything; the band is what the panel says out loud.
+	assert.equal(qualityBand(SETTLER), 'Rough', 'settlers alone are the floor');
+	assert.equal(qualityBand(build(MASON, SETTLER, SETTLER, SETTLER, SETTLER).quality), 'Good');
+	assert.equal(qualityBand(build(MASON, MASON).quality), 'Fine');
+	// 0.80 is the observed ceiling — a Carpenter with a good stat roll, working alone.
+	assert.equal(qualityBand(0.8), 'Masterwork', 'a trained builder at their best');
+	// Monotone across the whole scale: better work never reads as a worse word.
+	const seen: string[] = [];
+	for (let q = 0; q <= 1.0001; q += 0.01) {
+		const band = qualityBand(q);
+		if (band !== seen[seen.length - 1]) seen.push(band);
+	}
+	assert.deepEqual(seen, ['Rough', 'Fair', 'Good', 'Fine', 'Masterwork']);
+});
+
+test('every band boundary belongs to the band above it', () => {
+	// Half-open from below, so no value falls between two bands and none belongs to both.
+	for (const [edge, below] of [
+		[0.28, 'Rough'],
+		[0.41, 'Fair'],
+		[0.54, 'Good'],
+		[0.67, 'Fine']
+	] as const) {
+		assert.equal(qualityBand(edge - 1e-9), below);
+		assert.notEqual(qualityBand(edge), below);
+	}
 });

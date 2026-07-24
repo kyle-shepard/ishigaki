@@ -310,5 +310,47 @@ check(
 	small.body.characters.length
 );
 
+// Preview = outcome. This is a stated failure condition of the epic — "the numbers shown before
+// you commit aren't the ones you get" — and it can only be closed by asserting the quote against
+// the thing actually written. Both go through `planBuild`, so this is what proves that.
+const estimateOf = (x: number, y: number, buildingTypeId: number, crewSize: number) =>
+	api('/api/orders/estimate', {
+		method: 'POST',
+		body: JSON.stringify({ x, y, buildingTypeId, crewSize })
+	});
+
+for (const size of [1, 3]) {
+	cookie = '';
+	await api('/api/world');
+	const quote = await estimateOf(14, 9, free, size);
+	const placed = await order(14, 9, free, size);
+	const op = placed.body.operations?.[0];
+	if (!op) throw new Error(`estimate-then-order (crew ${size}) was refused`);
+	const actual = (Date.parse(op.completeAt) - Date.parse(op.startedAt)) / 1000;
+	check(
+		`a crew-of-${size} estimate (${quote.body.seconds}s) is what the order actually does (${actual}s)`,
+		Math.abs(quote.body.seconds - actual) <= 1,
+		true
+	);
+	check(`the estimate names the crew of ${size} it would send`, quote.body.crew.length, size);
+}
+
+// A refusal previews as the same refusal, rather than as a number nobody can act on.
+cookie = '';
+await api('/api/world');
+check(
+	'estimating an unbuildable tile refuses with the reason the order would give',
+	[(await estimateOf(0, 0, free, 1)).status, (await estimateOf(0, 0, free, 1)).body.reason],
+	[400, 'TILE_NOT_BUILDABLE']
+);
+// And it spends nothing: quoting is not ordering.
+const beforeQuote = woodHeld((await api('/api/world')).body);
+await estimateOf(9, 9, house, 3);
+check(
+	'an estimate costs nothing — quoting is not ordering',
+	woodHeld((await api('/api/world')).body),
+	beforeQuote
+);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

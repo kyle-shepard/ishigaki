@@ -29,6 +29,7 @@ import {
 	rollStats,
 	skillValue,
 	travelSeconds,
+	type EstimateResponse,
 	type OrderReason,
 	type WorldPayload
 } from './world';
@@ -641,6 +642,8 @@ async function constructionSkillId(tx: Tx): Promise<number> {
 }
 
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
+export type EstimateResult =
+	{ ok: true; estimate: EstimateResponse } | { ok: false; reason: OrderReason };
 
 /**
  * The grid a build order is judged against: what every tile is made of, keyed the same
@@ -683,10 +686,189 @@ async function loadGrid(tx: Tx): Promise<
 	);
 }
 
+/** A build as it *would* happen: who goes, how long it takes, how well it comes out. */
+export type BuildPlan = {
+	crew: { character: typeof character.$inferSelect; multiplier: number; arrivesAt: number }[];
+	/** Whole seconds from the order to the finished building, travel included. */
+	seconds: number;
+	quality: number;
+	costs: { resourceId: number; quantity: number }[];
+	settlementId: number;
+};
+export type PlanResult = { ok: true; plan: BuildPlan } | { ok: false; reason: OrderReason };
+
 /**
- * Rejections come back as a value, not an exception: a try/catch around the handler would
- * map a mid-transaction DB failure onto a 400 the player reads as a game rule. Only an
- * `OrderReason` produces a 400; anything thrown stays thrown.
+ * Everything an order decides, and none of what it writes: every rule, the crew it would send, and
+ * the numbers that crew would produce. Rejections come back as a value, not an exception — a
+ * try/catch around the handler would map a mid-transaction DB failure onto a 400 the player reads
+ * as a game rule. Only an `OrderReason` produces a 400; anything thrown stays thrown.
+ *
+ * **The estimate and the order both go through here, and that shared path is the only thing that
+ * actually guarantees the preview matches the outcome.** Two implementations agreeing today is two
+ * implementations that will disagree eventually, and "the numbers shown before you commit aren't
+ * the ones you get" is a stated failure of this epic.
+ *
+ * The caller must have run `resolveWorld` first: a stale idle set would quote a worker who is
+ * already busy.
+ */
+async function planBuild(
+	tx: Tx,
+	playerId: number,
+	x: number,
+	y: number,
+	buildingTypeId: number,
+	crewSize: number
+): Promise<PlanResult> {
+	// Clamped rather than refused: a crew size is a dial, not a claim about the world, and there is
+	// no sentence to show a player whose stepper sent 0. Absent means one, which is what every
+	// caller meant before crews existed.
+	const wanted = Number.isFinite(crewSize) ? Math.max(1, Math.floor(crewSize)) : 1;
+
+	if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
+	if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
+		return { ok: false, reason: 'OUT_OF_BOUNDS' };
+
+	const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
+	if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
+
+	// Realm-wide prerequisite: a type that names another must have one of that other standing
+	// *anywhere* the player owns before it can be placed at all (a Stone wall needs a Quarry).
+	// Checked before terrain — "you can't build this yet" outranks "not on this ground".
+	if (type.requiresBuildingTypeId !== null) {
+		const [owned] = await tx
+			.select({ id: building.id })
+			.from(building)
+			.where(
+				and(
+					eq(building.playerId, playerId),
+					eq(building.buildingTypeId, type.requiresBuildingTypeId)
+				)
+			)
+			.limit(1);
+		if (!owned) return { ok: false, reason: 'MISSING_PREREQUISITE' };
+	}
+
+	// Ground before what sits on it: bounds and building type ask "is this request
+	// coherent", terrain asks "is this place legal", occupancy asks "is this place free".
+	const grid = await loadGrid(tx);
+	// A hole in the grid is a corrupt world, not a game rule. Falling back to `undefined`
+	// would tell the player they can't build there (a DB fault dressed as a rule, which
+	// the docstring above forbids) and would feed NaN into the travel time.
+	const groundAt = (gx: number, gy: number) => {
+		const g = grid.get(gy * GRID_SIZE + gx);
+		if (!g) throw new Error(`no tile row at (${gx}, ${gy}) — run \`npm run seed\``);
+		return g;
+	};
+	// The terrain-eligibility rule, authored once in `eligibleTypeIds` and shared with the wire
+	// allow-list below. Its empty-set result subsumes the old bare `buildable` check: a House
+	// can't squat on an iron vein, a Quarry can't sit on a meadow, and unbuildable ground offers
+	// nothing at all. ponytail: reuses TILE_NOT_BUILDABLE rather than a dedicated
+	// TILE_WRONG_TERRAIN — a rarely-hit backstop behind the client's greyed menu; the sentence
+	// is slightly generous on a deposit but defensible. Upgrade the day it goes user-facing.
+	const catalogTypes = await tx.select({ id: buildingType.id }).from(buildingType);
+	const catalogResources = await tx
+		.select({ id: resource.id, requiresBuildingTypeId: resource.requiresBuildingTypeId })
+		.from(resource);
+	if (!eligibleTypeIds(groundAt(x, y), catalogTypes, catalogResources).includes(buildingTypeId))
+		return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
+
+	// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
+	// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
+	// and building_tile_idx — to restore world-global tile ownership.
+	const [existing] = await tx
+		.select()
+		.from(building)
+		.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
+	if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
+
+	// In-progress builds count as occupancy too, or two orders stack on one tile. Gathers
+	// don't: a worker standing on a tile is not a thing built on it, and refusing to build
+	// where someone happens to be foraging would be a rule nobody could guess.
+	const [pending] = await tx
+		.select()
+		.from(operation)
+		.where(
+			and(
+				eq(operation.playerId, playerId),
+				eq(operation.status, 'in-progress'),
+				eq(operation.type, 'build'),
+				eq(operation.destX, x),
+				eq(operation.destY, y)
+			)
+		);
+	if (pending) return { ok: false, reason: 'TILE_OCCUPIED' };
+
+	// The best builders, not merely the first idle bodies — a skilled worker builds faster and
+	// better (both fold into the numbers below). Every build ranks by Construction.
+	//
+	// `crewSize` is a **maximum**: the order takes up to that many of the ranked idle bodies and
+	// is happy with fewer. Asking for four when two are free starts with two — waiting for the
+	// full four would be a second kind of waiting, and nothing asks for one.
+	const ranked = await rankIdleWorkers(tx, playerId, await constructionSkillId(tx));
+	if (ranked.length === 0) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+	const crew = ranked.slice(0, wanted);
+
+	// Cost is judged last and, in the writer, spent last: a refusal on any earlier ground has
+	// to leave stock untouched. The estimate runs the same check and simply doesn't spend, so
+	// "you can't afford this" is a preview answer rather than a surprise at the button.
+	const costs = await tx
+		.select()
+		.from(buildingCost)
+		.where(eq(buildingCost.buildingTypeId, buildingTypeId));
+	const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
+	if (!home) throw new Error(`player ${playerId} has no settlement`);
+	const held = new Map(
+		(await tx.select().from(stock).where(eq(stock.settlementId, home.id))).map((s) => [
+			s.resourceId,
+			s.quantity
+		])
+	);
+	// Checked in full before anything is spent, so a two-resource cost can't half-pay.
+	if (costs.some((c) => (held.get(c.resourceId) ?? 0) < c.quantity))
+		return { ok: false, reason: 'INSUFFICIENT_RESOURCES' };
+
+	// Every member walks their own leg, from their own tile — so a crew necessarily arrives
+	// staggered, and each arrival is already known here. The grid loaded for the buildable
+	// check is the same one the paths are priced against: one read, many uses.
+	const arrivals = crew.map((m) =>
+		travelSeconds(
+			m.character.x,
+			m.character.y,
+			x,
+			y,
+			m.character.speed,
+			(cx, cy) => groundAt(cx, cy).movementCost
+		)
+	);
+	// One duration and one workmanship out of the whole crew, solved once — every arrival being
+	// known at order time is what lets `complete_at` be stamped now and never revisited.
+	const { seconds, quality } = crewBuild(
+		crew.map((m, i) => ({ multiplier: m.multiplier, arrivesAtSeconds: arrivals[i] })),
+		type.buildSeconds
+	);
+
+	return {
+		ok: true,
+		plan: {
+			crew: crew.map((m, i) => ({ ...m, arrivesAt: arrivals[i] })),
+			// Whole seconds, because that is what the preview shows and what the wire carries;
+			// quoting 320.94 and stamping 320.94 would still read as a mismatch to anyone
+			// comparing the two on screen.
+			seconds: Math.round(seconds),
+			quality,
+			costs: costs.map((c) => ({ resourceId: c.resourceId, quantity: c.quantity })),
+			settlementId: home.id
+		}
+	};
+}
+
+/**
+ * Places a build: the plan above, then the writes it implies — the cost spent, the operation, and
+ * one membership row per member of the crew.
+ *
+ * Deducted at order rather than on completion: there is a cancel path that refunds in full, and a
+ * charge that failed at completion would fail silently while the player was away, which is exactly
+ * when completion happens.
  */
 export async function createBuildOrder(
 	playerId: number,
@@ -695,144 +877,22 @@ export async function createBuildOrder(
 	buildingTypeId: number,
 	crewSize: number = 1
 ): Promise<OrderResult> {
-	// Clamped rather than refused: a crew size is a dial, not a claim about the world, and there is
-	// no sentence to show a player whose slider sent 0. Absent means one, which is what every
-	// caller meant before crews existed.
-	const wanted = Number.isFinite(crewSize) ? Math.max(1, Math.floor(crewSize)) : 1;
 	return db.transaction(async (tx): Promise<OrderResult> => {
 		// An order is a read-then-write: without this it could be rejected as NO_IDLE_CHARACTER
 		// by an operation that finished ten seconds ago, or judged against stale stock.
 		await resolveWorld(tx, playerId);
 
-		if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
-		if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
-			return { ok: false, reason: 'OUT_OF_BOUNDS' };
+		const planned = await planBuild(tx, playerId, x, y, buildingTypeId, crewSize);
+		if (!planned.ok) return { ok: false, reason: planned.reason };
+		const { crew, seconds, quality, costs, settlementId } = planned.plan;
 
-		const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
-		if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
-
-		// Realm-wide prerequisite: a type that names another must have one of that other standing
-		// *anywhere* the player owns before it can be placed at all (a Stone wall needs a Quarry).
-		// Checked before terrain — "you can't build this yet" outranks "not on this ground".
-		if (type.requiresBuildingTypeId !== null) {
-			const [owned] = await tx
-				.select({ id: building.id })
-				.from(building)
-				.where(
-					and(
-						eq(building.playerId, playerId),
-						eq(building.buildingTypeId, type.requiresBuildingTypeId)
-					)
-				)
-				.limit(1);
-			if (!owned) return { ok: false, reason: 'MISSING_PREREQUISITE' };
-		}
-
-		// Ground before what sits on it: bounds and building type ask "is this request
-		// coherent", terrain asks "is this place legal", occupancy asks "is this place free".
-		const grid = await loadGrid(tx);
-		// A hole in the grid is a corrupt world, not a game rule. Falling back to `undefined`
-		// would tell the player they can't build there (a DB fault dressed as a rule, which
-		// the docstring above forbids) and would feed NaN into the travel time.
-		const groundAt = (gx: number, gy: number) => {
-			const g = grid.get(gy * GRID_SIZE + gx);
-			if (!g) throw new Error(`no tile row at (${gx}, ${gy}) — run \`npm run seed\``);
-			return g;
-		};
-		// The terrain-eligibility rule, authored once in `eligibleTypeIds` and shared with the wire
-		// allow-list below. Its empty-set result subsumes the old bare `buildable` check: a House
-		// can't squat on an iron vein, a Quarry can't sit on a meadow, and unbuildable ground offers
-		// nothing at all. ponytail: reuses TILE_NOT_BUILDABLE rather than a dedicated
-		// TILE_WRONG_TERRAIN — a rarely-hit backstop behind the client's greyed menu; the sentence
-		// is slightly generous on a deposit but defensible. Upgrade the day it goes user-facing.
-		const catalogTypes = await tx.select({ id: buildingType.id }).from(buildingType);
-		const catalogResources = await tx
-			.select({ id: resource.id, requiresBuildingTypeId: resource.requiresBuildingTypeId })
-			.from(resource);
-		if (!eligibleTypeIds(groundAt(x, y), catalogTypes, catalogResources).includes(buildingTypeId))
-			return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
-
-		// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
-		// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
-		// and building_tile_idx — to restore world-global tile ownership.
-		const [existing] = await tx
-			.select()
-			.from(building)
-			.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
-		if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
-
-		// In-progress builds count as occupancy too, or two orders stack on one tile. Gathers
-		// don't: a worker standing on a tile is not a thing built on it, and refusing to build
-		// where someone happens to be foraging would be a rule nobody could guess.
-		const [pending] = await tx
-			.select()
-			.from(operation)
-			.where(
-				and(
-					eq(operation.playerId, playerId),
-					eq(operation.status, 'in-progress'),
-					eq(operation.type, 'build'),
-					eq(operation.destX, x),
-					eq(operation.destY, y)
-				)
-			);
-		if (pending) return { ok: false, reason: 'TILE_OCCUPIED' };
-
-		// The best builders, not merely the first idle bodies — a skilled worker builds faster and
-		// better (both fold into the numbers below). Every build ranks by Construction.
-		//
-		// `crewSize` is a **maximum**: the order takes up to that many of the ranked idle bodies and
-		// is happy with fewer. Asking for four when two are free starts with two — waiting for the
-		// full four would be a second kind of waiting, and nothing asks for one.
-		const ranked = await rankIdleWorkers(tx, playerId, await constructionSkillId(tx));
-		if (ranked.length === 0) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
-		const crew = ranked.slice(0, wanted);
-
-		// Cost comes last, because it is the only check that writes: a refusal on any earlier
-		// ground has to leave stock untouched. Deducted at order rather than on completion —
-		// there is no cancel path to refund, and a charge that failed at completion would fail
-		// silently while the player was away, which is exactly when completion happens.
-		const costs = await tx
-			.select()
-			.from(buildingCost)
-			.where(eq(buildingCost.buildingTypeId, buildingTypeId));
-		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
-		if (!home) throw new Error(`player ${playerId} has no settlement`);
-		const held = new Map(
-			(await tx.select().from(stock).where(eq(stock.settlementId, home.id))).map((s) => [
-				s.resourceId,
-				s.quantity
-			])
-		);
-		// Checked in full before anything is spent, so a two-resource cost can't half-pay.
-		if (costs.some((c) => (held.get(c.resourceId) ?? 0) < c.quantity))
-			return { ok: false, reason: 'INSUFFICIENT_RESOURCES' };
 		for (const c of costs) {
 			await tx
 				.update(stock)
 				.set({ quantity: sql`${stock.quantity} - ${c.quantity}` })
-				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, c.resourceId)));
+				.where(and(eq(stock.settlementId, settlementId), eq(stock.resourceId, c.resourceId)));
 		}
 
-		// Every member walks their own leg, from their own tile — so a crew necessarily arrives
-		// staggered, and each arrival is already known here. The grid loaded for the buildable
-		// check is the same one the paths are priced against: one read, many uses.
-		const arrivals = crew.map((m) =>
-			travelSeconds(
-				m.character.x,
-				m.character.y,
-				x,
-				y,
-				m.character.speed,
-				(cx, cy) => groundAt(cx, cy).movementCost
-			)
-		);
-		// One duration and one workmanship out of the whole crew, solved once — every arrival being
-		// known at order time is what lets `complete_at` be stamped now and never revisited.
-		const { seconds, quality } = crewBuild(
-			crew.map((m, i) => ({ multiplier: m.multiplier, arrivesAtSeconds: arrivals[i] })),
-			type.buildSeconds
-		);
 		// Every timestamp is computed by Postgres in this one statement. Node's clock never
 		// stamps anything, so the client's interpolation is exact by construction.
 		const [op] = await tx
@@ -852,17 +912,52 @@ export async function createBuildOrder(
 			})
 			.returning({ id: operation.id });
 		await tx.insert(operationWorker).values(
-			crew.map((m, i) => ({
+			crew.map((m) => ({
 				operationId: op.id,
 				characterId: m.character.id,
 				qualityMultiplier: m.multiplier,
 				originX: m.character.x,
 				originY: m.character.y,
-				arrivesAt: sql`now() + ${`${arrivals[i]} seconds`}::interval`
+				arrivesAt: sql`now() + ${`${m.arrivesAt} seconds`}::interval`
 			}))
 		);
 
 		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
+/**
+ * What an order *would* do, without doing it — the Lands of Lords complaint answered: you see the
+ * time and the workmanship before you spend anything, and they change as you change the crew.
+ *
+ * Runs `resolveWorld` first like every writer, so the idle set is not stale. Idle bodies don't move
+ * on their own, so a quote holds until you act on it; a build completing in between can only free
+ * *more* workers, which means the outcome can beat the quote but never miss it.
+ */
+export async function estimateBuild(
+	playerId: number,
+	x: number,
+	y: number,
+	buildingTypeId: number,
+	crewSize: number = 1
+): Promise<EstimateResult> {
+	return db.transaction(async (tx): Promise<EstimateResult> => {
+		await resolveWorld(tx, playerId);
+		const planned = await planBuild(tx, playerId, x, y, buildingTypeId, crewSize);
+		if (!planned.ok) return { ok: false, reason: planned.reason };
+		const { crew, seconds, quality } = planned.plan;
+		return {
+			ok: true,
+			estimate: {
+				seconds,
+				quality,
+				crew: crew.map((m) => ({
+					characterId: m.character.id,
+					name: m.character.name,
+					professionId: m.character.professionId
+				}))
+			}
+		};
 	});
 }
 

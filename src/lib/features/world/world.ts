@@ -28,6 +28,41 @@ export type OrderReason =
 export type OrderRequest = { x: number; y: number; buildingTypeId: number; crewSize?: number };
 export type TrainRequest = { x: number; y: number; professionId: number };
 
+// The same shape as an order, because it asks the same question — it just doesn't spend.
+export type EstimateRequest = OrderRequest;
+export type EstimateResponse = {
+	/** Whole seconds from placing the order to the finished building, travel included. */
+	seconds: number;
+	quality: number;
+	/** The bodies that would go, best first. `name`/`professionId` null for a settler. */
+	crew: { characterId: number; name: string | null; professionId: number | null }[];
+};
+
+// Where the five bands fall. Tuning, not structure — retune the numbers, not the code.
+//
+// Five even cuts of [0.15, 0.80]: the settler baseline at the bottom, and at the top the observed
+// ceiling of a well-rolled specialist working their own trade (a Carpenter measured at 0.80 —
+// bundle 0.7 swung up by good stats). Anchored on what the game actually produces rather than on
+// the round numbers in the design, because a band that never changes as you rebuild the crew tells
+// the player nothing, which is the exact failure showing a raw 0.44 would have been.
+const BANDS: [number, string][] = [
+	[0.28, 'Rough'],
+	[0.41, 'Fair'],
+	[0.54, 'Good'],
+	[0.67, 'Fine']
+];
+
+/**
+ * Quality as a word. `0.44` on screen is not information — nobody knows whether that is good, and
+ * the raw number belongs in a tooltip rather than the sentence.
+ *
+ * One function, used by both the preview and the finished building, so the two can never disagree
+ * about what a number means. That is the whole reason it is here rather than inline in the panel.
+ */
+export function qualityBand(quality: number): string {
+	return BANDS.find(([ceiling]) => quality < ceiling)?.[1] ?? 'Masterwork';
+}
+
 // ponytail: the whole world, every read. Terrain now dominates the payload — 256 small ints
 // row-major is ~700 B, so a full read is ~1.3 KB, still smaller than a diff protocol's own
 // HTTP headers. (An array of 256 tile *objects* would have been ~10 KB; that's why it isn't.)

@@ -8,7 +8,9 @@
 	import {
 		GRID_SIZE,
 		positionAt,
+		qualityBand,
 		travelFraction,
+		type EstimateResponse,
 		type OrderReason,
 		type TravelLeg,
 		type WorldPayload
@@ -409,6 +411,58 @@
 	// Named specialists, for both the map pawns and the roster. Live position so a pawn tracks a
 	// walking specialist.
 	const specialists = $derived(world?.characters.filter((c) => c.professionId !== null) ?? []);
+
+	// ---- The live estimate ---------------------------------------------------------------------
+	// What this build would cost you in time and workmanship, before you spend anything. The server
+	// answers from the same code path the order takes, so the quote and the outcome are the same
+	// arithmetic rather than two implementations that agree for now.
+	let estimate = $state<EstimateResponse | null>(null);
+	// A refusal the estimate saw — shown inline by the numbers rather than as a page-level error,
+	// because nothing has been attempted yet.
+	let estimateRefusal = $state<OrderReason | null>(null);
+
+	function duration(seconds: number) {
+		const m = Math.floor(seconds / 60);
+		const s = Math.round(seconds % 60);
+		return m ? `${m}m ${s}s` : `${s}s`;
+	}
+
+	// Re-quotes whenever the tile, the type or the crew size changes. Debounced, because the crew
+	// stepper fires per keystroke and a 16×16 map does not need a round trip per digit.
+	$effect(() => {
+		const target = selected;
+		const type = chosen;
+		const size = crewSize;
+		if (!target || type === null || !canBuild) {
+			estimate = null;
+			estimateRefusal = null;
+			return;
+		}
+		const timer = setTimeout(async () => {
+			try {
+				const res = await fetch('/api/orders/estimate', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ x: target.x, y: target.y, buildingTypeId: type, crewSize: size })
+				});
+				if (res.status === 400) {
+					estimate = null;
+					estimateRefusal = (await res.json()).reason;
+					return;
+				}
+				if (!res.ok) throw new Error(`estimate failed: ${res.status}`);
+				estimate = await res.json();
+				estimateRefusal = null;
+			} catch (e) {
+				// A quote that can't be fetched is not worth a page-level error — the Build button
+				// still works, and the server is still the one that decides.
+				console.error(e);
+				estimate = null;
+				estimateRefusal = null;
+			}
+		}, 200);
+		return () => clearTimeout(timer);
+	});
 </script>
 
 <header class="topbar">
@@ -584,6 +638,21 @@
 							<input type="number" min="1" max={world.characters.length} bind:value={crewSize} />
 							<span class="price">more hands, less craft</span>
 						</label>
+						<!-- The numbers, before you commit. They move as the crew moves — the whole point
+					     of the epic, and the thing Lands of Lords only tells you after you've spent
+					     the bodies. The raw quality rides in the title; the sentence gets the band. -->
+						{#if estimate}
+							<p class="estimate">
+								<b title="quality {estimate.quality.toFixed(2)}">
+									≈ {duration(estimate.seconds)} · {qualityBand(estimate.quality)}
+								</b>
+								<span class="price">
+									sending {estimate.crew.map((c) => c.name ?? 'a settler').join(', ')}
+								</span>
+							</p>
+						{:else if estimateRefusal}
+							<p class="estimate price">{REASON_TEXT[estimateRefusal] ?? estimateRefusal}</p>
+						{/if}
 						<button onclick={buildHere} disabled={!chosenOk}>Build</button>
 					{/if}
 
@@ -769,6 +838,13 @@
 	.crew-size input {
 		width: 4rem;
 		font: inherit;
+	}
+	.estimate {
+		margin: 0.25rem 0 0.6rem;
+		font-variant-numeric: tabular-nums;
+	}
+	.estimate span {
+		display: block;
 	}
 	.roster-title {
 		margin: 1.25rem 0 0.25rem;
