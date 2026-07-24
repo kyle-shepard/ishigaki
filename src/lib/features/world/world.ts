@@ -11,6 +11,10 @@ export type OrderReason =
 	| 'INSUFFICIENT_RESOURCES'
 	| 'TILE_YIELDS_NOTHING'
 	| 'MISSING_REQUIRED_BUILDING'
+	// A realm-wide build prerequisite isn't met — you don't yet own the building this type needs
+	// (a Stone wall before any Quarry). Distinct from MISSING_REQUIRED_BUILDING, which is
+	// tile-local ("a Quarry on *this* tile"); this one is "a Quarry *anywhere*".
+	| 'MISSING_PREREQUISITE'
 	| 'UNKNOWN_OPERATION'
 	// Training-specific: a settler is needed (not just any idle body), a School must stand on the
 	// tile, and the chosen profession must exist.
@@ -40,6 +44,10 @@ export type WorldPayload = {
 		icon: string;
 		buildable: boolean;
 		yieldsResourceId: number | null;
+		// The building types legal on this terrain, computed server-side by `eligibleTypeIds` — the
+		// same rule the server gate enforces, so the menu can only ever offer what the writer allows.
+		// Empty on unbuildable ground and on a deposit whose extractor doesn't exist yet.
+		buildableTypeIds: number[];
 	}[];
 	resources: { id: number; displayName: string }[];
 	// The professions a settler can be trained into, for the School's Train picker. Global
@@ -61,7 +69,15 @@ export type WorldPayload = {
 	// information arranged so that it can be got wrong.
 	tileQuantity: (number | null)[];
 	tileCapacity: (number | null)[];
-	buildingTypes: { id: number; displayName: string; icon: string; buildSeconds: number }[];
+	buildingTypes: {
+		id: number;
+		displayName: string;
+		icon: string;
+		buildSeconds: number;
+		// The type that must stand somewhere in your realm before this one can be placed; null if
+		// none. The client greys a type whose prerequisite isn't owned, labelled with its name.
+		requiresBuildingTypeId: number | null;
+	}[];
 	buildings: { id: number; x: number; y: number; buildingTypeId: number }[];
 	// professionId null ⇒ settler (a dot); set ⇒ a named specialist (drawn distinct). name is
 	// the specialist's, null for a settler.
@@ -390,4 +406,38 @@ export function travelSeconds(
 		);
 	}
 	return Math.ceil((dist * (total / n)) / speed);
+}
+
+/**
+ * The building types that may be placed on a given terrain — the one rule authored once and
+ * consumed twice: the server gate refuses anything not in this set, and `readWorld` ships it per
+ * terrain type as the wire allow-list so the client's menu offers exactly what the writer permits.
+ *
+ * Three cases, and its empty result subsumes the old bare `buildable` check (unbuildable ground
+ * yields `[]`, so every type fails the gate there):
+ *  - **Unbuildable ground** (Mountain, Water) → `[]`.
+ *  - **A deposit** (Stone outcrop, Clay pit, Iron vein) → only the one extractor that takes its
+ *    yield (Stone ⇒ Quarry), or `[]` when no extractor exists yet (Clay, Iron have none).
+ *  - **Plain buildable ground** → every type *except* an extractor, so a Quarry can't squat on a
+ *    meadow.
+ *
+ * Pure and database-free — the caller passes the catalogs it already holds — so the terrain-menu
+ * rule is pinned in `npm test` rather than only felt through the browser.
+ */
+export function eligibleTypeIds(
+	terrain: { buildable: boolean; isDeposit: boolean; yieldsResourceId: number | null },
+	buildingTypes: { id: number }[],
+	resources: { id: number; requiresBuildingTypeId: number | null }[]
+): number[] {
+	if (!terrain.buildable) return [];
+	// The types that are somebody's extractor — never offered on plain ground.
+	const extractors = new Set(
+		resources.map((r) => r.requiresBuildingTypeId).filter((id): id is number => id !== null)
+	);
+	if (terrain.isDeposit) {
+		const yielded = resources.find((r) => r.id === terrain.yieldsResourceId);
+		const extractor = yielded?.requiresBuildingTypeId ?? null;
+		return extractor !== null ? [extractor] : [];
+	}
+	return buildingTypes.filter((t) => !extractors.has(t.id)).map((t) => t.id);
 }

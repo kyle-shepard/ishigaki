@@ -65,27 +65,59 @@ if (free === undefined)
 const assign = (x: number, y: number) =>
 	api('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
 
-// Terrain rules. The lake and mountain coordinates are the seed layout's; the accepted three
-// cover plain ground, forest, and a deposit — deposits are buildable by design.
+// Terrain rules. `free` is the uncosted type (Barn), so these isolate the ground rule from cost.
+// Unbuildable ground and every *deposit* refuse a plain building: a deposit offers only its own
+// extractor (a Quarry on an outcrop), and Clay/Iron have no extractor yet — so nothing at all.
 for (const [x, y, label] of [
 	[7, 5, 'lake'],
-	[0, 0, 'mountain']
-] as const) {
-	const r = await order(x, y, free);
-	check(`(${x},${y}) ${label} is refused`, [r.status, r.body.reason], [400, 'TILE_NOT_BUILDABLE']);
-}
-for (const [x, y, label] of [
-	[14, 9, 'meadow'],
-	[11, 1, 'forest'],
+	[0, 0, 'mountain'],
+	[2, 1, 'iron vein'],
+	[14, 3, 'stone outcrop'],
 	[12, 5, 'clay pit']
 ] as const) {
-	// One character, one order at a time — a fresh sandbox per case keeps NO_IDLE_CHARACTER
-	// out of what is meant to be a terrain assertion.
+	const r = await order(x, y, free);
+	check(
+		`(${x},${y}) ${label} refuses a plain building`,
+		[r.status, r.body.reason],
+		[400, 'TILE_NOT_BUILDABLE']
+	);
+}
+// Plain buildable ground takes the uncosted type. One order at a time — a fresh sandbox per case
+// keeps NO_IDLE_CHARACTER out of what is meant to be a terrain assertion.
+for (const [x, y, label] of [
+	[14, 9, 'meadow'],
+	[11, 1, 'forest']
+] as const) {
 	cookie = '';
 	await api('/api/world');
 	const r = await order(x, y, free);
 	check(`(${x},${y}) ${label} is accepted`, r.status, 200);
 }
+
+// The deposit rule cuts both ways, and terrain is judged before cost — so even a costed type shows
+// the ground rule cleanly. An extractor belongs only on its deposit; a plain building never does.
+const quarry = typeId('Quarry');
+cookie = '';
+await api('/api/world');
+check(
+	'a Quarry is refused on a meadow — an extractor may not squat on plain ground',
+	[(await order(14, 9, quarry)).body.reason],
+	['TILE_NOT_BUILDABLE']
+);
+cookie = '';
+await api('/api/world');
+check(
+	'a House is refused on an iron vein — a plain building may not squat on a deposit',
+	[(await order(2, 1, house)).body.reason],
+	['TILE_NOT_BUILDABLE']
+);
+cookie = '';
+await api('/api/world');
+check(
+	'a Quarry is accepted on a Stone outcrop — the deposit offers exactly its extractor',
+	(await order(14, 3, quarry)).status,
+	200
+);
 
 // Unregressed: the rules that existed before terrain did.
 cookie = '';
@@ -119,33 +151,57 @@ check(
 	true
 );
 
-// Cost. A realm starts with nothing, so the very first House is the refusal case — no setup
-// needed, and it is also the state a real new player is in. Asserted off the world payload's
-// own stock rather than through psql, same rule as the travel legs.
-//
-// The matching *success* case is deliberately absent: at the seeded rate, affording a House
-// is a couple of hours of gathering, and a check that waited that long would never be run.
-// Watching a build actually get paid for is the rate-cranked manual pass — set units_per_hour
-// high with one UPDATE, no deploy, and the economy runs in seconds. That the cost is a row is
-// what makes it testable at all.
+// The runway and the refund path. A fresh realm no longer starts empty — it arrives stocked
+// (VISION #10) so it can build before it has to gather. Stock is asserted off the payload's own
+// numbers, same rule as the travel legs.
 cookie = '';
 const fresh = await api('/api/world');
-const woodId = fresh.body.resources.find(
-	(r: { displayName: string }) => r.displayName === 'Wood'
-).id;
-const houseCost = fresh.body.buildingCosts.find(
-	(c: { buildingTypeId: number; resourceId: number }) =>
-		c.buildingTypeId === house && c.resourceId === woodId
-).quantity;
+const woodStart = woodHeld(fresh.body);
+check('a new realm arrives with a Wood runway', woodStart > 0, true);
 
-check('a new realm starts with nothing', woodHeld(fresh.body), 0);
-const refused = await order(9, 9, house);
+// Cancel a build: the operation vanishes and the FULL cost returns — never prorated, never
+// double-credited. This is the epic's refund path, and its arithmetic is the thing to pin.
+const built = await order(9, 9, house);
+const site = built.body.operations?.find((o: { type: string }) => o.type === 'build');
 check(
-	`a House costing ${houseCost} Wood is refused on 0`,
-	[refused.status, refused.body.reason],
-	[400, 'INSUFFICIENT_RESOURCES']
+	'ordering a House deducts its cost up front',
+	[built.status, woodHeld(built.body)],
+	[200, woodStart - 6]
 );
-check('a refused order spends nothing', woodHeld((await api('/api/world')).body), 0);
+
+const cancelled = await api(`/api/orders/${site.id}`, { method: 'DELETE' });
+check(
+	'cancelling refunds in full — stock returns to exactly the pre-order value',
+	[cancelled.status, woodHeld(cancelled.body)],
+	[200, woodStart]
+);
+// Delete-first, refund-on-RETURNING: a second cancel finds nothing to delete and credits nothing,
+// so a double-clicked Cancel cannot dupe the refund.
+const twice = await api(`/api/orders/${site.id}`, { method: 'DELETE' });
+check(
+	'cancelling twice is refused, not a second refund',
+	[twice.status, twice.body.reason],
+	[400, 'UNKNOWN_OPERATION']
+);
+check(
+	'stock holds exactly one refund after the double cancel',
+	woodHeld((await api('/api/world')).body),
+	woodStart
+);
+// The cancelled op left nothing behind: the tile is buildable again and a worker is free to take it.
+check('the cancelled tile is buildable again', (await order(9, 9, house)).status, 200);
+
+// The realm-wide build prerequisite: a Stone wall needs a Quarry standing *anywhere* first. With
+// none owned it is refused before terrain or cost matter — a distinct reason from the tile-local
+// MISSING_REQUIRED_BUILDING that gates gathering.
+cookie = '';
+await api('/api/world');
+const stoneWall = typeId('Stone wall');
+check(
+	'a Stone wall with no Quarry owned is refused as a missing prerequisite',
+	[(await order(9, 9, stoneWall)).body.reason],
+	['MISSING_PREREQUISITE']
+);
 
 // Gathering. The refusals matter more than the acceptance: a tile that yields nothing must be
 // turned away at the writer, or a worker stands there forever earning nothing with no feedback.

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
 	accrue,
+	eligibleTypeIds,
 	NAME_POOL,
 	pickName,
 	population,
@@ -318,4 +319,43 @@ test('a week away on a finite tile equals many visits', () => {
 		`harvest drifted by ${taken - away.harvested}`
 	);
 	assert.ok(Math.abs(q - away.quantity!) < 1e-9, `stock drifted by ${q - away.quantity!}`);
+});
+
+// eligibleTypeIds — the terrain-menu rule authored once for the server gate and the wire allow-list.
+const CATALOG = [
+	{ id: 1 }, // House
+	{ id: 2 }, // Barn
+	{ id: 3 }, // Quarry — the one extractor (Stone requires it)
+	{ id: 4 }, // Stone wall
+	{ id: 5 } // School
+];
+// Only Stone names a required building; everything else is gathered bare-handed.
+const RES = [
+	{ id: 10, requiresBuildingTypeId: null }, // Food
+	{ id: 11, requiresBuildingTypeId: null }, // Wood
+	{ id: 12, requiresBuildingTypeId: 3 }, // Stone ⇒ Quarry
+	{ id: 13, requiresBuildingTypeId: null }, // Clay — no extractor exists
+	{ id: 14, requiresBuildingTypeId: null } // Iron — no extractor exists
+];
+
+test('plain ground offers every type except an extractor', () => {
+	const meadow = { buildable: true, isDeposit: false, yieldsResourceId: 10 };
+	assert.deepEqual(eligibleTypeIds(meadow, CATALOG, RES), [1, 2, 4, 5]);
+});
+
+test('a deposit offers only the extractor that takes its yield', () => {
+	const outcrop = { buildable: true, isDeposit: true, yieldsResourceId: 12 };
+	assert.deepEqual(eligibleTypeIds(outcrop, CATALOG, RES), [3]);
+});
+
+test('a deposit with no extractor yet offers nothing', () => {
+	const clay = { buildable: true, isDeposit: true, yieldsResourceId: 13 };
+	assert.deepEqual(eligibleTypeIds(clay, CATALOG, RES), []);
+	const iron = { buildable: true, isDeposit: true, yieldsResourceId: 14 };
+	assert.deepEqual(eligibleTypeIds(iron, CATALOG, RES), []);
+});
+
+test('unbuildable ground offers nothing, subsuming the old buildable check', () => {
+	const mountain = { buildable: false, isDeposit: false, yieldsResourceId: null };
+	assert.deepEqual(eligibleTypeIds(mountain, CATALOG, RES), []);
 });

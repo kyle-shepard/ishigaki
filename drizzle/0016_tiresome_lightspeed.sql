@@ -1,0 +1,3 @@
+ALTER TABLE "building_type" ADD COLUMN "requires_building_type_id" integer;--> statement-breakpoint
+ALTER TABLE "terrain_type" ADD COLUMN "is_deposit" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "building_type" ADD CONSTRAINT "building_type_requires_building_type_id_building_type_id_fk" FOREIGN KEY ("requires_building_type_id") REFERENCES "public"."building_type"("id") ON DELETE no action ON UPDATE no action;

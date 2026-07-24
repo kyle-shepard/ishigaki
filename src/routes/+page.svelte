@@ -24,6 +24,7 @@
 		INSUFFICIENT_RESOURCES: "You don't have the materials for that.",
 		TILE_YIELDS_NOTHING: "There's nothing to take from that ground.",
 		MISSING_REQUIRED_BUILDING: 'That needs a building on the tile before anyone can work it.',
+		MISSING_PREREQUISITE: 'You need another building before you can raise that.',
 		UNKNOWN_OPERATION: 'Nobody is working there.',
 		NO_IDLE_SETTLER: 'You have no idle settler to train.',
 		MISSING_SCHOOL: 'Training needs a School on the tile.',
@@ -208,6 +209,8 @@
 	}
 
 	const recall = (id: number) => act(`/api/assignments/${id}`, { method: 'DELETE' });
+	// Cancel an in-progress build; the server deletes the operation and refunds the full cost.
+	const cancelSite = (id: number) => act(`/api/orders/${id}`, { method: 'DELETE' });
 
 	async function newGame() {
 		// Native confirm, because this destroys a realm someone spent real time on and the
@@ -317,8 +320,30 @@
 				)
 			: undefined
 	);
-	// Build is offered only where the ground allows it and nothing already stands or is rising.
-	const canBuild = $derived(!!selected && selTerrain?.buildable === true && !selBuilt && !selSite);
+	// Build is offered only where the ground allows *some* type and nothing already stands or is
+	// rising. Keys on the terrain's eligible list (per-terrain, server-authored), not the bare
+	// `buildable` flag — so a deposit still offers its extractor and Mountain offers nothing.
+	const canBuild = $derived(
+		!!selected && (selTerrain?.buildableTypeIds.length ?? 0) > 0 && !selBuilt && !selSite
+	);
+	// The building types the player owns, for greying a type whose realm-wide prerequisite isn't met.
+	const ownedTypeIds = $derived(new Set(world?.buildings.map((b) => b.buildingTypeId) ?? []));
+	// The menu for the selected tile: only types this terrain allows, each flagged if its
+	// prerequisite building isn't owned yet (greyed, "Requires a {name}").
+	const buildOptions = $derived.by(() => {
+		if (!world || !selTerrain) return [];
+		const eligible = new Set(selTerrain.buildableTypeIds);
+		return world.buildingTypes
+			.filter((bt) => eligible.has(bt.id))
+			.map((bt) => {
+				const need = bt.requiresBuildingTypeId;
+				const blocked = need !== null && !ownedTypeIds.has(need);
+				return { ...bt, blocked, needName: need !== null ? typeName(need) : null };
+			});
+	});
+	// The Build button is live only when the chosen type is actually placeable here — `chosen`
+	// persists across tiles, so a Quarry picked on an outcrop mustn't fire a doomed order on a meadow.
+	const chosenOk = $derived(buildOptions.some((o) => o.id === chosen && !o.blocked));
 	// Training is offered where a finished School stands on the selected tile.
 	const selIsSchool = $derived(!!selBuilt && typeName(selBuilt.buildingTypeId) === 'School');
 	const present = $derived(
@@ -482,6 +507,7 @@
 						<p><b>{typeName(selBuilt.buildingTypeId)}</b> stands here.</p>
 					{:else if selSite}
 						<p><b>{typeName(selSite.buildingTypeId!)}</b> under construction.</p>
+						<p><button onclick={() => cancelSite(selSite.id)}>Cancel — full refund</button></p>
 					{/if}
 
 					{#if present.length}
@@ -503,17 +529,18 @@
 					{#if canBuild}
 						<h3>Build here</h3>
 						<ul class="build-picker">
-							{#each world.buildingTypes as bt (bt.id)}
-								<li>
+							{#each buildOptions as bt (bt.id)}
+								<li class:blocked-type={bt.blocked}>
 									<label>
-										<input type="radio" bind:group={chosen} value={bt.id} />
+										<input type="radio" bind:group={chosen} value={bt.id} disabled={bt.blocked} />
 										{bt.displayName}
 										<span class="price">{priceOf(bt.id)}</span>
+										{#if bt.blocked}<span class="requires">Requires a {bt.needName}</span>{/if}
 									</label>
 								</li>
 							{/each}
 						</ul>
-						<button onclick={buildHere} disabled={chosen === null}>Build</button>
+						<button onclick={buildHere} disabled={!chosenOk}>Build</button>
 					{/if}
 
 					{#if selYields !== null}
@@ -702,6 +729,15 @@
 		display: flex;
 		align-items: center;
 		gap: 0.35rem;
+	}
+	/* A type whose prerequisite isn't owned yet — dimmed and unselectable, with the reason inline. */
+	.build-picker li.blocked-type label {
+		color: var(--muted);
+		cursor: not-allowed;
+	}
+	.requires {
+		color: var(--muted);
+		font-style: italic;
 	}
 	/* A ring on the selected tile — outline so it sits over the art without shrinking it, same
 	   trick as .site. Drawn above neighbours so the ring isn't clipped by the next cell's border. */

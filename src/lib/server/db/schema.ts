@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import type { OperationType as WireOperationType } from '$lib/features/world/world';
 import {
+	type AnyPgColumn,
 	boolean,
 	check,
 	doublePrecision,
@@ -43,7 +44,14 @@ export const buildingType = pgTable('building_type', {
 	// built buildings, so a House carries a number and everything else is 0 — build a House,
 	// room opens, people arrive. A column, not a constant, so "a dorm holds more" is a row
 	// edit (VISION #10), and so the cap is one relational SUM rather than a rule in code.
-	housingCapacity: integer('housing_capacity').notNull().default(0)
+	housingCapacity: integer('housing_capacity').notNull().default(0),
+	// A realm-wide build prerequisite: this type can't be placed until the player owns one of
+	// the referenced type *anywhere* (a Stone wall needs a Quarry standing). Distinct from the
+	// tile-local gate on resource.requiresBuildingTypeId (a Quarry on *this* outcrop before
+	// Stone) — different scope, so its own column. Nullable self-FK; null means no prerequisite.
+	requiresBuildingTypeId: integer('requires_building_type_id').references(
+		(): AnyPgColumn => buildingType.id
+	)
 });
 
 // A row exists only once built — presence *is* built, so there is no status column.
@@ -263,6 +271,11 @@ export const terrainType = pgTable('terrain_type', {
 	// Same deal as building_type.icon — the row picks the symbol, Sprites.svelte draws it.
 	icon: text('icon').notNull(),
 	buildable: boolean('buildable').notNull(),
+	// A deposit is ground you extract from with a dedicated structure (a Quarry on an outcrop),
+	// not ground you build freely on. It filters the build menu: a deposit offers only its
+	// extractor, plain ground offers everything but extractors. Separate from `buildable` because
+	// a deposit *is* buildable (its extractor goes on it) — it just doesn't take a House.
+	isDeposit: boolean('is_deposit').notNull().default(false),
 	movementCost: real('movement_cost').notNull(),
 	yieldsResourceId: integer('yields_resource_id').references(() => resource.id),
 	// How long an emptied deposit takes to come back to full. Null means it never empties —

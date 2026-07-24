@@ -20,6 +20,7 @@ import {
 } from '$lib/server/db/schema';
 import {
 	accrue,
+	eligibleTypeIds,
 	GRID_SIZE,
 	pickName,
 	population,
@@ -551,14 +552,24 @@ export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reaso
  * buildability and the cost of every tile the trip crosses — a point query plus a path query
  * would be two reads over the same rows.
  */
-async function loadGrid(
-	tx: Tx
-): Promise<Map<number, { buildable: boolean; movementCost: number }>> {
+async function loadGrid(tx: Tx): Promise<
+	Map<
+		number,
+		{
+			buildable: boolean;
+			isDeposit: boolean;
+			yieldsResourceId: number | null;
+			movementCost: number;
+		}
+	>
+> {
 	const rows = await tx
 		.select({
 			x: tile.x,
 			y: tile.y,
 			buildable: terrainType.buildable,
+			isDeposit: terrainType.isDeposit,
+			yieldsResourceId: terrainType.yieldsResourceId,
 			movementCost: terrainType.movementCost
 		})
 		.from(tile)
@@ -566,7 +577,12 @@ async function loadGrid(
 	return new Map(
 		rows.map((r) => [
 			r.y * GRID_SIZE + r.x,
-			{ buildable: r.buildable, movementCost: r.movementCost }
+			{
+				buildable: r.buildable,
+				isDeposit: r.isDeposit,
+				yieldsResourceId: r.yieldsResourceId,
+				movementCost: r.movementCost
+			}
 		])
 	);
 }
@@ -594,6 +610,23 @@ export async function createBuildOrder(
 		const [type] = await tx.select().from(buildingType).where(eq(buildingType.id, buildingTypeId));
 		if (!type) return { ok: false, reason: 'UNKNOWN_BUILDING_TYPE' };
 
+		// Realm-wide prerequisite: a type that names another must have one of that other standing
+		// *anywhere* the player owns before it can be placed at all (a Stone wall needs a Quarry).
+		// Checked before terrain — "you can't build this yet" outranks "not on this ground".
+		if (type.requiresBuildingTypeId !== null) {
+			const [owned] = await tx
+				.select({ id: building.id })
+				.from(building)
+				.where(
+					and(
+						eq(building.playerId, playerId),
+						eq(building.buildingTypeId, type.requiresBuildingTypeId)
+					)
+				)
+				.limit(1);
+			if (!owned) return { ok: false, reason: 'MISSING_PREREQUISITE' };
+		}
+
 		// Ground before what sits on it: bounds and building type ask "is this request
 		// coherent", terrain asks "is this place legal", occupancy asks "is this place free".
 		const grid = await loadGrid(tx);
@@ -605,7 +638,18 @@ export async function createBuildOrder(
 			if (!g) throw new Error(`no tile row at (${gx}, ${gy}) — run \`npm run seed\``);
 			return g;
 		};
-		if (!groundAt(x, y).buildable) return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
+		// The terrain-eligibility rule, authored once in `eligibleTypeIds` and shared with the wire
+		// allow-list below. Its empty-set result subsumes the old bare `buildable` check: a House
+		// can't squat on an iron vein, a Quarry can't sit on a meadow, and unbuildable ground offers
+		// nothing at all. ponytail: reuses TILE_NOT_BUILDABLE rather than a dedicated
+		// TILE_WRONG_TERRAIN — a rarely-hit backstop behind the client's greyed menu; the sentence
+		// is slightly generous on a deposit but defensible. Upgrade the day it goes user-facing.
+		const catalogTypes = await tx.select({ id: buildingType.id }).from(buildingType);
+		const catalogResources = await tx
+			.select({ id: resource.id, requiresBuildingTypeId: resource.requiresBuildingTypeId })
+			.from(resource);
+		if (!eligibleTypeIds(groundAt(x, y), catalogTypes, catalogResources).includes(buildingTypeId))
+			return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
 
 		// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
 		// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
@@ -910,6 +954,59 @@ export async function recallWorker(playerId: number, operationId: number): Promi
 	});
 }
 
+/**
+ * Cancels an in-progress build and refunds its full cost. Unlike `recallWorker` — which marks a
+ * gather completed so the worker is paid out and left standing — a cancelled build must **delete**
+ * the operation row: a lingering in-progress build op becomes a building on the next `resolveWorld`
+ * read. Deleting frees the worker and the tile automatically, since both occupancy checks key on
+ * the in-progress op.
+ *
+ * The refund is the placement deduction (`createBuildOrder`) run with `+` instead of `-`, always in
+ * full — payment was taken in full at order and never prorated, so the return is too.
+ *
+ * **Delete-first, refund-only-on-RETURNING.** A double-clicked Cancel sends two DELETEs; a
+ * select-then-refund-then-delete order would let both refund one build (a trivially-triggered
+ * resource dupe). So the `DELETE … RETURNING` is the single point that picks a winner: exactly one
+ * racer gets the row back and refunds, the loser gets nothing and returns `UNKNOWN_OPERATION`.
+ * (`recallWorker`'s status-flip is idempotent enough to skip this; a refund is not.)
+ */
+export async function cancelBuild(playerId: number, operationId: number): Promise<OrderResult> {
+	return db.transaction(async (tx): Promise<OrderResult> => {
+		// resolveWorld may complete this very build first (turning it into a building); it is then no
+		// longer in-progress and the delete below matches nothing — correctly refusing to refund a
+		// build that already finished while the player was deciding.
+		await resolveWorld(tx, playerId);
+
+		const [cancelled] = await tx
+			.delete(operation)
+			.where(
+				and(
+					eq(operation.id, operationId),
+					eq(operation.playerId, playerId),
+					eq(operation.status, 'in-progress'),
+					eq(operation.type, 'build')
+				)
+			)
+			.returning({ buildingTypeId: operation.buildingTypeId });
+		if (!cancelled) return { ok: false, reason: 'UNKNOWN_OPERATION' };
+
+		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
+		if (!home) throw new Error(`player ${playerId} has no settlement`);
+		const costs = await tx
+			.select()
+			.from(buildingCost)
+			.where(eq(buildingCost.buildingTypeId, cancelled.buildingTypeId!));
+		for (const c of costs) {
+			await tx
+				.update(stock)
+				.set({ quantity: sql`${stock.quantity} + ${c.quantity}` })
+				.where(and(eq(stock.settlementId, home.id), eq(stock.resourceId, c.resourceId)));
+		}
+
+		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
 /** The world as stored, plus the DB's own `now` — the only clock anything trusts. */
 export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload> {
 	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
@@ -996,7 +1093,10 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			color: t.color,
 			icon: t.icon,
 			buildable: t.buildable,
-			yieldsResourceId: t.yieldsResourceId
+			yieldsResourceId: t.yieldsResourceId,
+			// The same rule the server gate runs, shipped per terrain so the menu offers only what
+			// the writer would accept — a menu that lists what the server refuses is the bug this epic exists to kill.
+			buildableTypeIds: eligibleTypeIds(t, types, resources)
 		})),
 		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName })),
 		professions: professions.map((p) => ({ id: p.id, displayName: p.displayName })),
@@ -1011,7 +1111,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			id: t.id,
 			displayName: t.displayName,
 			icon: t.icon,
-			buildSeconds: t.buildSeconds
+			buildSeconds: t.buildSeconds,
+			requiresBuildingTypeId: t.requiresBuildingTypeId
 		})),
 		buildings: buildings.map((b) => ({
 			id: b.id,

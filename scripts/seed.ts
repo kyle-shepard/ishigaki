@@ -291,6 +291,18 @@ for (const [r, b] of Object.entries(REQUIRES)) {
 		.where(eq(resource.displayName, r));
 }
 
+// Realm-wide build prerequisites: a type here can't be placed until the player owns one of the
+// named type anywhere. A Stone wall needs a Quarry standing first — the first build gated on
+// owning *another* building, not just on affording it. Not cleared on re-run (mirrors REQUIRES
+// above); the one prereq is stable content.
+const BUILDING_REQUIRES: Record<string, string> = { 'Stone wall': 'Quarry' };
+for (const [b, req] of Object.entries(BUILDING_REQUIRES)) {
+	await db
+		.update(buildingType)
+		.set({ requiresBuildingTypeId: bt[req] })
+		.where(eq(buildingType.displayName, b));
+}
+
 // A world starts with nothing, so every building has to be reachable *eventually* — not
 // necessarily at once. Walk the ladder: whatever can be gathered bare-handed is reachable,
 // anything payable from reachable resources is buildable, and any resource whose required
@@ -298,6 +310,14 @@ for (const [r, b] of Object.entries(REQUIRES)) {
 // never be built by anyone, which is a world that quietly cannot be won.
 //
 // Cheap to check, silent to break, and a future cost edit is exactly how it would break.
+//
+// ponytail: this walks *affordability* only — two blind spots this epic opened, both currently
+// satisfied so neither is modelled. (1) It ignores build prerequisites (Stone wall → Quarry): the
+// one we add is satisfiable, so the ladder stays open, but a future unsatisfiable prereq would slip
+// past. (2) A Quarry is now placeable *only* on a Stone outcrop, yet nothing here checks the map
+// actually contains one (nor a placeable tile for every extractor) — delete every outcrop and Stone
+// silently strands while this passes. Guarded by the Slice 1/2 manual checks today; teach it to
+// walk prereq chains and require a placeable tile per extractor the day a map/seed edit could seal either.
 const takeable = resources.filter((r) => r.unitsPerHour > 0).map((r) => r.displayName);
 const reachable = new Set(takeable.filter((r) => !REQUIRES[r]));
 const buildable = new Set<string>();
@@ -360,6 +380,9 @@ const TERRAIN = [
 		color: '#d08b4f',
 		icon: 'clay',
 		buildable: true,
+		// A deposit: extracted with a dedicated structure, not built on freely. Its extractor (a
+		// future Kiln) doesn't exist yet, so a clay pit currently offers nothing to build.
+		isDeposit: true,
 		movementCost: 1.5,
 		yields: 'Clay'
 	},
@@ -369,6 +392,9 @@ const TERRAIN = [
 		color: '#b0b3b8',
 		icon: 'stone',
 		buildable: true,
+		// A deposit whose extractor is the Quarry (Stone.requiresBuildingTypeId), so an outcrop's
+		// build menu offers a Quarry and nothing else.
+		isDeposit: true,
 		movementCost: 2.5,
 		yields: 'Stone'
 	},
@@ -378,6 +404,8 @@ const TERRAIN = [
 		color: '#7a3b2e',
 		icon: 'iron',
 		buildable: true,
+		// A deposit; its extractor (a future Mine) doesn't exist yet, so nothing is buildable here.
+		isDeposit: true,
 		movementCost: 2.5,
 		yields: 'Iron ore'
 	},
@@ -407,6 +435,7 @@ const terrainRows = await db
 			color: t.color,
 			icon: t.icon,
 			buildable: t.buildable,
+			isDeposit: t.isDeposit ?? false,
 			movementCost: t.movementCost,
 			yieldsResourceId: t.yields ? res[t.yields] : null,
 			regrowSeconds: t.regrowSeconds ?? null
@@ -418,6 +447,7 @@ const terrainRows = await db
 			color: sql`excluded.color`,
 			icon: sql`excluded.icon`,
 			buildable: sql`excluded.buildable`,
+			isDeposit: sql`excluded.is_deposit`,
 			movementCost: sql`excluded.movement_cost`,
 			yieldsResourceId: sql`excluded.yields_resource_id`,
 			regrowSeconds: sql`excluded.regrow_seconds`
