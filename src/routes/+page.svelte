@@ -660,7 +660,9 @@
 		pointer-events: none;
 	}
 	/* Overlays are absolutely positioned and moved with transform: animating left/top would
-	   relayout all 256 cells every frame. */
+	   relayout all 256 cells every frame. z-index keeps them above a *selected* tile — which
+	   lifts itself to z-index 1 for its ring — so clicking a building doesn't bury it under the
+	   raised grass tile. */
 	.over {
 		position: absolute;
 		top: 0;
@@ -668,6 +670,7 @@
 		width: var(--cell);
 		height: var(--cell);
 		pointer-events: none;
+		z-index: 2;
 	}
 	/* A body on the map. Filled dark with a light rim so it reads on any terrain colour. */
 	.dot {
