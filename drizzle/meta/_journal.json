@@ -148,6 +148,13 @@
       "when": 1784913449183,
       "tag": "0020_chief_kid_colt",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1784942369329,
+      "tag": "0021_tidy_banshee",
+      "breakpoints": true
     }
   ]
 }

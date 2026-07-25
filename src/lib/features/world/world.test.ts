@@ -7,6 +7,7 @@ import {
 	crewRate,
 	eligibleTypeIds,
 	NAME_POOL,
+	netRates,
 	pickName,
 	population,
 	positionAt,
@@ -509,4 +510,44 @@ test('every band boundary belongs to the band above it', () => {
 		assert.equal(qualityBand(edge - 1e-9), below);
 		assert.notEqual(qualityBand(edge), below);
 	}
+});
+
+const NOW = Date.parse('2026-01-01T12:00:00.000Z');
+const gather = (resourceId: number, unitsPerHour: number, arrivals: number[]) => ({
+	resourceId,
+	unitsPerHour,
+	qualityMultiplier: 1,
+	arrivals
+});
+
+test('the resource bar credits arrived workers and nobody else', () => {
+	// Two on the same forest: one standing in it, one still walking. Only the first earns.
+	const rates = netRates([gather(2, 3, [NOW - 60_000, NOW + 60_000])], NOW, null);
+	assert.equal(rates.get(2), 3);
+});
+
+test('rates stack per resource and scale with workmanship', () => {
+	const rates = netRates(
+		[
+			{ ...gather(2, 3, [NOW]), qualityMultiplier: 0.15 },
+			{ ...gather(2, 3, [NOW]), qualityMultiplier: 0.7 },
+			gather(1, 12, [NOW])
+		],
+		NOW,
+		null
+	);
+	assert.equal(rates.get(2), 3 * 0.15 + 3 * 0.7);
+	assert.equal(rates.get(1), 12);
+});
+
+test('food nets forage against mouths, and reads negative when it cannot keep up', () => {
+	const mouths = { resourceId: 1, perCapitaHour: 0.4, population: 6 };
+	// A settler forager (0.15 of 12/hr = 1.8) against six mouths (2.4) — the hamlet is losing.
+	const losing = netRates([{ ...gather(1, 12, [NOW]), qualityMultiplier: 0.15 }], NOW, mouths);
+	assert.ok(losing.get(1)! < 0, 'a settler cannot feed six');
+	// A trained Forager covers them with room to spare.
+	const winning = netRates([{ ...gather(1, 12, [NOW]), qualityMultiplier: 0.7 }], NOW, mouths);
+	assert.ok(winning.get(1)! > 0, 'a Forager can');
+	// Nobody working at all is the drain alone — the number a fresh realm shows.
+	assert.ok(Math.abs(netRates([], NOW, mouths).get(1)! + 2.4) < 1e-9);
 });

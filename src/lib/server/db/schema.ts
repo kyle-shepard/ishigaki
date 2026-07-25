@@ -148,6 +148,12 @@ export const resource = pgTable('resource', {
 	id: serial('id').primaryKey(),
 	/** Natural key — see building_type.display_name. */
 	displayName: text('display_name').notNull().unique(),
+	// Names a symbol in Sprites.svelte, same contract as building_type.icon — and the reason the
+	// resource bar can be icons rather than words. Keyed on this rather than on display_name
+	// because that column is the reskin one (VISION #10): the day 'Food' becomes 'koku' the icons
+	// must not all go blank. Defaulted to empty so the column could be added to a live table;
+	// an unknown key draws nothing, which is a missing icon rather than a broken bar.
+	icon: text('icon').notNull().default(''),
 	// How fast one worker takes it, flat — skill-derived rates need skills, and a character
 	// carries only `speed` today. The seam is clean either way: the rate is a number.
 	// Zero means "seeded on the map but not yet wired"; assignment refuses those outright

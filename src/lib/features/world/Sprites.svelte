@@ -1,9 +1,10 @@
 <!--
 	Every piece of map art, once, as SVG <symbol>s. Rendered once per page; tiles and overlays
-	reference them with <use href="#i-name"/>, so 256 tiles cost 256 references and one copy of
-	each shape rather than 256 copies of the paths.
+	reference them with <use href="#i-name"/>, so 2304 tiles cost 2304 references and one copy of
+	each shape rather than 2304 copies of the paths. That ratio is the whole reason the map could
+	grow from 16×16 to 48×48 without the art becoming the page's weight.
 
-	Naming: `i-<key>` where <key> is the `icon` column on terrain_type / building_type. `p-*` are
+	Naming: `i-<key>` where <key> is the `icon` column on terrain_type / building_type / resource. `p-*` are
 	private primitives composed by the symbols above them — a rock is drawn once and reused for
 	both stone and iron.
 
@@ -132,6 +133,50 @@
 			</g>
 			<rect x="14" y="20" width="4" height="8" fill="#5b3a22" />
 			<rect x="5" y="27" width="22" height="1.6" fill="#00000022" />
+		</symbol>
+
+		<!-- The resource bar's icons, keyed `res-*` off resource.icon. Unlike the terrain and building
+		     symbols these are drawn on the header band rather than on a tile colour, at about half
+		     the size, so they are chunkier and fewer-marked: five shapes have to stay apart from each
+		     other at 18px. Stone and Iron ore reuse the terrain rock deliberately — the thing you
+		     hold should look like the ground it came out of. -->
+		<symbol id="i-res-food" viewBox="0 0 32 32">
+			<path d="M16 30V13" stroke="#7a5a22" stroke-width="2.6" fill="none" />
+			<g fill="#e0a83c">
+				<ellipse cx="16" cy="6" rx="3" ry="4.6" />
+				<ellipse cx="10.5" cy="11" rx="3" ry="4.6" transform="rotate(-30 10.5 11)" />
+				<ellipse cx="21.5" cy="11" rx="3" ry="4.6" transform="rotate(30 21.5 11)" />
+				<ellipse cx="11" cy="18" rx="3" ry="4.6" transform="rotate(-30 11 18)" />
+				<ellipse cx="21" cy="18" rx="3" ry="4.6" transform="rotate(30 21 18)" />
+			</g>
+		</symbol>
+
+		<!-- Two logs, the top one end-on so the rings say "cut timber" rather than "brown pill". -->
+		<symbol id="i-res-wood" viewBox="0 0 32 32">
+			<rect x="4" y="10" width="24" height="10" rx="5" fill="#8a5a33" />
+			<ellipse cx="26.5" cy="15" rx="3.6" ry="5" fill="#c08a52" />
+			<ellipse cx="26.5" cy="15" rx="1.5" ry="2.1" fill="#8a5a33" />
+			<rect x="7" y="21" width="18" height="8" rx="4" fill="#6f4726" />
+		</symbol>
+
+		<symbol id="i-res-stone" viewBox="0 0 32 32">
+			<use href="#p-rock" fill="#9aa0a6" transform="translate(16,26) scale(1.7)" />
+		</symbol>
+
+		<!-- A jar, not a pit: what you hold is worked clay. -->
+		<symbol id="i-res-clay" viewBox="0 0 32 32">
+			<rect x="12" y="4" width="8" height="4.5" fill="#a35f22" />
+			<circle cx="16" cy="19" r="9.5" fill="#c0762f" />
+			<path d="M8.5 15q7.5 4.5 15 0" stroke="#a35f22" stroke-width="2.2" fill="none" />
+		</symbol>
+
+		<symbol id="i-res-iron" viewBox="0 0 32 32">
+			<use href="#p-rock" fill="#a5644e" transform="translate(16,26) scale(1.7)" />
+			<g fill="#33201a">
+				<circle cx="12" cy="18" r="2" />
+				<circle cx="18.5" cy="21" r="1.6" />
+				<circle cx="20" cy="15.5" r="1.8" />
+			</g>
 		</symbol>
 
 		<!-- A character. Pale outline so it stays legible crossing water, forest, or mountain. -->

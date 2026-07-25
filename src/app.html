@@ -8,12 +8,19 @@
 			/* Theme tokens, global so component-scoped styles can read them via var(). Light is a
 			   warm off-white, not the browser's blinding default white. */
 			:root {
+				/* The fixed header's height. A token because three separate fixed boxes measure
+				   themselves against it — the header, the map beneath it, and the inspector. */
+				--header-h: 46px;
 				--bg: #ebe6db;
 				--text: #2b2420;
 				--muted: #6b6257;
 				--header-bg: #d7cdb8;
 				--panel-bg: #f5f1e9;
 				--border: rgba(0, 0, 0, 0.15);
+				/* Income and drain in the resource bar. Tokens rather than literals because the
+				   light pair is too dark to read on the dark header, and vice versa. */
+				--gain: #15803d;
+				--loss: #b91c1c;
 			}
 			:root[data-theme='dark'] {
 				--bg: #1c1a17;
@@ -22,6 +29,8 @@
 				--header-bg: #2a2622;
 				--panel-bg: #26231f;
 				--border: rgba(255, 255, 255, 0.13);
+				--gain: #6ee7a0;
+				--loss: #f6857c;
 			}
 			html,
 			body {

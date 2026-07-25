@@ -9,6 +9,15 @@
 // Deliberately not wired into `npm test`, which must stay runnable with no server.
 const BASE = process.env.RULES_CHECK_URL ?? 'http://localhost:5173';
 
+// Every coordinate below is written against the map's **hand-authored core** — the lake, the stone
+// outcrop, the hamlet's own tile — because that is where those features are authored and that frame
+// is stable (scripts/seed.ts, LAYOUT in worldgen.ts). The core sits in the middle of a generated
+// 48×48 world, so it has to be shifted into the coordinates the API speaks. Imported rather than
+// written out: when the map grew, forty hardcoded coordinates here quietly started naming generated
+// ground, and half these checks passed against tiles that were no longer what they claimed.
+import { LAYOUT_OFFSET } from '../src/lib/features/world/worldgen.ts';
+const core = (x: number, y: number) => [x + LAYOUT_OFFSET, y + LAYOUT_OFFSET] as const;
+
 // Every request carries the same cookie, so all cases play in one player's sandbox — the
 // occupancy checks are player-scoped and would read a different world otherwise.
 let cookie = '';
@@ -23,8 +32,14 @@ async function api(path: string, init?: RequestInit) {
 	return { status: res.status, body: await res.json() };
 }
 
-const order = (x: number, y: number, buildingTypeId: number, crewSize?: number) =>
-	api('/api/orders', { method: 'POST', body: JSON.stringify({ x, y, buildingTypeId, crewSize }) });
+// x, y are core coordinates (see `core` above); the wire gets world ones.
+const order = (cx: number, cy: number, buildingTypeId: number, crewSize?: number) => {
+	const [x, y] = core(cx, cy);
+	return api('/api/orders', {
+		method: 'POST',
+		body: JSON.stringify({ x, y, buildingTypeId, crewSize })
+	});
+};
 
 let failures = 0;
 function check(name: string, actual: unknown, expected: unknown) {
@@ -62,8 +77,10 @@ const free = world.body.buildingTypes.find((t: { id: number }) => !costed.has(t.
 if (free === undefined)
 	throw new Error('every building type costs something — no free type to test terrain with');
 
-const assign = (x: number, y: number) =>
-	api('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
+const assign = (cx: number, cy: number) => {
+	const [x, y] = core(cx, cy);
+	return api('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
+};
 
 // Terrain rules. `free` is the uncosted type (Barn), so these isolate the ground rule from cost.
 // Unbuildable ground and every *deposit* refuse a plain building: a deposit offers only its own
@@ -247,7 +264,10 @@ check(
 // manual pass — at 3 Wood an hour it takes eight hours, which is the mechanic working.
 cookie = '';
 const map = await api('/api/world');
-const at = (x: number, y: number) => y * map.body.gridSize + x;
+const at = (cx: number, cy: number) => {
+	const [x, y] = core(cx, cy);
+	return y * map.body.gridSize + x;
+};
 check(
 	'an untouched forest tile reports full',
 	[map.body.tileQuantity[at(11, 1)], map.body.tileCapacity[at(11, 1)]],
@@ -313,11 +333,13 @@ check(
 // Preview = outcome. This is a stated failure condition of the epic — "the numbers shown before
 // you commit aren't the ones you get" — and it can only be closed by asserting the quote against
 // the thing actually written. Both go through `planBuild`, so this is what proves that.
-const estimateOf = (x: number, y: number, buildingTypeId: number, crewSize: number) =>
-	api('/api/orders/estimate', {
+const estimateOf = (cx: number, cy: number, buildingTypeId: number, crewSize: number) => {
+	const [x, y] = core(cx, cy);
+	return api('/api/orders/estimate', {
 		method: 'POST',
 		body: JSON.stringify({ x, y, buildingTypeId, crewSize })
 	});
+};
 
 for (const size of [1, 3]) {
 	cookie = '';
@@ -369,7 +391,8 @@ let finished: { quality: number } | undefined;
 while (Date.now() < dueAt + 15_000) {
 	await new Promise((r) => setTimeout(r, 3000));
 	const w = await api('/api/world');
-	finished = w.body.buildings.find((b: { x: number; y: number }) => b.x === 14 && b.y === 9);
+	const [bx, by] = core(14, 9);
+	finished = w.body.buildings.find((b: { x: number; y: number }) => b.x === bx && b.y === by);
 	if (finished) break;
 }
 check(
@@ -378,8 +401,9 @@ check(
 	true
 );
 // The starting hamlet predates the column, so it is the honest null case: no band, no crash.
+const [hx, hy] = core(7, 8);
 const hamlet = (await api('/api/world')).body.buildings.find(
-	(b: { x: number; y: number }) => b.x === 7 && b.y === 8
+	(b: { x: number; y: number }) => b.x === hx && b.y === hy
 );
 check(
 	'a building raised before quality was recorded reports null, not a number',
@@ -390,11 +414,13 @@ check(
 // Restrict-by-specialty. The filter is the entry point to the whole worker-selection UX, and its
 // two ends are what matter: naming a trade the realm has none of turns the order away, and naming
 // one it has narrows the crew to exactly those bodies.
-const restricted = (x: number, y: number, ids: number[] | null, crewSize = 3) =>
-	api('/api/orders', {
+const restricted = (cx: number, cy: number, ids: number[] | null, crewSize = 3) => {
+	const [x, y] = core(cx, cy);
+	return api('/api/orders', {
 		method: 'POST',
 		body: JSON.stringify({ x, y, buildingTypeId: free, crewSize, allowedProfessionIds: ids })
 	});
+};
 const professionId = (name: string) => {
 	const p = world.body.professions.find((q: { displayName: string }) => q.displayName === name);
 	if (!p) throw new Error(`no '${name}' profession — seed the database`);

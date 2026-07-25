@@ -16,6 +16,8 @@ import {
 	terrainType,
 	tile
 } from '../src/lib/server/db/schema.ts';
+import { GRID_SIZE, START } from '../src/lib/features/world/world.ts';
+import { terrainCharAt } from '../src/lib/features/world/worldgen.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);
@@ -211,21 +213,37 @@ const resources = await db
 		// Slice 4). Tune freely — this is a seed edit, not schema.
 		{
 			displayName: 'Food',
+			// `icon` names a symbol in Sprites.svelte — what the resource bar draws instead of the word.
+			icon: 'res-food',
 			unitsPerHour: 12,
 			startingStock: 50,
 			isSustenance: true,
 			skillId: sk[RESOURCE_SKILL.Food]
 		},
-		{ displayName: 'Wood', unitsPerHour: 3, startingStock: 100, skillId: sk[RESOURCE_SKILL.Wood] },
+		{
+			displayName: 'Wood',
+			icon: 'res-wood',
+			unitsPerHour: 3,
+			startingStock: 100,
+			skillId: sk[RESOURCE_SKILL.Wood]
+		},
 		{
 			displayName: 'Stone',
+			icon: 'res-stone',
 			unitsPerHour: 2,
 			startingStock: 100,
 			skillId: sk[RESOURCE_SKILL.Stone]
 		},
-		{ displayName: 'Clay', unitsPerHour: 0, startingStock: 50, skillId: sk[RESOURCE_SKILL.Clay] },
+		{
+			displayName: 'Clay',
+			icon: 'res-clay',
+			unitsPerHour: 0,
+			startingStock: 50,
+			skillId: sk[RESOURCE_SKILL.Clay]
+		},
 		{
 			displayName: 'Iron ore',
+			icon: 'res-iron',
 			unitsPerHour: 0,
 			startingStock: 50,
 			skillId: sk[RESOURCE_SKILL['Iron ore']]
@@ -234,6 +252,7 @@ const resources = await db
 	.onConflictDoUpdate({
 		target: resource.displayName,
 		set: {
+			icon: sql`excluded.icon`,
 			unitsPerHour: sql`excluded.units_per_hour`,
 			startingStock: sql`excluded.starting_stock`,
 			isSustenance: sql`excluded.is_sustenance`,
@@ -322,13 +341,10 @@ for (const [b, req] of Object.entries(BUILDING_REQUIRES)) {
 //
 // Cheap to check, silent to break, and a future cost edit is exactly how it would break.
 //
-// ponytail: this walks *affordability* only — two blind spots this epic opened, both currently
-// satisfied so neither is modelled. (1) It ignores build prerequisites (Stone wall → Quarry): the
-// one we add is satisfiable, so the ladder stays open, but a future unsatisfiable prereq would slip
-// past. (2) A Quarry is now placeable *only* on a Stone outcrop, yet nothing here checks the map
-// actually contains one (nor a placeable tile for every extractor) — delete every outcrop and Stone
-// silently strands while this passes. Guarded by the Slice 1/2 manual checks today; teach it to
-// walk prereq chains and require a placeable tile per extractor the day a map/seed edit could seal either.
+// ponytail: this walks *affordability* only. It ignores build prerequisites (Stone wall → Quarry):
+// the one we add is satisfiable, so the ladder stays open, but a future unsatisfiable prereq would
+// slip past — teach it to walk prereq chains the day one could. The other blind spot, "the map
+// contains no tile to put the extractor on", is checked separately once the tiles exist below.
 const takeable = resources.filter((r) => r.unitsPerHour > 0).map((r) => r.displayName);
 const reachable = new Set(takeable.filter((r) => !REQUIRES[r]));
 const buildable = new Set<string>();
@@ -467,61 +483,56 @@ const terrainRows = await db
 	.returning();
 const byChar = new Map(TERRAIN.map((t, i) => [t.char, terrainRows[i]]));
 
-// Hand-authored, one char per terrain — diffable in a PR and editable in place. A 16-line
-// string block is easy enough to iterate on that a generator would be inventing a problem;
-// real world generation belongs to the world-gen epic, at a size where this actually fails.
-//
-// Load-bearing: from the character's start tile (7,9) this gives two equal-distance (7 tile)
-// orders to buildable destinations — (14,9) across open meadow, and (7,2) through five tiles
-// of lake. That pair is what demonstrates terrain slowing travel. Editing the lake or the
-// row-9 corridor invalidates it.
-const LAYOUT = [
-	'mmmmmm....fff..m',
-	'mmimm....ffff..m',
-	'mmmm.....fff....',
-	'.mm..www...f..s.',
-	'....wwwww.......',
-	'...wwwwwww..c...',
-	'...wwwwww.......',
-	'....wwww........',
-	'................',
-	'................',
-	'..ff............',
-	'.ffff..........s',
-	'.fffff..........',
-	'..fff..........m',
-	'c..f........mmm.',
-	'..........immmmm'
-];
-
-// A typo must fail the seed, not quietly produce a 255-tile world.
-if (LAYOUT.length !== 16) throw new Error(`LAYOUT has ${LAYOUT.length} rows, expected 16`);
-const tiles = LAYOUT.flatMap((row, y) => {
-	if (row.length !== 16) throw new Error(`LAYOUT row ${y} is ${row.length} chars, expected 16`);
-	return [...row].map((char, x) => {
-		const t = byChar.get(char);
-		if (!t) throw new Error(`LAYOUT (${x}, ${y}): unknown terrain char '${char}'`);
-		const spec = TERRAIN.find((s) => s.char === char)!;
-		// The invariant is "finite ⇔ regrow_seconds is set ⇔ quantity is set". A cross-table
-		// CHECK can't express it without denormalizing, and this is the only writer, so it is
-		// held here by construction — a terrain with one and not the other cannot be written.
-		if ((spec.capacity === undefined) !== (spec.regrowSeconds === undefined))
-			throw new Error(`${spec.displayName}: capacity and regrowSeconds must be set together`);
-		return { x, y, terrainTypeId: t.id, quantity: spec.capacity ?? null };
-	});
+// The map itself — one char per tile, from worldgen.ts: hand-authored in the middle, generated
+// around it. This script's job is turning those chars into rows, and refusing anything it can't.
+const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => {
+	const x = i % GRID_SIZE;
+	const y = Math.floor(i / GRID_SIZE);
+	const char = terrainCharAt(x, y);
+	const t = byChar.get(char);
+	if (!t) throw new Error(`(${x}, ${y}): unknown terrain char '${char}'`);
+	const spec = TERRAIN.find((s) => s.char === char)!;
+	// The invariant is "finite ⇔ regrow_seconds is set ⇔ quantity is set". A cross-table
+	// CHECK can't express it without denormalizing, and this is the only writer, so it is
+	// held here by construction — a terrain with one and not the other cannot be written.
+	if ((spec.capacity === undefined) !== (spec.regrowSeconds === undefined))
+		throw new Error(`${spec.displayName}: capacity and regrowSeconds must be set together`);
+	return { x, y, terrainTypeId: t.id, quantity: spec.capacity ?? null };
 });
 
-// Every new player's hamlet and character land on these tiles (START in world.server.ts), so
-// the layout is authored around them. A one-character typo could put someone in a lake.
+// Every new player's hamlet and characters land on these tiles, so the authored core is drawn
+// around them. This is the one check that ties the two together: a moved LAYOUT_OFFSET, a
+// one-character typo, or a START edit that walks off the authored block all land here rather
+// than putting somebody in a lake. It reads the real terrain row, so it also catches '.' being
+// retuned to something that isn't Meadow.
 const meadowAt = (x: number, y: number) => {
-	const name = terrainRows.find((t) => t.id === tiles[y * 16 + x].terrainTypeId)!.displayName;
+	const at = tiles[y * GRID_SIZE + x];
+	const name = terrainRows.find((t) => t.id === at.terrainTypeId)!.displayName;
 	if (name !== 'Meadow') throw new Error(`start tile (${x}, ${y}) is ${name}, must be Meadow`);
-	return name;
 };
-meadowAt(7, 8);
-meadowAt(6, 8);
-meadowAt(8, 8);
-meadowAt(7, 9);
+meadowAt(START.hamletX, START.hamletY);
+meadowAt(START.house2X, START.house2Y);
+meadowAt(START.barnX, START.barnY);
+meadowAt(START.characterX, START.characterY);
+// The three starting characters stand shoulder to shoulder from characterX - 1 (see
+// STARTING_CHARACTERS in world.server.ts), so their tiles have to be open ground too.
+meadowAt(START.characterX - 1, START.characterY);
+meadowAt(START.characterX + 1, START.characterY);
+
+// An extracted resource needs somewhere to extract it from: a Quarry is placeable *only* on a
+// Stone outcrop, so a map with no outcrop strands Stone and seals the ladder the winnability
+// check above believes it proved open. That was a blind spot worth writing down while the map was
+// hand-authored; now that most of it is generated, a threshold edit in worldgen.ts could close
+// the last outcrop without anyone touching a layout, so it is checked rather than noted.
+// Keyed on REQUIRES rather than on the `resources` rows: those were read back before the
+// requires_building_type_id UPDATE below ran, so on a fresh database they all still say null.
+const yieldingTerrain = new Set(
+	tiles.map((t) => terrainRows.find((r) => r.id === t.terrainTypeId)!.yieldsResourceId)
+);
+for (const name of Object.keys(REQUIRES)) {
+	if (yieldingTerrain.has(res[name])) continue;
+	throw new Error(`no tile on the map yields ${name}, which is extracted — the ladder is sealed`);
+}
 
 // Upserted, never truncated: `tile_stock` has a foreign key into this table, so deleting and
 // reinserting the grid would take every player's harvested-forest record with it.

@@ -24,31 +24,20 @@ import {
 	crewBuild,
 	eligibleTypeIds,
 	GRID_SIZE,
+	netRates,
 	pickName,
 	population,
 	rollStats,
 	skillValue,
+	START,
 	travelSeconds,
 	type EstimateResponse,
 	type OrderReason,
 	type WorldPayload
 } from './world';
 
-// Where a new sandbox starts. Every player gets the same coordinates because they never
-// see each other (VISION #4 interim override) — the hamlet, the barn beside it, and a builder.
-const START = {
-	hamletX: 7,
-	hamletY: 8,
-	// A second House beside the hamlet — a new realm opens with room for eight, so settlers
-	// arrive before the first build. Its own tile so the two Houses don't stack into one pawn.
-	house2X: 6,
-	house2Y: 8,
-	barnX: 8,
-	barnY: 8,
-	characterX: 7,
-	characterY: 9,
-	speed: 0.5
-};
+// START now lives in world.ts beside GRID_SIZE — the seed asserts those tiles are Meadow, and the
+// coordinates were written out in both places until one of them moved.
 
 // How many people a realm starts with. An explicit placeholder for real population growth
 // (the People epic). One would mean every build order cancels your only gatherer.
@@ -1533,6 +1522,37 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		tileQuantity[i] = live.get(i) ?? d.capacity;
 	}
 
+	// Which way each stock is moving. Every input is already in hand except the per-capita food
+	// rate, and it is read from the same singleton row the drain in resolveWorld charges from.
+	const [cfg] = await tx.select().from(gameConfig);
+	const sustenance = resources.find((r) => r.isSustenance);
+	const rates = netRates(
+		operations
+			.filter((o) => o.type === 'gather')
+			.flatMap((o) => {
+				const yielded = deposits.get(o.destY * GRID_SIZE + o.destX);
+				// A tile whose terrain stopped yielding under a standing worker — resolveWorld pays
+				// nothing for it, so neither does the bar.
+				if (!yielded) return [];
+				return [
+					{
+						resourceId: yielded.resourceId,
+						unitsPerHour: yielded.unitsPerHour,
+						qualityMultiplier: o.qualityMultiplier,
+						arrivals: (crews.get(o.id) ?? []).map((w) => w.arrivesAt.getTime())
+					}
+				];
+			}),
+		nowMs,
+		sustenance && cfg
+			? {
+					resourceId: sustenance.id,
+					perCapitaHour: cfg.foodPerCapitaHour,
+					population: characters.length
+				}
+			: null
+	);
+
 	return {
 		now: new Date(now).toISOString(),
 		gridSize: GRID_SIZE,
@@ -1549,9 +1569,9 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			// the writer would accept — a menu that lists what the server refuses is the bug this epic exists to kill.
 			buildableTypeIds: eligibleTypeIds(t, types, resources)
 		})),
-		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName })),
+		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName, icon: r.icon })),
 		professions: professions.map((p) => ({ id: p.id, displayName: p.displayName })),
-		stock: held,
+		stock: held.map((s) => ({ ...s, ratePerHour: rates.get(s.resourceId) ?? 0 })),
 		buildingCosts: costs.map((c) => ({
 			buildingTypeId: c.buildingTypeId,
 			resourceId: c.resourceId,
@@ -1578,7 +1598,11 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			y: c.y,
 			speed: c.speed,
 			professionId: c.professionId,
-			name: c.name
+			name: c.name,
+			strength: c.strength,
+			dexterity: c.dexterity,
+			constitution: c.constitution,
+			intelligence: c.intelligence
 		})),
 		operations: operations.map((o) => ({
 			id: o.id,

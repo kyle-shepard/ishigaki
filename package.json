@@ -21,6 +21,7 @@
 		"db:migrate": "drizzle-kit migrate",
 		"db:studio": "drizzle-kit studio",
 		"seed": "node --env-file=.env scripts/seed.ts",
+		"map": "node scripts/map.ts",
 		"test": "node --test src/**/*.test.ts",
 		"check:rules": "node scripts/rules-check.ts"
 	},

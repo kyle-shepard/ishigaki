@@ -1,0 +1,1 @@
+ALTER TABLE "resource" ADD COLUMN "icon" text DEFAULT '' NOT NULL;

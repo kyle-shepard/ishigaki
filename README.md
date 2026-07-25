@@ -14,8 +14,9 @@ castle — is what everything is built on top of.
 
 Early. Stack is locked (see [VISION.md](VISION.md)): **SvelteKit + PostgreSQL +
 Drizzle**, TypeScript full-stack. The tracer bullet works end to end — you can order a
-building, watch a character walk to the tile, and see it finish — on a featureless
-16×16 grid. Terrain is the epic in progress.
+building, watch a character walk to the tile, and see it finish. The world is a 48×48
+terrain grid: a hand-authored core around the starting hamlet, generated ground around
+that. Terrain is the epic in progress.
 
 > **Every visitor gets their own private world — for now.** There is no login. A cookie
 > holds a player id, and your first request to the API creates a hamlet and a character
@@ -40,12 +41,13 @@ native type stripping) and a Postgres database — local, Docker, or hosted
 npm install
 cp .env.example .env          # then set DATABASE_URL to your Postgres connection string
 npm run db:migrate            # applies migrations (creates the tables)
-npm run seed                  # fills the global catalogs and the 16×16 terrain grid
+npm run seed                  # fills the global catalogs and the 48×48 terrain grid
 npm run dev                   # serves at http://localhost:5173
 ```
 
-Seeding is not optional: the grid is 256 stored tiles, and `/api/world` throws rather than
-render a world with no ground under it.
+Seeding is not optional: the grid is 2304 stored tiles, and `/api/world` throws rather than
+render a world with no ground under it. `npm run map` prints the terrain the seed would
+write, coloured, without touching the database — that is how the generator gets tuned.
 
 > **Secrets:** `.env` is gitignored and has never been committed.
 >

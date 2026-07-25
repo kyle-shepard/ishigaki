@@ -1,6 +1,26 @@
 // Client-safe: shared constants, wire types, and the position math. No db imports.
 
-export const GRID_SIZE = 16;
+// 48×48. Past hand-authoring, which is why the ground outside the authored core comes from
+// worldgen.ts now — see the note on `LAYOUT` in scripts/seed.ts.
+export const GRID_SIZE = 48;
+
+// Where a new sandbox starts. Every player gets the same coordinates because they never see each
+// other (VISION #4 interim override) — the hamlet, a second House beside it, the barn, and the
+// builders. Shared rather than server-only so the seed can assert these tiles are Meadow: the
+// numbers used to be written out twice, and a hand-edited map could put someone in a lake.
+export const START = {
+	hamletX: 23,
+	hamletY: 24,
+	// A second House beside the hamlet — a new realm opens with room for eight, so settlers
+	// arrive before the first build. Its own tile so the two Houses don't stack into one pawn.
+	house2X: 22,
+	house2Y: 24,
+	barnX: 24,
+	barnY: 24,
+	characterX: 23,
+	characterY: 25,
+	speed: 0.5
+};
 
 export type OrderReason =
 	| 'OUT_OF_BOUNDS'
@@ -77,10 +97,11 @@ export function qualityBand(quality: number): string {
 	return BANDS.find(([ceiling]) => quality < ceiling)?.[1] ?? 'Masterwork';
 }
 
-// ponytail: the whole world, every read. Terrain now dominates the payload — 256 small ints
-// row-major is ~700 B, so a full read is ~1.3 KB, still smaller than a diff protocol's own
-// HTTP headers. (An array of 256 tile *objects* would have been ~10 KB; that's why it isn't.)
-// Viewport culling belongs to the map-client epic.
+// ponytail: the whole world, every read. Terrain dominates the payload, and at 48×48 that is
+// 2304 small ints row-major (~7 KB) plus two dense same-length arrays for the deposits, most of
+// whose entries are `null` — call it ~30 KB a read, gzipped to a few. Fine at this size and over
+// this cadence (once on load, then a 30 s heartbeat); it is the thing that stops scaling first,
+// and viewport culling still belongs to the map-client epic.
 export type WorldPayload = {
 	now: string;
 	gridSize: number;
@@ -101,13 +122,20 @@ export type WorldPayload = {
 		// Empty on unbuildable ground and on a deposit whose extractor doesn't exist yet.
 		buildableTypeIds: number[];
 	}[];
-	resources: { id: number; displayName: string }[];
+	// icon names a symbol in Sprites.svelte, minus the `i-` prefix — what the resource bar draws
+	// in place of the word. Unknown or empty ⇒ nothing drawn.
+	resources: { id: number; displayName: string; icon: string }[];
 	// The professions a settler can be trained into, for the School's Train picker. Global
 	// catalog, unfiltered by player — the callings the world offers, like building types.
 	professions: { id: number; displayName: string }[];
 	// What you hold, one entry per resource — fractional, because accrual is continuous. The
 	// client floors it; the server never does.
-	stock: { resourceId: number; quantity: number }[];
+	//
+	// ratePerHour is where it is heading: everything being earned right now minus everything being
+	// eaten, signed, for the +/- beside the number. Computed by the server (see `netRates`) rather
+	// than by the client, because it is economy arithmetic — a second implementation in the panel
+	// would be free to disagree with the one that actually moves the stock.
+	stock: { resourceId: number; quantity: number; ratePerHour: number }[];
 	// What each building type costs. A type with no entries is free.
 	buildingCosts: { buildingTypeId: number; resourceId: number; quantity: number }[];
 	// Row-major, index = y * gridSize + x, value = terrainTypeId — the same flat indexing the
@@ -135,6 +163,10 @@ export type WorldPayload = {
 	buildings: { id: number; x: number; y: number; buildingTypeId: number; quality: number | null }[];
 	// professionId null ⇒ settler (a dot); set ⇒ a named specialist (drawn distinct). name is
 	// the specialist's, null for a settler.
+	//
+	// The four stats ride along for the citizens roster — which of your two Masons is the better
+	// one is the whole reason to open it, and they are all-or-nothing with the profession (the
+	// character_tier CHECK holds that), so a settler simply has none.
 	characters: {
 		id: number;
 		x: number;
@@ -142,6 +174,10 @@ export type WorldPayload = {
 		speed: number;
 		professionId: number | null;
 		name: string | null;
+		strength: number | null;
+		dexterity: number | null;
+		constitution: number | null;
+		intelligence: number | null;
 	}[];
 	operations: {
 		id: number;
@@ -211,6 +247,49 @@ export function accrue(
 	// Clamped at both ends: a tile cannot go below empty, and cannot regrow past full.
 	const quantity = Math.min(Math.max(deposit.quantity + grown - harvested, 0), deposit.capacity);
 	return { harvested, quantity };
+}
+
+/**
+ * Which way each resource is moving, per real hour, right now — the signed number the resource bar
+ * paints green or red.
+ *
+ * Pure and database-free like `accrue` and `population`, and for the same reason: it is the only
+ * thing on screen that claims to predict the future, so the two ways it can lie are worth pinning
+ * in `npm test` rather than squinting at.
+ *
+ * **A worker still walking earns nothing.** `accrue` bills from the moment a body *arrives*, so a
+ * gather ordered across the map contributes zero until then, and the bar has to say the same or it
+ * is quoting income nobody is producing yet. Arrivals are per-body (a crew leaves from its own
+ * tiles), so the rate steps up as they land.
+ *
+ * **Food drains by head count**, at the settlement's own per-capita rate — the same product
+ * `population` charges. This is the one entry that is normally negative, and a hamlet whose forager
+ * cannot cover its own mouths reads as red before anybody starves, which is the point.
+ *
+ * Not modelled, deliberately: a finite deposit running dry mid-hour (the rate is instantaneous, not
+ * a forecast), and a build that will spend from stock on completion (already spent — cost is taken
+ * at order time).
+ */
+export function netRates(
+	gathers: {
+		resourceId: number;
+		unitsPerHour: number;
+		qualityMultiplier: number;
+		/** Epoch ms each body on this job reaches the tile. */
+		arrivals: number[];
+	}[],
+	nowMs: number,
+	food: { resourceId: number; perCapitaHour: number; population: number } | null
+): Map<number, number> {
+	const rates = new Map<number, number>();
+	const add = (resourceId: number, delta: number) =>
+		rates.set(resourceId, (rates.get(resourceId) ?? 0) + delta);
+	for (const g of gathers) {
+		const working = g.arrivals.filter((a) => a <= nowMs).length;
+		if (working > 0) add(g.resourceId, g.unitsPerHour * g.qualityMultiplier * working);
+	}
+	if (food) add(food.resourceId, -food.population * food.perCapitaHour);
+	return rates;
 }
 
 export type PopulationConfig = {
@@ -518,8 +597,9 @@ export function positionAt(op: TravelLeg, nowMs: number): { x: number; y: number
  * which is what that half-tile claim means. Flooring would put the character on a corner and
  * give the origin tile no samples at all when it departs along an axis.
  *
- * ponytail: uniform resolution, ~4 samples per tile. Fine at 16×16; a much larger map could
- * slip a one-tile-wide river between samples, and that is when this needs revisiting.
+ * ponytail: uniform resolution, ~4 samples per tile — so the cost is per tile of distance, not
+ * per map, and 48×48 changed nothing here. Four samples per tile still cannot skip a one-tile
+ * feature; a *sub*-tile one (a river drawn thinner than a tile) is what would need revisiting.
  */
 export function travelSeconds(
 	originX: number,
