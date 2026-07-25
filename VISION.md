@@ -208,8 +208,11 @@ API, SvelteKit render-and-order, and the travel primitive.
    choice matter, and both epics above lean on its answers.
 6. **Time/progression hardening** — robust offline/concurrency resolution (the hard cases the
    tracer stubs); depends on the R-step time-model decision.
-7. **Map client depth** — zoom/LOD tiers, terrain rendering.
-8. **World generation** — the terrain map.
+7. **Map depth** ([#10](https://github.com/kyle-shepard/ishigaki/issues/10)) — zoom/LOD tiers and
+   world generation, **merged**: a far view of noise is a smaller picture of nothing, and
+   geography you only ever see fifteen tiles at a time is geography nobody looks at. Two tracks
+   in one epic.
+8. _(folded into #7)_
 9. **Premium currency & rush** — hard currency, rush-an-operation. _(small)_
 10. **Accounts & multiplayer shell** — auth, player identity. _(schema already ready)_
 11. **Settlement hierarchy & politics** — growth ladder, domains/provinces, vassalage, war.
@@ -217,6 +220,12 @@ API, SvelteKit render-and-order, and the travel primitive.
 Also owed, and not yet epics: **expansion** (how a settlement claims more than the tile it
 started on) and **borders** (where one settlement ends). Both sit between People and the
 shared-world reversal, and both are still too vague to write down honestly.
+
+Outside the ladder, three tickets that are interaction design and tooling rather than a strand of
+the vision, and are sized to run on their own: an **admin back door** for seeding test states
+([#11](https://github.com/kyle-shepard/ishigaki/issues/11)), a **right-click build menu**
+([#12](https://github.com/kyle-shepard/ishigaki/issues/12)), and the **rosters** moved out of the
+inspector rail ([#13](https://github.com/kyle-shepard/ishigaki/issues/13)).
 
 The trio — **Economy → Construction → People** — is what turns "a house appears" into "a
 settlement you're growing." Each epic runs its own QRSPI cycle.
