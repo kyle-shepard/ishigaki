@@ -20,6 +20,31 @@ _eventual_ skin, not the build vocabulary (see "Setting & naming").
 Single-player-first: we design and build for one player, but the schema is multiplayer-shaped
 from day one so multiplayer is a feature-add, not a rewrite.
 
+### Current target (2026-07-25): a browser Banished
+
+A hard scope pause, taken after reading the [Lands of Lords encyclopedia](https://www.landsoflords.com/help/)
+properly for the first time. LoL is enormous — hundreds of goods running to gunpowder and
+automata, organisations from lordship to empire, era-gated global content unlocks, cults,
+tournaments, excommunication. Copying **most** of it before forking remains the plan; copying
+**all** of it in one pass is not a plan.
+
+So the target narrows to the half of LoL that needs nobody else in the world: **the village
+survival economy.** Terrain, buildings, jobs, resources, needs, people. In one line — _Banished,
+in a browser_, with LoL's quality system as the thing that gives it depth and the
+designate/auto-assign model (locked decision #7) as the thing that makes it playable without micromanagement.
+
+**In:** production chains, tools, needs beyond food, seasons, decay and repair, storage limits,
+the quality feedback loop, map depth.
+
+**Out until the village works:** accounts and identity, organisations and titles, the era
+system, politics, military, trade. All of it is multiplayer-shaped or scale-shaped, and none of
+it can be honestly designed against a world with one player and forty people in it.
+
+**Not Rimworld, yet.** Individual colonists with moods, traits, and a storyteller generating
+crises is the most attractive _fork_ on the table — but it is a fork, and it comes after the
+economy it would generate crises against. Ishigaki already has Rimworld's assignment model
+(locked decision #7); it does not need Rimworld's psychology to be a game.
+
 ---
 
 ## Locked decisions (Session 0)
@@ -74,6 +99,15 @@ These were argued out and are settled. Change them only with a deliberate revers
      and skills that determine the **quality** of what they build/make. These are the entities
      the "restrict builders / pick specialties" filter selects among, and the ones you see when
      you click a tile.
+
+   **Amended 2026-07-25 — the commoner tier is deferred, not owed.** The 1:10 group ratio was
+   taken from LoL, where it is literal: _"a unit is not an individual, but rather a group of ten
+   individuals specialised in the same profession."_ That is correct for a feudal MMO counting
+   thousands of people. It is wrong for a village of forty, where the individual villager **is**
+   the interesting object — which is why Banished tracks every one of them by name. What shipped
+   is individuals for both tiers, and under the current target that is the right model, not a
+   shortcut. The aggregate returns when settlement scale makes forty names unreadable, and not
+   before.
 
 7. **Activity model — the first deliberate divergence from LoL.** LoL's manual
    select-worker → walk-to-tile → build loop is rejected as too micromanagey. Instead
@@ -153,14 +187,16 @@ blocker.
 
 - **Time-resolution mechanics** — validate lazy-on-read against offline/concurrent/combat cases
   (top research item; gates world-sim schema).
-- **Group ratio** — 1:10 is a starting value, retuned via data.
 - **Character autonomy / random schedules** — the "characters live their own lives" depth layer.
-- **World generation** — how the terrain map (mountains, seas, biomes) is produced.
-- **Map LOD phasing** — continent/regional zoom tiers and nation/city borders.
-- **Settlement & title ladder** — exact stages and thresholds.
+  The nearest thing to a Rimworld fork, and the most attractive one once the economy stands up.
+- **Aging & generations** ([#19](https://github.com/kyle-shepard/ishigaki/issues/19)) — whether villagers grow old and die. It is what makes Banished hard
+  and what makes a lot of players quit it; a product call, not a design gap.
+- **Settlement & title ladder** — superseded by LoL's organisations model; see "Parked" below.
 - **Political / multiplayer layer** — vassalage, war, player governance.
-- **Resource & economy model** — resources, chains, currency.
 - **Premium currency specifics** — pricing, what's rushable, monetization shape.
+
+Moved off this list and onto the ladder: world generation, map LOD, and the resource/economy
+model (production chains, needs, storage).
 
 ---
 
@@ -196,30 +232,60 @@ API, SvelteKit render-and-order, and the travel primitive.
   restrict-builders, cancel/rush, premium currency, **resource cost — the tracer's build is free**,
   multiplayer/auth, settlement hierarchy.
 
-### Deepening epics (order by feel after the tracer)
+### Shipped
 
-3. **Construction depth** ([#7](https://github.com/kyle-shepard/ishigaki/issues/7)) —
-   data-driven building catalog; restrict-builders + specialties; cancel/rush; requirements.
-4. **People depth** ([#8](https://github.com/kyle-shepard/ishigaki/issues/8)) — two-tier model;
-   commoner aggregate; individual skilled characters with abilities/skills → quality;
-   auto-assign pool; multiple characters.
-5. **Economy & resources** ([#6](https://github.com/kyle-shepard/ishigaki/issues/6)) — build
-   costs, production chains, storage. **Running first of the three:** cost is what makes a tile
-   choice matter, and both epics above lean on its answers.
-6. **Time/progression hardening** — robust offline/concurrency resolution (the hard cases the
-   tracer stubs); depends on the R-step time-model decision.
-7. **Map depth** ([#10](https://github.com/kyle-shepard/ishigaki/issues/10)) — zoom/LOD tiers and
-   world generation, **merged**: a far view of noise is a smaller picture of nothing, and
-   geography you only ever see fifteen tiles at a time is geography nobody looks at. Two tracks
-   in one epic.
-8. _(folded into #7)_
-9. **Premium currency & rush** — hard currency, rush-an-operation. _(small)_
-10. **Accounts & multiplayer shell** — auth, player identity. _(schema already ready)_
-11. **Settlement hierarchy & politics** — growth ladder, domains/provinces, vassalage, war.
+3. **Economy & resources** ([#6](https://github.com/kyle-shepard/ishigaki/issues/6)) — build
+   costs, stock, tile deposits with depletion and regrowth.
+4. **Construction depth** ([#7](https://github.com/kyle-shepard/ishigaki/issues/7)) —
+   data-driven catalog, requirements, terrain gating, cancel with refund.
+5. **People depth** ([#8](https://github.com/kyle-shepard/ishigaki/issues/8)) — individual
+   characters with stats, professions, skills; food drain, population growth against housing,
+   starvation.
+6. **Labor & crews** ([#9](https://github.com/kyle-shepard/ishigaki/issues/9)) — crews, the
+   speed-vs-quality curve, the live pre-commit estimate.
 
-Also owed, and not yet epics: **expansion** (how a settlement claims more than the tile it
-started on) and **borders** (where one settlement ends). Both sit between People and the
-shared-world reversal, and both are still too vague to write down honestly.
+Between them these four already stand up the Banished spine: extract → eat → grow → house →
+more hands. What they do not have is anything **made**, anything **needed but food**, anything
+that **wears out**, or any reason the quality already being recorded should matter.
+
+### The village ladder (current target)
+
+Ordered. Unlike the deepening epics, these do have a dependency shape — each one is what makes
+the next worth having.
+
+7. **Production buildings & recipes** ([#14](https://github.com/kyle-shepard/ishigaki/issues/14)) — a staffed building that consumes inputs and emits
+   outputs over time. **The keystone.** Every resource today is dug out of the ground; nothing
+   is made from anything. Without this there is no chain for quality to travel down, no tools,
+   no second need to satisfy, and no reason for a catalog.
+8. **Tools & the quality loop** ([#15](https://github.com/kyle-shepard/ishigaki/issues/15)) — tools as produced goods, and effective skill computed live
+   from base skill, tool quality, the building worked in, and the land. This is LoL's actual
+   mechanic (_"skills … calculated in real time depending on the context of the unit: its level
+   of fatigue, the quality of its equipment, the building or the land where it is located"_) and
+   it is what closes the loop: better tools make better tools. Quality stops being a scoreboard.
+9. **Needs beyond food** ([#16](https://github.com/kyle-shepard/ishigaki/issues/16)) — heating and clothing alongside food. One need is a dial; three needs
+   are a decision. `resource.is_food` generalises to a needs table.
+10. **Seasons** ([#17](https://github.com/kyle-shepard/ishigaki/issues/17)) — a year that swings yields and consumption, so the same numbers become a
+    stockpile-or-die rhythm rather than a flat drain.
+11. **Decay, repair & storage limits** ([#18](https://github.com/kyle-shepard/ishigaki/issues/18)) — buildings wear out (quality's second consumer, already
+    promised in the schema), and stock stops being unbounded so a barn has a job.
+12. **Map depth** ([#10](https://github.com/kyle-shepard/ishigaki/issues/10)) — zoom/LOD tiers
+    and world generation, **merged**: a far view of noise is a smaller picture of nothing, and
+    geography you only ever see fifteen tiles at a time is geography nobody looks at.
+
+### Parked until the village works
+
+Not cancelled — sequenced behind a game that stands up on its own. Every one of them is
+multiplayer-shaped, scale-shaped, or both.
+
+- **Accounts & identity** — auth, player identity, armorial, rankings. _(schema already ready)_
+- **Organisations & titles** — LoL's legal-person model: lordship→empire, bishoprics, guilds,
+  vassal/suzerain. Supersedes the old "settlement hierarchy" line as the thing to copy.
+- **The era system** — LoL gates content globally by week, medieval through automata. A genuine
+  fork in the content model, and an open product question rather than an epic.
+- **Expansion & borders** — how a settlement claims more than the tile it started on.
+- **Shared-world reversal** — see locked decision #4.
+- **Logistics, trade, military, politics** — in that order, and all after the reversal.
+- **Premium currency & rush**, **time/progression hardening**, **character autonomy**.
 
 Outside the ladder, three tickets that are interaction design and tooling rather than a strand of
 the vision, and are sized to run on their own: an **admin back door** for seeding test states
@@ -227,8 +293,7 @@ the vision, and are sized to run on their own: an **admin back door** for seedin
 ([#12](https://github.com/kyle-shepard/ishigaki/issues/12)), and the **rosters** moved out of the
 inspector rail ([#13](https://github.com/kyle-shepard/ishigaki/issues/13)).
 
-The trio — **Economy → Construction → People** — is what turns "a house appears" into "a
-settlement you're growing." Each epic runs its own QRSPI cycle.
+Each epic runs its own QRSPI cycle.
 
 ---
 
