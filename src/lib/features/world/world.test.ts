@@ -12,6 +12,8 @@ import {
 	population,
 	positionAt,
 	qualityBand,
+	roadArms,
+	roadStyles,
 	rollStats,
 	skillValue,
 	STAT_MAX,
@@ -588,4 +590,54 @@ test('food nets forage against mouths, and reads negative when it cannot keep up
 	assert.ok(winning.get(1)! > 0, 'a Forager can');
 	// Nobody working at all is the drain alone — the number a fresh realm shows.
 	assert.ok(Math.abs(netRates([], NOW, mouths).get(1)! + 2.4) < 1e-9);
+});
+
+// Roads. The shape of a junction is a rule rather than fifteen hand-drawn sprites, so the rule is
+// what gets pinned — and the override's one guarantee (it can hide an arm, never invent one) is the
+// thing that would otherwise leave roads pointing at grass.
+const roads = (...tiles: [number, number][]) => {
+	const set = new Set(tiles.map(([x, y]) => `${x},${y}`));
+	return (x: number, y: number) => set.has(`${x},${y}`);
+};
+const N = 1;
+const E = 2;
+const S = 4;
+const W = 8;
+
+test('a road joins the roads beside it and nothing else', () => {
+	// A cross: the middle tile joins all four, each arm joins only back to the middle.
+	const cross = roads([5, 5], [5, 4], [5, 6], [4, 5], [6, 5]);
+	assert.equal(roadArms(5, 5, cross, null), N | E | S | W);
+	assert.equal(roadArms(5, 4, cross, null), S);
+	assert.equal(roadArms(6, 5, cross, null), W);
+	// A lone road joins nothing — a stub, not an error.
+	assert.equal(roadArms(9, 9, roads([9, 9]), null), 0);
+});
+
+test('a corner is a corner without anybody choosing an orientation', () => {
+	// An L bending east then south: the elbow joins east and south, which *is* the corner sprite.
+	const bend = roads([2, 2], [3, 2], [2, 3]);
+	assert.equal(roadArms(2, 2, bend, null), E | S);
+});
+
+test('an override hides an arm and can never invent one', () => {
+	const cross = roads([5, 5], [5, 4], [5, 6], [4, 5], [6, 5]);
+	// Drawn straight north-south at a crossroads: the east and west arms go unpainted.
+	assert.equal(roadArms(5, 5, cross, N | S), N | S);
+	// Claiming an arm with no road behind it is intersected away rather than drawn into the grass.
+	assert.equal(roadArms(5, 4, cross, N | S), S);
+	// And a stored shape whose road is later torn up heals itself: no eastern neighbour, no east arm.
+	assert.equal(roadArms(5, 5, roads([5, 5], [5, 4], [5, 6], [4, 5]), N | E | S), N | S);
+});
+
+test('only a junction offers a choice of shape, and only of the straights it contains', () => {
+	// A crossroads reads three ways: as it joins, north-south, or east-west.
+	assert.deepEqual(roadStyles(N | E | S | W), [null, N | S, E | W]);
+	// A T with a north-south straight through it offers that one and no other.
+	assert.deepEqual(roadStyles(N | S | E), [null, N | S]);
+	// A corner, a through-road and a dead end are each already the only drawing of themselves.
+	assert.deepEqual(roadStyles(N | E), [null]);
+	assert.deepEqual(roadStyles(N | S), [null]);
+	assert.deepEqual(roadStyles(N), [null]);
+	assert.deepEqual(roadStyles(0), [null]);
 });

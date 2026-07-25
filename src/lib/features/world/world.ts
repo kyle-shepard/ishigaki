@@ -25,7 +25,11 @@ export type OrderReason =
 	// tile, and the chosen profession must exist.
 	| 'NO_IDLE_SETTLER'
 	| 'MISSING_SCHOOL'
-	| 'UNKNOWN_PROFESSION';
+	| 'UNKNOWN_PROFESSION'
+	// Restyling something that is not a road you own. Deliberately one reason for both halves —
+	// "no such building" and "not a road" — because a building belonging to somebody else must not
+	// be distinguishable from one that does not exist.
+	| 'NOT_A_ROAD';
 
 // crewSize is how many bodies to send — a *maximum*, not a requirement: the order takes up to that
 // many of the qualifying idle workers and is happy with fewer. Optional on the wire so an older
@@ -139,13 +143,25 @@ export type WorldPayload = {
 		displayName: string;
 		icon: string;
 		buildSeconds: number;
+		// What this type does to the ground's movement cost; null means nothing. Non-null is what
+		// makes a type *linear infrastructure* — the client draws it as arms joining its own kind
+		// rather than as a single building sprite, and routing walks bodies onto it.
+		movementCost: number | null;
 		// The type that must stand somewhere in your realm before this one can be placed; null if
 		// none. The client greys a type whose prerequisite isn't owned, labelled with its name.
 		requiresBuildingTypeId: number | null;
 	}[];
 	// quality is how well it was built — null on anything raised before it was recorded, which
-	// reads as nothing at all rather than as "unknown".
-	buildings: { id: number; x: number; y: number; buildingTypeId: number; quality: number | null }[];
+	// reads as nothing at all rather than as "unknown". roadMask is the player's override of a
+	// road's shape; null means derive it from the neighbours (see `roadArms`).
+	buildings: {
+		id: number;
+		x: number;
+		y: number;
+		buildingTypeId: number;
+		quality: number | null;
+		roadMask: number | null;
+	}[];
 	// professionId null ⇒ settler (a dot); set ⇒ a named specialist (drawn distinct). name is
 	// the specialist's, null for a settler.
 	//
@@ -677,6 +693,58 @@ export function route(
 	return { path, seconds: Math.ceil(best[goal]) };
 }
 
+// The four sides a road can join, clockwise from north, as bits. Clockwise matters: the bit order is
+// also the order the arms are drawn in, so an arm's rotation is just its index × 90°.
+export const ROAD_SIDES = [
+	{ bit: 1, dx: 0, dy: -1, degrees: 0 },
+	{ bit: 2, dx: 1, dy: 0, degrees: 90 },
+	{ bit: 4, dx: 0, dy: 1, degrees: 180 },
+	{ bit: 8, dx: -1, dy: 0, degrees: 270 }
+] as const;
+
+/** Both straights, for the override picker: north–south, and east–west. */
+const NORTH_SOUTH = 1 | 4;
+const EAST_WEST = 2 | 8;
+
+/**
+ * Which arms a road tile draws — the auto-shape from its neighbours, narrowed by the player's stored
+ * override. Fifteen sprites' worth of shape from one rule, so a road laid next to a road becomes a
+ * corner or a crossing without anybody choosing an orientation, which is the bit Lands of Lords makes
+ * you do by hand.
+ *
+ * The override is **intersected**, never unioned: a player can hide an arm at a junction, and cannot
+ * draw one to a tile that has no road on it. That is also what makes it self-healing — pave over a
+ * junction's northern arm, tear that road up later, and the override quietly stops claiming it rather
+ * than leaving a stub pointing at grass.
+ *
+ * Pure and free of the payload so the shape rule is a unit test rather than something to squint at:
+ * `isRoad` answers "is there a road of this kind on that tile", off-map included (false).
+ */
+export function roadArms(
+	x: number,
+	y: number,
+	isRoad: (x: number, y: number) => boolean,
+	stored: number | null
+): number {
+	let auto = 0;
+	for (const side of ROAD_SIDES) if (isRoad(x + side.dx, y + side.dy)) auto |= side.bit;
+	return stored === null ? auto : stored & auto;
+}
+
+/**
+ * The shapes worth offering for a tile whose neighbours make `auto` — what "change road" cycles
+ * through. Null first, meaning "however it joins up", then whichever straights the junction
+ * contains: a crossroads can read as north–south or east–west, a T as the straight through it.
+ *
+ * Only junctions get a choice. A corner, a dead end or a plain through-road is already the only
+ * sensible drawing of itself, and offering to restyle it would be a button that changes nothing.
+ */
+export function roadStyles(auto: number): (number | null)[] {
+	const bits = ROAD_SIDES.filter((s) => auto & s.bit).length;
+	if (bits < 3) return [null];
+	return [null, ...[NORTH_SOUTH, EAST_WEST].filter((straight) => (auto & straight) === straight)];
+}
+
 /** How far along the travel leg we are at `nowMs`, clamped to [0, 1]. */
 export function travelFraction(leg: TravelLeg, nowMs: number): number {
 	const start = Date.parse(leg.startedAt);
@@ -692,10 +760,15 @@ export function travelFraction(leg: TravelLeg, nowMs: number): number {
  * stored — the server does not tick intermediate positions.
  *
  * ponytail: spread evenly along the route by *distance*, not by each tile's movement cost. So a
- * route that has to cross one slow tile draws the body a little ahead of itself going in and a
- * little behind coming out — it still leaves and arrives on the second. The exact version needs
- * every tile's movement cost on the wire (it is deliberately not there today) and the drift is
- * small precisely because the router already avoided the expensive ground.
+ * route that mixes fast and slow ground draws the body a little ahead of itself on the slow part and
+ * a little behind on the fast — it still leaves and arrives on the second, and the error is worst in
+ * the middle and zero at both ends.
+ *
+ * Roads widened this: half a route on paving at 0.4 and half on meadow at 1.0 is a real difference
+ * in pace that the drawing flattens, up to about a tile out at the midpoint. Fixing it means putting
+ * every terrain's movement cost on the wire (deliberately absent — nothing on the client estimates
+ * travel) and giving this a cost lookup, at which point it is exact. Worth doing the day somebody
+ * notices a body sauntering down a road; not before.
  */
 export function positionAt(
 	leg: TravelLeg,

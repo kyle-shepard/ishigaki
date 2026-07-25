@@ -169,6 +169,13 @@
       "when": 1784953769687,
       "tag": "0023_mushy_pestilence",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1784955736394,
+      "tag": "0024_plain_thena",
+      "breakpoints": true
     }
   ]
 }

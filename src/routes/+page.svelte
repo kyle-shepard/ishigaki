@@ -9,6 +9,9 @@
 		GRID_SIZE,
 		positionAt,
 		qualityBand,
+		roadArms,
+		ROAD_SIDES,
+		roadStyles,
 		travelFraction,
 		type EstimateResponse,
 		type OrderReason,
@@ -31,7 +34,8 @@
 		UNKNOWN_OPERATION: 'Nobody is working there.',
 		NO_IDLE_SETTLER: 'You have no idle settler to train.',
 		MISSING_SCHOOL: 'Training needs a School on the tile.',
-		UNKNOWN_PROFESSION: "That isn't a profession anyone can learn."
+		UNKNOWN_PROFESSION: "That isn't a profession anyone can learn.",
+		NOT_A_ROAD: "That isn't a road you can change."
 	};
 
 	// A click selects a tile; the inspector panel to the right of the map owns the verbs. No
@@ -505,6 +509,48 @@
 	// walking specialist.
 	const specialists = $derived(world?.characters.filter((c) => c.professionId !== null) ?? []);
 
+	// ---- Roads -----------------------------------------------------------------------------------
+	// A type that changes the ground's movement cost is drawn as linear infrastructure — a hub and
+	// arms joining its own kind — rather than as one building sprite. Keyed on that rather than on the
+	// name 'Road', which is the reskin column, so a towpath or a paved way needs no client change.
+	const roadTypeIds = $derived(
+		new Set(world?.buildingTypes.filter((t) => t.movementCost !== null).map((t) => t.id) ?? [])
+	);
+	const roadTiles = $derived(
+		new Set(
+			world?.buildings
+				.filter((b) => roadTypeIds.has(b.buildingTypeId))
+				.map((b) => b.y * GRID_SIZE + b.x) ?? []
+		)
+	);
+	// Off the map is not a road, which is what stops an edge tile drawing an arm into nothing.
+	const isRoad = (x: number, y: number) =>
+		x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE && roadTiles.has(y * GRID_SIZE + x);
+	type Built = WorldPayload['buildings'][number];
+	// The rotations to draw, in bit order — one arm per side this tile joins.
+	const armsOf = (b: Built) => {
+		const mask = roadArms(b.x, b.y, isRoad, b.roadMask);
+		return ROAD_SIDES.filter((s) => mask & s.bit).map((s) => s.degrees);
+	};
+	// The styles on offer for the selected road, from its *neighbours* rather than its current
+	// override — the choice is a property of the junction, not of what it is drawn as right now.
+	const selRoadStyles = $derived(
+		selBuilt && roadTypeIds.has(selBuilt.buildingTypeId)
+			? roadStyles(roadArms(selBuilt.x, selBuilt.y, isRoad, null))
+			: []
+	);
+	function cycleRoad() {
+		if (!selBuilt) return;
+		// An override the junction no longer contains isn't in the list, so findIndex misses and this
+		// lands back on "however it joins up" — the right answer for a shape that has gone stale.
+		const at = selRoadStyles.findIndex((s) => s === selBuilt!.roadMask);
+		const next = selRoadStyles[(at + 1) % selRoadStyles.length];
+		act(`/api/roads/${selBuilt.id}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ roadMask: next })
+		});
+	}
+
 	// ---- The resource bar ----------------------------------------------------------------------
 	const resourceIcon = $derived(new Map(world?.resources.map((r) => [r.id, r.icon]) ?? []));
 	// Below this the number is noise: a rate rounds to 0.0 and a "+0.0" beside a still stock reads
@@ -526,7 +572,7 @@
 		quality: number | null;
 		state: 'built' | 'building' | 'waiting';
 	};
-	const buildingRows = $derived.by<Row[]>(() => {
+	const allBuildingRows = $derived.by<Row[]>(() => {
 		if (!world) return [];
 		const rows: Row[] = world.buildings.map((b) => ({
 			key: `b${b.id}`,
@@ -553,10 +599,14 @@
 			(a, b) => typeName(a.typeId).localeCompare(typeName(b.typeId)) || a.y - b.y || a.x - b.x
 		);
 	});
-	// "Houses 3 · Barn 1" — the summary the list itself can't give you at a glance once it's long.
+	// Roads are counted, never listed. A network is dozens of tiles and none of them is a thing you
+	// go and look at — forty rows of "Road" would bury the four buildings you actually manage. They
+	// stay in the summary line, which is the honest place for "you have paved thirty tiles".
+	const buildingRows = $derived(allBuildingRows.filter((r) => !roadTypeIds.has(r.typeId)));
+	// "3 House · 1 Barn · 24 Road" — the summary the list itself can't give at a glance once it's long.
 	const buildingSummary = $derived.by(() => {
 		const counts = new Map<string, number>();
-		for (const r of buildingRows) {
+		for (const r of allBuildingRows) {
 			const name = typeName(r.typeId);
 			counts.set(name, (counts.get(name) ?? 0) + 1);
 		}
@@ -741,7 +791,23 @@
 					</svg>
 				</button>
 			{/each}
-			{#each world.buildings as b (b.id)}
+			<!-- Roads first, so anything standing beside one is painted over its arms rather than
+			     under them — and because a road is the ground, not a thing on it. -->
+			{#each world.buildings.filter((b) => roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
+				<svg
+					class="over road"
+					viewBox="0 0 32 32"
+					style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
+				>
+					<use href="#p-road-hub" />
+					<!-- One arm per side it joins, rotated about the tile's centre. The shape of a
+					     crossing, a corner and a dead end all fall out of this. -->
+					{#each armsOf(b) as degrees (degrees)}
+						<use href="#p-road-arm" transform="rotate({degrees} 16 16)" />
+					{/each}
+				</svg>
+			{/each}
+			{#each world.buildings.filter((b) => !roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
 				<svg
 					class="over"
 					viewBox="0 0 32 32"
@@ -895,6 +961,18 @@
 							>{qualityBand(selBuilt.quality)} work.</span
 						>{/if}
 				</p>
+				<!-- Only at a junction: a corner or a through-road is already the only sensible drawing
+				     of itself, so there would be nothing for the button to do. -->
+				{#if selRoadStyles.length > 1}
+					<p>
+						<button onclick={cycleRoad}>Change road</button>
+						<span class="price">
+							{selBuilt.roadMask === null
+								? 'joins everything next to it'
+								: 'drawn straight through'}
+						</span>
+					</p>
+				{/if}
 			{:else if selSite && selSite.startedAt === null}
 				<p><b>{typeName(selSite.buildingTypeId!)}</b> — waiting for a builder.</p>
 				<p class="crew">Starts itself as soon as someone is free.</p>

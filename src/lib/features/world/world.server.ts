@@ -533,7 +533,7 @@ async function startQueuedBuilds(tx: Tx, playerId: number): Promise<void> {
 	if (free.length === 0) return;
 
 	const rank = await loadRanker(tx, await constructionSkillId(tx));
-	const grid = await loadGrid(tx);
+	const grid = await loadGrid(tx, playerId);
 	const buildSecondsOf = new Map(
 		(
 			await tx
@@ -782,8 +782,16 @@ export type EstimateResult =
  * row-major way the wire payload is. One read of the whole grid serves both the destination's
  * buildability and the cost of every tile a route might cross — and routing genuinely needs all
  * of them, since it does not know which way it is going until it has looked.
+ *
+ * **Per player, because roads are.** A tile's cost is now what is *built* on it if that changes the
+ * ground, else the terrain's own — and buildings are player-scoped under VISION #4's interim
+ * override, so your roads speed your people up and nobody else's. The COALESCE is the whole of
+ * "a road is a fast tile"; there is no other place where roads affect travel.
  */
-async function loadGrid(tx: Tx): Promise<
+async function loadGrid(
+	tx: Tx,
+	playerId: number
+): Promise<
 	Map<
 		number,
 		{
@@ -801,10 +809,17 @@ async function loadGrid(tx: Tx): Promise<
 			buildable: terrainType.buildable,
 			isDeposit: terrainType.isDeposit,
 			yieldsResourceId: terrainType.yieldsResourceId,
-			movementCost: terrainType.movementCost
+			movementCost: sql<number>`coalesce(${buildingType.movementCost}, ${terrainType.movementCost})`
 		})
 		.from(tile)
-		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id));
+		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
+		// The left joins are what keep this one read: a tile with nothing on it still comes back, with
+		// its own cost. The unique index on (player_id, x, y) is why one building can match at most.
+		.leftJoin(
+			building,
+			and(eq(building.x, tile.x), eq(building.y, tile.y), eq(building.playerId, playerId))
+		)
+		.leftJoin(buildingType, eq(building.buildingTypeId, buildingType.id));
 	return new Map(
 		rows.map((r) => [
 			r.y * GRID_SIZE + r.x,
@@ -940,7 +955,7 @@ async function planBuild(
 
 	// Ground before what sits on it: bounds and building type ask "is this request
 	// coherent", terrain asks "is this place legal", occupancy asks "is this place free".
-	const grid = await loadGrid(tx);
+	const grid = await loadGrid(tx, playerId);
 	// A hole in the grid is a corrupt world, not a game rule. Falling back to `undefined`
 	// would tell the player they can't build there (a DB fault dressed as a rule, which
 	// the docstring above forbids) and would feed NaN into the travel time.
@@ -1235,7 +1250,7 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		if (!pick) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
 		const idle = pick.character;
 
-		const grid = await loadGrid(tx);
+		const grid = await loadGrid(tx, playerId);
 		const walk = route(idle.x, idle.y, x, y, idle.speed, movementCostIn(grid), GRID_SIZE);
 		const travel = walk.seconds;
 		const [op] = await tx
@@ -1328,7 +1343,7 @@ export async function assignTraining(
 			.limit(1);
 		if (!settler) return { ok: false, reason: 'NO_IDLE_SETTLER' };
 
-		const grid = await loadGrid(tx);
+		const grid = await loadGrid(tx, playerId);
 		const walk = route(settler.x, settler.y, x, y, settler.speed, movementCostIn(grid), GRID_SIZE);
 		const travel = walk.seconds;
 		const [op] = await tx
@@ -1438,6 +1453,49 @@ export async function cancelBuild(playerId: number, operationId: number): Promis
 		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
 		if (!home) throw new Error(`player ${playerId} has no settlement`);
 		await refundBuild(tx, home.id, cancelled.buildingTypeId!);
+
+		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
+/**
+ * Restyles a road: which of its arms are drawn. Cosmetic, and the only write in this file that
+ * changes nothing about how the world behaves — a road is cheap to cross whichever way it is drawn.
+ *
+ * The mask is stored as given (within 0–15, which the DB also holds) rather than validated against
+ * the tile's real neighbours, because rendering intersects it with them anyway: an override can only
+ * hide an arm, and one whose road is later torn up stops claiming it by itself. Validating here
+ * would be a second, weaker copy of that rule that goes stale the moment the map changes.
+ */
+export async function restyleRoad(
+	playerId: number,
+	buildingId: number,
+	roadMask: number | null
+): Promise<OrderResult> {
+	if (roadMask !== null && (!Number.isInteger(roadMask) || roadMask < 0 || roadMask > 15))
+		return { ok: false, reason: 'NOT_A_ROAD' };
+	return db.transaction(async (tx) => {
+		await resolveWorld(tx, playerId);
+		// One statement decides both questions the verb can fail on — yours, and a road — because a
+		// building you do not own must not even be confirmed to exist.
+		const [changed] = await tx
+			.update(building)
+			.set({ roadMask })
+			.where(
+				and(
+					eq(building.id, buildingId),
+					eq(building.playerId, playerId),
+					inArray(
+						building.buildingTypeId,
+						tx
+							.select({ id: buildingType.id })
+							.from(buildingType)
+							.where(sql`${buildingType.movementCost} IS NOT NULL`)
+					)
+				)
+			)
+			.returning({ id: building.id });
+		if (!changed) return { ok: false, reason: 'NOT_A_ROAD' };
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});
@@ -1595,6 +1653,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			displayName: t.displayName,
 			icon: t.icon,
 			buildSeconds: t.buildSeconds,
+			movementCost: t.movementCost,
 			requiresBuildingTypeId: t.requiresBuildingTypeId
 		})),
 		buildings: buildings.map((b) => ({
@@ -1602,7 +1661,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			x: b.x,
 			y: b.y,
 			buildingTypeId: b.buildingTypeId,
-			quality: b.quality
+			quality: b.quality,
+			roadMask: b.roadMask
 		})),
 		characters: characters.map((c) => ({
 			id: c.id,

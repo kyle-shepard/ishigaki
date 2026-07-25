@@ -67,7 +67,25 @@ const buildingTypes = await db
 		{ displayName: 'Stone wall', icon: 'wall', buildSeconds: 90, housingCapacity: 0 },
 		// Where a settler is trained into a specialist. Gates training exactly as the Quarry gates
 		// Stone — no School, no specialists.
-		{ displayName: 'School', icon: 'school', buildSeconds: 45, housingCapacity: 0 }
+		{ displayName: 'School', icon: 'school', buildSeconds: 45, housingCapacity: 0 },
+		// The first building that is worth having for what it does to the *ground* rather than for
+		// what stands on it. movementCost 0.4 against meadow's 1.0 makes a road two and a half times
+		// quicker than open grass and better than six times quicker than forest — enough that routing
+		// bends onto it from a couple of tiles away, which is the only way a road can matter when
+		// nothing tells a body to prefer one.
+		//
+		// Cheap and quick on purpose: a road is bought by the dozen, so the per-tile price has to
+		// suit a network rather than a landmark. buildSeconds is *ideal* effort — an untrained settler
+		// works at 0.15, so 6 here is about 40 seconds of one settler's afternoon per tile, and a
+		// ten-tile road is an evening's work rather than a week's. All three numbers are seed tuning
+		// (VISION #10).
+		{
+			displayName: 'Road',
+			icon: 'road',
+			buildSeconds: 6,
+			housingCapacity: 0,
+			movementCost: 0.4
+		}
 	])
 	// Keyed on the name, so re-running against a live world retunes the row a player's
 	// buildings already point at rather than making a second one beside it.
@@ -76,7 +94,8 @@ const buildingTypes = await db
 		set: {
 			icon: sql`excluded.icon`,
 			buildSeconds: sql`excluded.build_seconds`,
-			housingCapacity: sql`excluded.housing_capacity`
+			housingCapacity: sql`excluded.housing_capacity`,
+			movementCost: sql`excluded.movement_cost`
 		}
 	})
 	.returning();
@@ -284,7 +303,11 @@ const COSTS = [
 	{ building: 'Stone wall', resource: 'Wood', quantity: 4 },
 	// The School is priced in Wood alone — reachable bare-handed from the start, so the path to
 	// specialists never strands (the winnability check below proves it).
-	{ building: 'School', resource: 'Wood', quantity: 15 }
+	{ building: 'School', resource: 'Wood', quantity: 15 },
+	// Per *tile*, and a network is dozens of them: 2 Wood is a road you lay as you go rather than
+	// save up for. Wood rather than Stone deliberately — Stone is gated behind a Quarry, and roads
+	// should be something a hamlet can do on its first afternoon.
+	{ building: 'Road', resource: 'Wood', quantity: 2 }
 ];
 await db
 	.insert(buildingCost)

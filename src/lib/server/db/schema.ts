@@ -46,6 +46,15 @@ export const buildingType = pgTable('building_type', {
 	// room opens, people arrive. A column, not a constant, so "a dorm holds more" is a row
 	// edit (VISION #10), and so the cap is one relational SUM rather than a rule in code.
 	housingCapacity: integer('housing_capacity').notNull().default(0),
+	// What this building does to the ground it stands on: the movement cost a route pays to cross
+	// that tile, replacing the terrain's own. Null — every type but a Road — means it changes
+	// nothing, and a House is as slow to walk past as the meadow under it.
+	//
+	// This is the whole of what a road *is*. Routing already prefers cheap tiles, so a tile made
+	// cheap is a tile bodies choose to walk on, and no rule anywhere says "follow the road".
+	// A column rather than a constant so a paved road, a towpath or a bridge are row edits
+	// (VISION #10), and so the number is tunable against travel times in a live world.
+	movementCost: real('movement_cost'),
 	// A realm-wide build prerequisite: this type can't be placed until the player owns one of
 	// the referenced type *anywhere* (a Stone wall needs a Quarry standing). Distinct from the
 	// tile-local gate on resource.requiresBuildingTypeId (a Quarry on *this* outcrop before
@@ -81,14 +90,29 @@ export const building = pgTable(
 		// (better work degrades slower) and crafting (a workshop's quality feeds its output), both
 		// their own later epics. Captured now because it cannot be reconstructed afterwards: the
 		// operation that knows it is deleted the moment the building exists.
-		quality: real('quality')
+		quality: real('quality'),
+		// Which arms a road draws, as a bitmask (N 1, E 2, S 4, W 8) — the player's override of the
+		// shape derived from its neighbours. Null, and every building that is not a road, means
+		// "work it out from what is next door", which is the ordinary case.
+		//
+		// Purely how it looks. A road tile is cheap to cross in every direction whatever this says,
+		// because routing prices tiles rather than the edges between them — a junction set to N/S
+		// still carries a body east. Rendering intersects it with the live neighbours, so an arm can
+		// only ever be *hidden*, never invented, and a stored mask that later loses its road heals
+		// itself instead of pointing at nothing.
+		roadMask: integer('road_mask')
 	},
 	// ponytail: scoped by player_id so each visitor gets an isolated sandbox on the shared
 	// map — see VISION #4's interim override. This REVERSES the original rule (a tile is a
 	// physical place; whoever builds there first holds it), which is still the intended end
 	// state. Drop player_id from this index and from the occupancy checks in world.server.ts
 	// to restore it, once players are meant to see each other.
-	(t) => [uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y)]
+	(t) => [
+		uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y),
+		// Four bits, so a mask outside 0–15 cannot be written. The client only ever sends a subset of
+		// a tile's real neighbours, but this is the wire's edge and the wire is not the client's.
+		check('building_road_mask_range', sql`${t.roadMask} IS NULL OR ${t.roadMask} BETWEEN 0 AND 15`)
+	]
 );
 
 // The action-skills a body can have — Foraging, Woodcutting, and so on. Global catalog,

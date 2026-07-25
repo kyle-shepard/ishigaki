@@ -31,6 +31,22 @@
 			<path d="M-5.5 -6.5 L0.5 -9 L1.5 -3.5 Z" fill="#fff" fill-opacity=".22" />
 		</g>
 
+		<!-- A road is drawn, not stamped: the hub always, plus one arm per side it joins, each rotated
+		     about the tile's centre. Two shapes instead of the sixteen symbols a mask-per-sprite sheet
+		     would need — and the shape of a junction is then a *rule* rather than fifteen drawings
+		     that have to agree with each other. Arms overlap the hub deliberately, so a corner reads
+		     as one continuous surface rather than two pieces meeting.
+		     Rutted dirt: two wheel tracks in a lighter bed, which is what reads as a road at 32px. -->
+		<g id="p-road-arm">
+			<rect x="10" y="-1" width="12" height="18" fill="#a8926f" />
+			<g stroke="#8a7454" stroke-width="1.4">
+				<path d="M13.5 0v16M18.5 0v16" />
+			</g>
+		</g>
+		<g id="p-road-hub">
+			<rect x="10" y="10" width="12" height="12" fill="#a8926f" />
+		</g>
+
 		<symbol id="i-meadow" viewBox="0 0 32 32">
 			<g fill="none" stroke="#7ba84e" stroke-width="1.6" stroke-linecap="round">
 				<path d="M8 26v-4M5.5 26l1.6-3.2M10.5 26L8.9 22.8" />
