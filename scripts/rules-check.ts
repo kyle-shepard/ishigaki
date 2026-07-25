@@ -151,30 +151,46 @@ check(
 	[400, 'TILE_OCCUPIED']
 );
 
-// Terrain has to cost time, not just look different. Both legs are the same distance from the
+// Terrain has to change the route, not just cost time. Both legs are the same distance from the
 // settlers' start row — 4 across and 9 up, mirrored either side of it — so distance is held
-// constant and only the ground differs: the western one crosses five tiles of the authored lake,
-// the eastern one is open ground the whole way. The durations come off the public payload —
-// asserting through psql what the wire already exposes would be testing round the back.
-const legs: Record<string, number> = {};
+// constant and only the ground differs: the authored lake lies between the start and the western
+// one, and the eastern one is open ground. Both the durations and the routes come off the public
+// payload — asserting through psql what the wire already exposes would be testing round the back.
+const legs: Record<string, { seconds: number; wet: number; steps: number }> = {};
 for (const [x, y, label] of [
 	[13, 2, 'dry'],
 	[5, 2, 'wet']
 ] as const) {
 	// A fresh sandbox per leg: the same body has to depart from the same tile both times.
 	cookie = '';
-	await api('/api/world');
+	const fresh = await api('/api/world');
 	const r = await order(x, y, free);
 	const op = r.body.operations?.[0];
 	if (!op) throw new Error(`order (${x},${y}) was refused: ${JSON.stringify(r.body)}`);
-	// The travel leg is per-worker now — each member of a crew leaves from their own tile. One
-	// worker on this order, so its arrival *is* the leg.
-	legs[label] = (Date.parse(op.workers[0].arrivesAt) - Date.parse(op.startedAt)) / 1000;
+	// The route as walked, off the payload — the same array the client draws the body along.
+	const w = op.workers[0];
+	const g = fresh.body.gridSize;
+	const water = fresh.body.terrainTypes.find(
+		(t: { displayName: string }) => t.displayName === 'Water'
+	).id;
+	legs[label] = {
+		seconds: (Date.parse(w.arrivesAt) - Date.parse(op.startedAt)) / 1000,
+		wet: w.path.filter((i: number) => fresh.body.terrain[i] === water).length,
+		steps: w.path.length
+	};
 }
-// A ratio, not the literals — the spread survives future cost tuning, the numbers wouldn't.
+// Nobody swims. This is what routing bought, and it is the assertion that would have been
+// impossible to write before: the destination beyond the lake is reached without a single tile of
+// water under anyone's feet. It used to be measured the other way round — a body ploughing straight
+// through five tiles of lake, three times slower for it.
+check('the route to the far shore crosses no water at all', legs.wet.wet, 0);
+check('the dry leg crosses no water either, and never did', legs.dry.wet, 0);
+// The detour is still a real cost: going round takes more steps and more time than the same
+// distance over open ground. A ratio would be wrong here — walking around a lake is not three
+// times anything, it is just longer.
 check(
-	`crossing the lake (${legs.wet}s) costs 3x+ the same distance over land (${legs.dry}s)`,
-	legs.wet > legs.dry * 3,
+	`going round the lake (${legs.wet.seconds}s, ${legs.wet.steps} steps) costs more than open ground (${legs.dry.seconds}s, ${legs.dry.steps} steps)`,
+	legs.wet.seconds > legs.dry.seconds && legs.wet.steps > legs.dry.steps,
 	true
 );
 

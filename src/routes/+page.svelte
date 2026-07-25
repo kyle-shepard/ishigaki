@@ -388,28 +388,21 @@
 	// An unknown key resolves to no symbol and draws nothing — a tile missing its art, not a
 	// broken page.
 	const typeIcon = (id: number) => buildingTypeById.get(id)?.icon ?? '';
-	// Each member of a crew walks their own leg — from their own tile, arriving at their own time —
-	// so a travel leg is composed per worker rather than read off the operation.
+	// Each member of a crew walks their own route — from their own tile, their own way, arriving at
+	// their own time — so a travel leg is composed per worker rather than read off the operation.
 	type Op = WorldPayload['operations'][number];
 	function legFor(op: Op, characterId: number): TravelLeg | undefined {
 		const w = op.workers.find((w) => w.characterId === characterId);
 		// A queued build has neither: nobody is walking anywhere yet.
 		if (!w || op.startedAt === null) return undefined;
-		return {
-			originX: w.originX,
-			originY: w.originY,
-			destX: op.destX,
-			destY: op.destY,
-			startedAt: op.startedAt!,
-			travelDoneAt: w.arrivesAt
-		};
+		return { path: w.path, startedAt: op.startedAt, travelDoneAt: w.arrivesAt };
 	}
 	// A character with an in-progress operation is walking or building; its stored tile is
 	// where it left from, so the live position comes from the operation instead.
 	function at(c: { id: number; x: number; y: number }) {
 		const op = opFor(c.id);
 		const leg = op && legFor(op, c.id);
-		return leg ? positionAt(leg, nowMs) : c;
+		return leg ? positionAt(leg, nowMs, GRID_SIZE) : c;
 	}
 	const professionName = $derived(
 		new Map(world?.professions.map((p) => [p.id, p.displayName]) ?? [])

@@ -28,8 +28,8 @@ import {
 	pickName,
 	population,
 	rollStats,
+	route,
 	skillValue,
-	travelSeconds,
 	type EstimateResponse,
 	type OrderReason,
 	type WorldPayload
@@ -552,11 +552,7 @@ async function startQueuedBuilds(tx: Tx, playerId: number): Promise<void> {
 			buildSecondsOf.get(op.buildingTypeId!)!,
 			op.destX,
 			op.destY,
-			(cx, cy) => {
-				const g = grid.get(cy * GRID_SIZE + cx);
-				if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
-				return g.movementCost;
-			}
+			movementCostIn(grid)
 		);
 		await tx
 			.update(operation)
@@ -639,6 +635,24 @@ async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 }
 
 type RankedWorker = { character: typeof character.$inferSelect; multiplier: number };
+
+/**
+ * What `route` charges per tile, read off a loaded grid. Written once because all three journeys —
+ * a build crew, a gather, a training — must be priced by the same ground; three inline copies of
+ * this lookup was three chances for one of them to route differently.
+ *
+ * A missing tile is a corrupt grid, not a game rule: the seed writes every tile, so a hole means
+ * the map was never seeded (the same reading `readWorld` gives it).
+ */
+function movementCostIn(
+	grid: Awaited<ReturnType<typeof loadGrid>>
+): (x: number, y: number) => number {
+	return (x, y) => {
+		const g = grid.get(y * GRID_SIZE + x);
+		if (!g) throw new Error(`no tile row at (${x}, ${y}) — run \`npm run seed\``);
+		return g.movementCost;
+	};
+}
 
 /**
  * Whether an order restricted to `allowed` will take this body. Null or empty is no restriction;
@@ -765,9 +779,9 @@ export type EstimateResult =
 
 /**
  * The grid a build order is judged against: what every tile is made of, keyed the same
- * row-major way the wire payload is. One 256-row read serves both the destination's
- * buildability and the cost of every tile the trip crosses — a point query plus a path query
- * would be two reads over the same rows.
+ * row-major way the wire payload is. One read of the whole grid serves both the destination's
+ * buildability and the cost of every tile a route might cross — and routing genuinely needs all
+ * of them, since it does not know which way it is going until it has looked.
  */
 async function loadGrid(tx: Tx): Promise<
 	Map<
@@ -819,10 +833,15 @@ function solveCrew(
 	destY: number,
 	cost: (x: number, y: number) => number
 ): { crew: BuildPlan['crew']; seconds: number | null; quality: number | null } {
-	const arrivals = crew.map((m) =>
-		travelSeconds(m.character.x, m.character.y, destX, destY, m.character.speed, cost)
+	// One route each: they leave from their own tiles, so they each pick their own way there.
+	const routes = crew.map((m) =>
+		route(m.character.x, m.character.y, destX, destY, m.character.speed, cost, GRID_SIZE)
 	);
-	const members = crew.map((m, i) => ({ ...m, arrivesAt: arrivals[i] }));
+	const members = crew.map((m, i) => ({
+		...m,
+		arrivesAt: routes[i].seconds,
+		path: routes[i].path
+	}));
 	if (members.length === 0) return { crew: members, seconds: null, quality: null };
 	const { seconds, quality } = crewBuild(
 		members.map((m) => ({ multiplier: m.multiplier, arrivesAtSeconds: m.arrivesAt })),
@@ -834,7 +853,13 @@ function solveCrew(
 /** A build as it *would* happen: who goes, how long it takes, how well it comes out. */
 export type BuildPlan = {
 	/** Empty when nobody qualifies — the order waits, and starts itself when someone frees. */
-	crew: { character: typeof character.$inferSelect; multiplier: number; arrivesAt: number }[];
+	crew: {
+		character: typeof character.$inferSelect;
+		multiplier: number;
+		arrivesAt: number;
+		/** The route this body walks — stored on the membership row, see operation_worker.path. */
+		path: number[];
+	}[];
 	/** Whole seconds from the order to the finished building, travel included. Null while it waits. */
 	seconds: number | null;
 	quality: number | null;
@@ -999,13 +1024,7 @@ async function planBuild(
 	// Every member walks their own leg, from their own tile — so a crew necessarily arrives
 	// staggered, and each arrival is already known here. The grid loaded for the buildable
 	// check is the same one the paths are priced against: one read, many uses.
-	const solved = solveCrew(
-		crew,
-		type.buildSeconds,
-		x,
-		y,
-		(cx, cy) => groundAt(cx, cy).movementCost
-	);
+	const solved = solveCrew(crew, type.buildSeconds, x, y, movementCostIn(grid));
 
 	return {
 		ok: true,
@@ -1025,7 +1044,7 @@ async function planBuild(
 }
 
 /**
- * Writes a crew's membership rows, each with its own origin and its own arrival. Every timestamp is
+ * Writes a crew's membership rows, each with its own route and its own arrival. Every timestamp is
  * computed by Postgres, so the client's interpolation is exact by construction — Node's clock never
  * stamps anything.
  */
@@ -1035,8 +1054,7 @@ async function insertCrew(tx: Tx, operationId: number, crew: BuildPlan['crew']):
 			operationId,
 			characterId: m.character.id,
 			qualityMultiplier: m.multiplier,
-			originX: m.character.x,
-			originY: m.character.y,
+			path: m.path,
 			arrivesAt: sql`now() + ${`${m.arrivesAt} seconds`}::interval`
 		}))
 	);
@@ -1218,11 +1236,8 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		const idle = pick.character;
 
 		const grid = await loadGrid(tx);
-		const travel = travelSeconds(idle.x, idle.y, x, y, idle.speed, (cx, cy) => {
-			const g = grid.get(cy * GRID_SIZE + cx);
-			if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
-			return g.movementCost;
-		});
+		const walk = route(idle.x, idle.y, x, y, idle.speed, movementCostIn(grid), GRID_SIZE);
+		const travel = walk.seconds;
 		const [op] = await tx
 			.insert(operation)
 			.values({
@@ -1246,8 +1261,7 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 			operationId: op.id,
 			characterId: idle.id,
 			qualityMultiplier: pick.multiplier,
-			originX: idle.x,
-			originY: idle.y,
+			path: walk.path,
 			arrivesAt: sql`now() + ${`${travel} seconds`}::interval`
 		});
 
@@ -1315,11 +1329,8 @@ export async function assignTraining(
 		if (!settler) return { ok: false, reason: 'NO_IDLE_SETTLER' };
 
 		const grid = await loadGrid(tx);
-		const travel = travelSeconds(settler.x, settler.y, x, y, settler.speed, (cx, cy) => {
-			const g = grid.get(cy * GRID_SIZE + cx);
-			if (!g) throw new Error(`no tile row at (${cx}, ${cy}) — run \`npm run seed\``);
-			return g.movementCost;
-		});
+		const walk = route(settler.x, settler.y, x, y, settler.speed, movementCostIn(grid), GRID_SIZE);
+		const travel = walk.seconds;
 		const [op] = await tx
 			.insert(operation)
 			.values({
@@ -1340,8 +1351,7 @@ export async function assignTraining(
 			characterId: settler.id,
 			// A training has no workmanship of its own — the settler is the work, not the worker.
 			qualityMultiplier: 1,
-			originX: settler.x,
-			originY: settler.y,
+			path: walk.path,
 			arrivesAt: sql`now() + ${`${travel} seconds`}::interval`
 		});
 
@@ -1618,8 +1628,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			completeAt: o.completeAt?.toISOString() ?? null,
 			workers: (crews.get(o.id) ?? []).map((w) => ({
 				characterId: w.characterId,
-				originX: w.originX,
-				originY: w.originY,
+				path: w.path,
 				arrivesAt: w.arrivesAt.toISOString()
 			}))
 		}))

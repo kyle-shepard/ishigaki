@@ -508,10 +508,18 @@ export const operationWorker = pgTable(
 			.references(() => character.id),
 		/** This body's own workmanship — see operation.quality_multiplier for the combined one. */
 		qualityMultiplier: real('quality_multiplier').notNull(),
-		/** When this body reaches the site. Its travel leg is (origin_x, origin_y) → the op's dest. */
+		/** When this body reaches the site, walking `path`. */
 		arrivesAt: timestamp('arrives_at', { withTimezone: true }).notNull(),
-		originX: integer('origin_x').notNull(),
-		originY: integer('origin_y').notNull()
+		// The route this body walks, as row-major tile indices — origin first, the operation's
+		// destination last. Replaced origin_x/origin_y, which described a straight line: travel picks
+		// its way around lakes now, so where it *started* no longer says where it goes.
+		//
+		// Stored rather than re-derived on read, for the same reason quality is snapshotted onto a
+		// building: it is the route the arrival time was solved from, and re-routing on every read
+		// would let a road built mid-journey silently change a trip already under way. An array
+		// because it is only ever read whole — a row per step would buy relational querying nobody
+		// does (same argument as operation.allowed_profession_ids).
+		path: integer('path').array().notNull()
 	},
 	(t) => [
 		primaryKey({ columns: [t.operationId, t.characterId] }),

@@ -177,11 +177,15 @@ export type WorldPayload = {
 		// worker to free. It has no crew, so it has no travel legs to draw either.
 		startedAt: string | null;
 		completeAt: string | null;
-		// The crew. One entry for a gather or a training; a build may have several. Origin and
-		// arrival are per-body because members leave from their own tiles — the client composes
-		// one TravelLeg per worker from `{originX, originY, op.destX, op.destY, op.startedAt,
-		// travelDoneAt: arrivesAt}`.
-		workers: { characterId: number; originX: number; originY: number; arrivesAt: string }[];
+		// The crew. One entry for a gather or a training; a build may have several. The route and the
+		// arrival are per-body because members leave from their own tiles and walk their own way —
+		// the client composes one TravelLeg per worker from `{path, op.startedAt, travelDoneAt:
+		// arrivesAt}`.
+		//
+		// `path` is the route as walked (row-major tile indices, origin first), stored rather than
+		// recomputed: the body must be drawn on the route the server *timed it on*, and a road built
+		// while it is walking must not reroute it retroactively.
+		workers: { characterId: number; path: number[]; arrivesAt: string }[];
 	}[];
 };
 
@@ -538,76 +542,183 @@ export function crewBuild(
 	return { seconds: t, quality };
 }
 
+// A trip, as walked: the tiles crossed and how long the whole thing takes. `path` is row-major tile
+// indices, origin first and destination last, so it is one flat array of small ints on the wire and
+// one lookup away from coordinates on either side.
+export type Route = { path: number[]; seconds: number };
+
 export type TravelLeg = {
-	originX: number;
-	originY: number;
-	destX: number;
-	destY: number;
+	/** Row-major tile indices — see `Route.path`. */
+	path: number[];
 	startedAt: string;
 	travelDoneAt: string;
 };
 
+// A binary min-heap of [cost, node], private to `route`. A sorted-array queue would make Dijkstra
+// O(n²) over 2304 tiles, which is measurable on an estimate that re-quotes as you type.
+function heapPush(heap: [number, number][], item: [number, number]): void {
+	heap.push(item);
+	let i = heap.length - 1;
+	while (i > 0) {
+		const parent = (i - 1) >> 1;
+		if (heap[parent][0] <= heap[i][0]) break;
+		[heap[parent], heap[i]] = [heap[i], heap[parent]];
+		i = parent;
+	}
+}
+
+function heapPop(heap: [number, number][]): [number, number] {
+	const top = heap[0];
+	const last = heap.pop()!;
+	if (heap.length) {
+		heap[0] = last;
+		let i = 0;
+		for (;;) {
+			const left = 2 * i + 1;
+			const right = left + 1;
+			let small = i;
+			if (left < heap.length && heap[left][0] < heap[small][0]) small = left;
+			if (right < heap.length && heap[right][0] < heap[small][0]) small = right;
+			if (small === i) break;
+			[heap[small], heap[i]] = [heap[i], heap[small]];
+			i = small;
+		}
+	}
+	return top;
+}
+
+/**
+ * The route a body actually walks, and how long it takes — cheapest total time, not shortest
+ * distance. This is what makes terrain a *decision* rather than a tax: a worker walks around a lake
+ * instead of swimming it, takes the pass rather than the peak, and (once roads exist) prefers the
+ * road because a road is a cheap tile.
+ *
+ * It replaced a straight line sampled for cost. That model could only ever charge for the ground
+ * between two points; it could not choose different ground, so no road anybody built would have been
+ * walked on unless it happened to lie along the line.
+ *
+ * Dijkstra over the tile grid, eight-way, with each step costing its own length (1 or √2) times the
+ * mean of the two tiles' movement costs, over `speed`. Averaging the pair rather than charging the
+ * tile you land on is what keeps A→B and B→A identical — the same reason the old midpoint sampling
+ * was symmetric, and the estimate and the order it turns into are two separate calls that must agree
+ * exactly.
+ *
+ * No heuristic, deliberately: A* would want a lower bound on any tile's cost, and the day a road or
+ * a bridge undercuts that bound the routes go quietly suboptimal. 2304 tiles is small enough that
+ * the exact answer is cheap — measured at 0.06 ms for a trip near the hamlet and 0.44 ms corner to
+ * corner, against an estimate that re-quotes per keystroke — and it early-exits the moment the
+ * destination is settled. Add the heuristic when the map is big enough for that to stop being true.
+ *
+ * `cost` takes *integer tile coordinates* and returns that tile's movement cost. Required rather than
+ * defaulted, because a default of 1 would hand terrain-free timings back to a caller that forgot to
+ * pass terrain, silently.
+ *
+ * ponytail: every tile is passable — expensive, never forbidden — which is why this has no
+ * unreachable case to report. An impassable tile (a cliff, a wall) would need `cost` to return
+ * Infinity and this to answer "no route" rather than throwing.
+ */
+export function route(
+	originX: number,
+	originY: number,
+	destX: number,
+	destY: number,
+	speed: number,
+	cost: (x: number, y: number) => number,
+	gridSize: number
+): Route {
+	const start = originY * gridSize + originX;
+	const goal = destY * gridSize + destX;
+	// Ordering a build on the body's own tile: a one-tile path, no time. The client's travelFraction
+	// reads a zero-length leg as arrived.
+	if (start === goal) return { path: [start], seconds: 0 };
+
+	const cells = gridSize * gridSize;
+	const best = new Float64Array(cells).fill(Infinity);
+	const cameFrom = new Int32Array(cells).fill(-1);
+	const settled = new Uint8Array(cells);
+	best[start] = 0;
+	const heap: [number, number][] = [[0, start]];
+
+	while (heap.length) {
+		const [soFar, node] = heapPop(heap);
+		// The stale copy of a node whose cost improved after it was pushed.
+		if (settled[node]) continue;
+		settled[node] = 1;
+		if (node === goal) break;
+
+		const x = node % gridSize;
+		const y = (node - x) / gridSize;
+		const here = cost(x, y);
+		for (let dy = -1; dy <= 1; dy++) {
+			for (let dx = -1; dx <= 1; dx++) {
+				if (!dx && !dy) continue;
+				const nx = x + dx;
+				const ny = y + dy;
+				if (nx < 0 || ny < 0 || nx >= gridSize || ny >= gridSize) continue;
+				const next = ny * gridSize + nx;
+				if (settled[next]) continue;
+				const step = ((dx && dy ? Math.SQRT2 : 1) * ((here + cost(nx, ny)) / 2)) / speed;
+				if (soFar + step >= best[next]) continue;
+				best[next] = soFar + step;
+				cameFrom[next] = node;
+				heapPush(heap, [best[next], next]);
+			}
+		}
+	}
+
+	// Unreachable is impossible while every tile is passable (see the ponytail note), so this is a
+	// corrupt grid rather than a game rule — the same reading `readWorld` gives a hole in the map.
+	if (!Number.isFinite(best[goal]))
+		throw new Error(`no route from (${originX}, ${originY}) to (${destX}, ${destY})`);
+
+	const path = [goal];
+	for (let node = cameFrom[goal]; node !== -1; node = cameFrom[node]) path.push(node);
+	path.reverse();
+	return { path, seconds: Math.ceil(best[goal]) };
+}
+
 /** How far along the travel leg we are at `nowMs`, clamped to [0, 1]. */
-export function travelFraction(op: TravelLeg, nowMs: number): number {
-	const start = Date.parse(op.startedAt);
-	const end = Date.parse(op.travelDoneAt);
+export function travelFraction(leg: TravelLeg, nowMs: number): number {
+	const start = Date.parse(leg.startedAt);
+	const end = Date.parse(leg.travelDoneAt);
 	// Ordering a build on the character's own tile gives a zero-length leg — treat as arrived
 	// rather than dividing by zero.
 	if (end <= start) return 1;
 	return Math.min(1, Math.max(0, (nowMs - start) / (end - start)));
 }
 
-/** Derived position — the server never stores or ticks intermediate positions. */
-export function positionAt(op: TravelLeg, nowMs: number): { x: number; y: number } {
-	const f = travelFraction(op, nowMs);
-	return {
-		x: op.originX + (op.destX - op.originX) * f,
-		y: op.originY + (op.destY - op.originY) * f
-	};
-}
-
 /**
- * How long the trip takes, weighted by what it crosses. `cost` takes *integer tile
- * coordinates* and returns that tile's movement cost; it is required rather than defaulted,
- * because a default of 1 would hand terrain-free timings back to a caller that forgot to
- * pass terrain, silently.
+ * Where a body is right now: how far along its route the clock has carried it. Derived, never
+ * stored — the server does not tick intermediate positions.
  *
- * Sampling is the midpoint rule — sample points sit at the centres of n equal sub-segments,
- * never at the endpoints. Two properties fall out for free: the sample set is invariant
- * under t → 1−t, so A→B and B→A always agree; and an all-cost-1 path reduces exactly to the
- * old `ceil(dist / speed)`. Neither endpoint is special-cased — the character stands *on*
- * its origin tile, so counting half of it is right.
- *
- * Rounding (not flooring) each sample to a tile makes integer coordinates tile *centres*,
- * which is what that half-tile claim means. Flooring would put the character on a corner and
- * give the origin tile no samples at all when it departs along an axis.
- *
- * ponytail: uniform resolution, ~4 samples per tile — so the cost is per tile of distance, not
- * per map, and 48×48 changed nothing here. Four samples per tile still cannot skip a one-tile
- * feature; a *sub*-tile one (a river drawn thinner than a tile) is what would need revisiting.
+ * ponytail: spread evenly along the route by *distance*, not by each tile's movement cost. So a
+ * route that has to cross one slow tile draws the body a little ahead of itself going in and a
+ * little behind coming out — it still leaves and arrives on the second. The exact version needs
+ * every tile's movement cost on the wire (it is deliberately not there today) and the drift is
+ * small precisely because the router already avoided the expensive ground.
  */
-export function travelSeconds(
-	originX: number,
-	originY: number,
-	destX: number,
-	destY: number,
-	speed: number,
-	cost: (x: number, y: number) => number
-): number {
-	const dist = Math.hypot(destX - originX, destY - originY);
-	// Ordering a build on the character's own tile — same case travelFraction guards.
-	if (dist === 0) return 0;
+export function positionAt(
+	leg: TravelLeg,
+	nowMs: number,
+	gridSize: number
+): { x: number; y: number } {
+	const points = leg.path.map((i) => ({ x: i % gridSize, y: Math.floor(i / gridSize) }));
+	if (points.length === 1) return points[0];
 
-	const n = Math.ceil(dist * 4);
-	let total = 0;
-	for (let i = 0; i < n; i++) {
-		const t = (i + 0.5) / n;
-		total += cost(
-			Math.round(originX + (destX - originX) * t),
-			Math.round(originY + (destY - originY) * t)
-		);
+	const steps = points.slice(1).map((p, i) => Math.hypot(p.x - points[i].x, p.y - points[i].y));
+	let want = steps.reduce((sum, s) => sum + s, 0) * travelFraction(leg, nowMs);
+	for (let i = 0; i < steps.length; i++) {
+		if (want > steps[i] && i < steps.length - 1) {
+			want -= steps[i];
+			continue;
+		}
+		const t = steps[i] > 0 ? Math.min(1, want / steps[i]) : 1;
+		return {
+			x: points[i].x + (points[i + 1].x - points[i].x) * t,
+			y: points[i].y + (points[i + 1].y - points[i].y) * t
+		};
 	}
-	return Math.ceil((dist * (total / n)) / speed);
+	return points[points.length - 1];
 }
 
 /**

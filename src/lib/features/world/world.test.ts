@@ -16,15 +16,20 @@ import {
 	skillValue,
 	STAT_MAX,
 	STAT_MIN,
-	travelFraction,
-	travelSeconds
+	route,
+	travelFraction
 } from './world.ts';
 
+// A 16-tile test grid, small enough to reason about by hand. The routing tests below use it rather
+// than the real map: an invariant that needs the seed to hold is an invariant nobody can read.
+const G = 16;
+const idx = (x: number, y: number) => y * G + x;
+const tiles = (path: number[]) => path.map((i) => [i % G, Math.floor(i / G)]);
+
 const leg = (startedAt: string, travelDoneAt: string) => ({
-	originX: 0,
-	originY: 0,
-	destX: 10,
-	destY: 20,
+	// Straight down the map, ten tiles: (0,0) → (10,20) is no longer expressible on a 16-wide grid,
+	// and a straight run is what the fraction tests are about anyway.
+	path: [idx(0, 0), idx(0, 5), idx(0, 10)],
 	startedAt,
 	travelDoneAt
 });
@@ -40,39 +45,72 @@ test('fraction is 0 at departure and clamps below', () => {
 
 test('fraction interpolates mid-travel and clamps above', () => {
 	assert.equal(travelFraction(leg(T0, T10), now + 2500), 0.25);
-	assert.deepEqual(positionAt(leg(T0, T10), now + 5000), { x: 5, y: 10 });
+	assert.deepEqual(positionAt(leg(T0, T10), now + 5000, G), { x: 0, y: 5 });
 	assert.equal(travelFraction(leg(T0, T10), now + 99000), 1);
 });
 
 test('a zero-length leg means arrived, not a divide by zero', () => {
 	assert.equal(travelFraction(leg(T0, T0), now), 1);
-	assert.deepEqual(positionAt(leg(T0, T0), now), { x: 10, y: 20 });
+	assert.deepEqual(positionAt(leg(T0, T0), now, G), { x: 0, y: 10 });
+});
+
+test('a body walks the corners of its route, not the straight line through them', () => {
+	// An L: five east, then five south. Halfway in time is halfway along the *route*, which is the
+	// corner itself — a straight-line reading would have put it out in the middle of the L instead.
+	const bend = { path: [idx(0, 0), idx(5, 0), idx(5, 5)], startedAt: T0, travelDoneAt: T10 };
+	assert.deepEqual(positionAt(bend, now + 5000, G), { x: 5, y: 0 });
+	assert.deepEqual(positionAt(bend, now + 2500, G), { x: 2.5, y: 0 });
+	assert.deepEqual(positionAt(bend, now + 7500, G), { x: 5, y: 2.5 });
 });
 
 const meadow = () => 1;
-// A lake across the middle rows, matching the seed layout's shape.
-const lake = (_x: number, y: number) => (y >= 3 && y <= 7 ? 8 : 1);
+// A lake across the middle rows with a dry margin at each edge, so there is always a way round.
+const lake = (x: number, y: number) => (y >= 3 && y <= 7 && x >= 2 && x <= 13 ? 8 : 1);
 
-test('flat cost-1 terrain reproduces the pre-terrain formula exactly', () => {
-	// The observed tracer trip before terrain existed: hypot(13,13)/0.5 = 36.77 → 37.
-	assert.equal(travelSeconds(1, 1, 14, 14, 0.5, meadow), 37);
-	assert.equal(travelSeconds(0, 0, 3, 4, 1, meadow), 5);
+test('flat terrain routes in a straight line, at the old cost', () => {
+	// Eight-way movement on uniform ground: a pure diagonal is hypot, an axis run is its length.
+	assert.equal(route(1, 1, 8, 8, 0.5, meadow, G).seconds, Math.ceil(Math.hypot(7, 7) / 0.5));
+	assert.equal(route(0, 0, 0, 4, 1, meadow, G).seconds, 4);
+	// Straight means every step is one tile and there are no more of them than the distance.
+	assert.equal(route(1, 1, 8, 8, 0.5, meadow, G).path.length, 8);
 });
 
-test('crossing costly terrain is slower than the same distance over meadow', () => {
-	const dry = travelSeconds(7, 9, 14, 9, 0.5, lake);
-	const wet = travelSeconds(7, 9, 7, 2, 0.5, lake);
-	assert.equal(dry, 14);
-	assert.equal(wet, 84);
-	assert.ok(wet > dry * 3, `${wet}s vs ${dry}s is not a perceptible difference`);
+test('a body walks around costly ground rather than through it', () => {
+	// The whole point of routing. Straight from (7,1) to (7,9) is eight tiles of lake; going round
+	// the western shore is longer in distance and far cheaper in time.
+	const wet = route(7, 1, 7, 9, 0.5, lake, G);
+	const crossed = tiles(wet.path).filter(([x, y]) => lake(x, y) > 1);
+	assert.equal(crossed.length, 0, `walked through ${crossed.length} tiles of lake`);
+	// And it is still slower than the same trip over open ground — the detour costs something.
+	assert.ok(wet.seconds > route(7, 1, 7, 9, 0.5, meadow, G).seconds);
+});
+
+test('a route is a connected chain of single steps from origin to destination', () => {
+	const { path } = route(2, 12, 11, 2, 0.5, lake, G);
+	assert.deepEqual(tiles(path)[0], [2, 12]);
+	assert.deepEqual(tiles(path).at(-1), [11, 2]);
+	for (const [i, [x, y]] of tiles(path).slice(1).entries()) {
+		const [px, py] = tiles(path)[i];
+		assert.ok(
+			Math.abs(x - px) <= 1 && Math.abs(y - py) <= 1,
+			`(${px},${py}) → (${x},${y}) is not one step`
+		);
+	}
 });
 
 test('a trip costs the same in both directions', () => {
-	assert.equal(travelSeconds(3, 12, 11, 2, 0.5, lake), travelSeconds(11, 2, 3, 12, 0.5, lake));
+	// Averaging the two tiles of each step is what buys this; charging the tile you land on would
+	// make A→B and B→A disagree, and the estimate is a separate call from the order it becomes.
+	assert.equal(
+		route(2, 12, 11, 2, 0.5, lake, G).seconds,
+		route(11, 2, 2, 12, 0.5, lake, G).seconds
+	);
 });
 
-test('a zero-length trip is 0 seconds, not NaN', () => {
-	assert.equal(travelSeconds(4, 4, 4, 4, 0.5, lake), 0);
+test('a zero-length trip is 0 seconds on its own tile, not NaN', () => {
+	const here = route(4, 4, 4, 4, 0.5, lake, G);
+	assert.equal(here.seconds, 0);
+	assert.deepEqual(here.path, [idx(4, 4)]);
 });
 
 // Accrual. This is the one mechanic that cannot be verified by watching it — a thirty-day
