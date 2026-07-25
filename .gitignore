@@ -41,3 +41,7 @@ vite.config.ts.timestamp-*
 # Vercel CLI: project link (.vercel) and pulled env (.env.local).
 # .env* is already covered above; .vercel is not.
 .vercel
+
+# Design research: scraped Lands of Lords encyclopedia (scripts/lol-harvest.ts).
+# Someone else's game data — reference only, never ships.
+.lol/
