@@ -1,7 +1,7 @@
 // Run: npm run map — prints the world the seed would write, coloured, with a tile census.
 // No database, no arguments. This is how the generator's thresholds get tuned: change them in
 // worldgen.ts, run this, look at it.
-import { terrainMap } from '../src/lib/features/world/worldgen.ts';
+import { MAP_SEED, START, terrainMap } from '../src/lib/features/world/worldgen.ts';
 
 // Rough ANSI stand-ins for each terrain's tile colour, so a lake reads as a lake at a glance.
 const PAINT: Record<string, string> = {
@@ -17,9 +17,23 @@ const PAINT: Record<string, string> = {
 // Plain when piped or when NO_COLOR is set — 2304 escape sequences are unreadable in a file.
 const colour = !!process.stdout.isTTY && !process.env.NO_COLOR;
 const rows = terrainMap();
-for (const row of rows) {
-	console.log(colour ? [...row].map((c) => `${PAINT[c] ?? ''}${c}\x1b[0m`).join('') : row);
-}
+// The starting buildings, overlaid on the terrain rather than counted as it — the census below is
+// about the ground. Seeing where the hamlet landed is half the reason to print the map.
+const marks = new Map([
+	[`${START.house2X},${START.house2Y}`, 'H'],
+	[`${START.hamletX},${START.hamletY}`, 'H'],
+	[`${START.barnX},${START.barnY}`, 'B']
+]);
+rows.forEach((row, y) =>
+	console.log(
+		[...row]
+			.map((c, x) => {
+				const mark = marks.get(`${x},${y}`);
+				return colour ? `${PAINT[c] ?? ''}${mark ?? c}\x1b[0m` : (mark ?? c);
+			})
+			.join('')
+	)
+);
 
 const total = rows.length * rows.length;
 const census = [...rows.join('')].reduce<Record<string, number>>(
@@ -27,7 +41,8 @@ const census = [...rows.join('')].reduce<Record<string, number>>(
 	{}
 );
 console.log(
-	`\n${rows.length}×${rows.length} = ${total} tiles · ` +
+	`\nseed ${MAP_SEED} · hamlet at ${START.hamletX}, ${START.hamletY} · ` +
+		`${rows.length}×${rows.length} = ${total} tiles · ` +
 		Object.entries(census)
 			.sort((a, b) => b[1] - a[1])
 			.map(([c, n]) => `${c} ${n} (${Math.round((n / total) * 100)}%)`)

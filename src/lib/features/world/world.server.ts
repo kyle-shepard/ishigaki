@@ -29,15 +29,17 @@ import {
 	population,
 	rollStats,
 	skillValue,
-	START,
 	travelSeconds,
 	type EstimateResponse,
 	type OrderReason,
 	type WorldPayload
 } from './world';
+// Where a realm opens is a fact about the terrain, so it comes from whatever drew the terrain.
+import { START } from './worldgen';
 
-// START now lives in world.ts beside GRID_SIZE — the seed asserts those tiles are Meadow, and the
-// coordinates were written out in both places until one of them moved.
+// How fast a starting settler walks, in tiles per second. Not part of START, which is a placement
+// and knows nothing about legs.
+const WALK_SPEED = 0.5;
 
 // How many people a realm starts with. An explicit placeholder for real population growth
 // (the People epic). One would mean every build order cancels your only gatherer.
@@ -152,7 +154,7 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 				playerId: p.id,
 				x: START.characterX + i - 1,
 				y: START.characterY,
-				speed: START.speed
+				speed: WALK_SPEED
 			}))
 		);
 		return p.id;
@@ -434,7 +436,7 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 					playerId,
 					x: home.x,
 					y: home.y,
-					speed: START.speed
+					speed: WALK_SPEED
 				}))
 			);
 		if (died > 0) await removeSettlers(tx, playerId, died);

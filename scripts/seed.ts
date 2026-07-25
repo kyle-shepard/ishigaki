@@ -16,8 +16,8 @@ import {
 	terrainType,
 	tile
 } from '../src/lib/server/db/schema.ts';
-import { GRID_SIZE, START } from '../src/lib/features/world/world.ts';
-import { terrainCharAt } from '../src/lib/features/world/worldgen.ts';
+import { GRID_SIZE } from '../src/lib/features/world/world.ts';
+import { START, terrainCharAt } from '../src/lib/features/world/worldgen.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);

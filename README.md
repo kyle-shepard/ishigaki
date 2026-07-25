@@ -15,8 +15,10 @@ castle — is what everything is built on top of.
 Early. Stack is locked (see [VISION.md](VISION.md)): **SvelteKit + PostgreSQL +
 Drizzle**, TypeScript full-stack. The tracer bullet works end to end — you can order a
 building, watch a character walk to the tile, and see it finish. The world is a 48×48
-terrain grid: a hand-authored core around the starting hamlet, generated ground around
-that. Terrain is the epic in progress.
+terrain grid: a hand-authored core in the middle, generated ground around it. The map
+fills the window and pans by dragging; a realm opens where the terrain has grass enough
+for it, which the generator searches for rather than being told. Terrain is the epic in
+progress.
 
 > **Every visitor gets their own private world — for now.** There is no login. A cookie
 > holds a player id, and your first request to the API creates a hamlet and a character

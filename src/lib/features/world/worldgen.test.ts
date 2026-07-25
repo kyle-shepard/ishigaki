@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GRID_SIZE } from './world.ts';
-import { terrainCharAt, terrainMap } from './worldgen.ts';
+import { START, terrainCharAt, terrainMap } from './worldgen.ts';
 
 const CHARS = new Set(['.', 'f', 'w', 'm', 's', 'c', 'i']);
 const map = terrainMap();
@@ -30,6 +30,25 @@ test('the world is somewhere to live, not an ocean or a mountain range', () => {
 	// Every deposit terrain is somewhere. The seed enforces the one that seals the ladder (Stone);
 	// this catches the ones that only make the world duller.
 	for (const c of ['s', 'c', 'i']) assert.ok(census(c) > 0, `no ${c} anywhere on the map`);
+});
+
+test('a realm opens on grass, with two clear tiles on every side', () => {
+	// The rule the start search exists to hold, asserted from the outside: the three buildings, the
+	// settlers' row below them, and a two-tile margin around the lot — all of it meadow. This is the
+	// one that catches a retuned threshold or an edited LAYOUT quietly putting the hamlet in a lake,
+	// which is exactly what a hand-placed constant did before the search replaced it.
+	for (let x = START.hamletX - 3; x <= START.hamletX + 3; x++)
+		for (let y = START.hamletY - 2; y <= START.hamletY + 3; y++) {
+			assert.ok(x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE, `(${x},${y}) is off the map`);
+			assert.equal(terrainCharAt(x, y), '.', `(${x},${y}) beside the hamlet is not grass`);
+		}
+	// The buildings and the settlers are placed relative to the hamlet, so the margin above only
+	// means anything if they really are where it assumes.
+	assert.deepEqual(
+		[START.house2X - START.hamletX, START.barnX - START.hamletX, START.house2Y, START.barnY],
+		[-1, 1, START.hamletY, START.hamletY]
+	);
+	assert.deepEqual([START.characterX, START.characterY], [START.hamletX, START.hamletY + 1]);
 });
 
 test('the authored core sits where the offset says it does', () => {

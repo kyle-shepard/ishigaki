@@ -76,6 +76,54 @@
 		centreOn(x, y);
 	}
 
+	// Take hold of the map and move it. The pane is still an ordinary scroll container — its bars are
+	// hidden in CSS, not its scrolling — so a drag is just its scroll offset moved by the pointer's
+	// delta. No transform and no second coordinate system, which is what keeps every tile's own hit
+	// testing, focus ring and aria label working while the map moves under them.
+	//
+	// Mouse only, deliberately: a touch already pans the pane natively, and handling it here as well
+	// would move the map twice as fast as the finger.
+	// Plain, not $state: it is mutated on every pointermove and nothing renders from it. The cursor
+	// does, so that is a separate boolean rather than a reactive proxy re-firing per mouse move.
+	let pan: { lastX: number; lastY: number; travel: number } | null = null;
+	let panning = $state(false);
+	// True once a drag has actually travelled. Read by the click swallow below — a pan that happens to
+	// end on a tile must not also select it.
+	let dragged = false;
+	// Under this it is a click with an unsteady hand, not a pan.
+	const DRAG_SLOP = 4;
+
+	function panStart(e: PointerEvent) {
+		if (e.button !== 0 || e.pointerType !== 'mouse') return;
+		pan = { lastX: e.clientX, lastY: e.clientY, travel: 0 };
+		panning = true;
+		// Cleared here rather than after the swallow: a drag released outside the map never produces a
+		// click to clear it, and a stale flag would eat the next real one.
+		dragged = false;
+	}
+	function panMove(e: PointerEvent) {
+		if (!pan || !pane) return;
+		const dx = e.clientX - pan.lastX;
+		const dy = e.clientY - pan.lastY;
+		pan.lastX = e.clientX;
+		pan.lastY = e.clientY;
+		pan.travel += Math.hypot(dx, dy);
+		if (pan.travel < DRAG_SLOP) return;
+		dragged = true;
+		// Assigning rather than scrollBy: it clamps at the edges for free and never animates.
+		pane.scrollLeft -= dx;
+		pane.scrollTop -= dy;
+	}
+	function panEnd() {
+		pan = null;
+		panning = false;
+	}
+	function swallowClick(e: MouseEvent) {
+		if (!dragged) return;
+		e.stopPropagation();
+		e.preventDefault();
+	}
+
 	// Open on the hamlet rather than on the map's top-left corner. Not $state: writing it must not
 	// re-run the effect, and nothing renders from it.
 	let centred = false;
@@ -668,7 +716,17 @@
 {#if world}
 	<!-- The map owns the window and pans by scrolling. 48×48 doesn't fit on any screen, and a
 	     viewport that shows the whole world is the one thing a map this size can't be. -->
-	<main class="map-pane" bind:this={pane}>
+	<main
+		class="map-pane"
+		class:panning
+		bind:this={pane}
+		onpointerdown={panStart}
+		onpointermove={panMove}
+		onpointerup={panEnd}
+		onpointercancel={panEnd}
+		onpointerleave={panEnd}
+		onclickcapture={swallowClick}
+	>
 		<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
 			{#each tiles as t, i (t.x + ',' + t.y)}
 				<button
@@ -1077,7 +1135,21 @@
 	.map-pane {
 		position: fixed;
 		inset: var(--header-h) 0 0 0;
+		/* Scrolls, but shows no bars: two grey gutters framing a map you drag is furniture, and the
+		   window is the viewport now. Hidden rather than `overflow: hidden`, because that would kill
+		   the wheel and the keyboard's scroll-into-view along with the bars — this keeps every way of
+		   moving the map except the one nobody wanted to look at. */
 		overflow: auto;
+		scrollbar-width: none;
+		/* A drag across tiles must not start selecting them. */
+		user-select: none;
+		cursor: grab;
+	}
+	.map-pane::-webkit-scrollbar {
+		display: none;
+	}
+	.map-pane.panning {
+		cursor: grabbing;
 	}
 	.grid {
 		position: relative;

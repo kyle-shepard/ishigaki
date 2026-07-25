@@ -15,8 +15,11 @@ const BASE = process.env.RULES_CHECK_URL ?? 'http://localhost:5173';
 // 48×48 world, so it has to be shifted into the coordinates the API speaks. Imported rather than
 // written out: when the map grew, forty hardcoded coordinates here quietly started naming generated
 // ground, and half these checks passed against tiles that were no longer what they claimed.
-import { LAYOUT_OFFSET } from '../src/lib/features/world/worldgen.ts';
+import { LAYOUT_OFFSET, START } from '../src/lib/features/world/worldgen.ts';
 const core = (x: number, y: number) => [x + LAYOUT_OFFSET, y + LAYOUT_OFFSET] as const;
+// And back again, for the few checks that name a tile the *game* chose rather than one the map
+// author did — the hamlet's own tile is derived from the terrain now, not written down.
+const fromWorld = (x: number, y: number) => [x - LAYOUT_OFFSET, y - LAYOUT_OFFSET] as const;
 
 // Every request carries the same cookie, so all cases play in one player's sandbox — the
 // occupancy checks are player-scoped and would read a different world otherwise.
@@ -141,19 +144,24 @@ cookie = '';
 await api('/api/world');
 const oob = await order(99, 0, free);
 check('(99,0) is off the map', [oob.status, oob.body.reason], [400, 'OUT_OF_BOUNDS']);
-const occupied = await order(7, 8, free);
-check('(7,8) holds the hamlet', [occupied.status, occupied.body.reason], [400, 'TILE_OCCUPIED']);
+const occupied = await order(...fromWorld(START.hamletX, START.hamletY), free);
+check(
+	`(${START.hamletX},${START.hamletY}) holds the hamlet`,
+	[occupied.status, occupied.body.reason],
+	[400, 'TILE_OCCUPIED']
+);
 
-// Terrain has to cost time, not just look different. Both legs are 7 tiles from the
-// character's start tile, so distance is held constant and only the ground differs. The
-// durations come off the public payload — asserting through psql what the wire already
-// exposes would be testing round the back.
+// Terrain has to cost time, not just look different. Both legs are the same distance from the
+// settlers' start row — 4 across and 9 up, mirrored either side of it — so distance is held
+// constant and only the ground differs: the western one crosses five tiles of the authored lake,
+// the eastern one is open ground the whole way. The durations come off the public payload —
+// asserting through psql what the wire already exposes would be testing round the back.
 const legs: Record<string, number> = {};
 for (const [x, y, label] of [
-	[14, 9, 'dry'],
-	[7, 2, 'wet']
+	[13, 2, 'dry'],
+	[5, 2, 'wet']
 ] as const) {
-	// A fresh sandbox per leg: the character must depart from (7,9) both times.
+	// A fresh sandbox per leg: the same body has to depart from the same tile both times.
 	cookie = '';
 	await api('/api/world');
 	const r = await order(x, y, free);
@@ -165,7 +173,7 @@ for (const [x, y, label] of [
 }
 // A ratio, not the literals — the spread survives future cost tuning, the numbers wouldn't.
 check(
-	`7 tiles of lake (${legs.wet}s) costs 3x+ the same distance of meadow (${legs.dry}s)`,
+	`crossing the lake (${legs.wet}s) costs 3x+ the same distance over land (${legs.dry}s)`,
 	legs.wet > legs.dry * 3,
 	true
 );
@@ -400,11 +408,13 @@ check(
 	finished ? Math.abs(finished.quality - promised.body.quality) < 1e-6 : 'never finished',
 	true
 );
-// The starting hamlet predates the column, so it is the honest null case: no band, no crash.
-const [hx, hy] = core(7, 8);
+// The starting hamlet predates the column, so it is the honest null case: no band, no crash. Read
+// straight off START — this looks up a tile the *game* chose, not one the map author drew, and a
+// hand-written coordinate here is what crashed this check the day the hamlet moved.
 const hamlet = (await api('/api/world')).body.buildings.find(
-	(b: { x: number; y: number }) => b.x === hx && b.y === hy
+	(b: { x: number; y: number }) => b.x === START.hamletX && b.y === START.hamletY
 );
+if (!hamlet) throw new Error(`no starting hamlet at ${START.hamletX}, ${START.hamletY}`);
 check(
 	'a building raised before quality was recorded reports null, not a number',
 	hamlet.quality,

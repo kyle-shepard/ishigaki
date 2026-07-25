@@ -4,23 +4,8 @@
 // worldgen.ts now — see the note on `LAYOUT` in scripts/seed.ts.
 export const GRID_SIZE = 48;
 
-// Where a new sandbox starts. Every player gets the same coordinates because they never see each
-// other (VISION #4 interim override) — the hamlet, a second House beside it, the barn, and the
-// builders. Shared rather than server-only so the seed can assert these tiles are Meadow: the
-// numbers used to be written out twice, and a hand-edited map could put someone in a lake.
-export const START = {
-	hamletX: 23,
-	hamletY: 24,
-	// A second House beside the hamlet — a new realm opens with room for eight, so settlers
-	// arrive before the first build. Its own tile so the two Houses don't stack into one pawn.
-	house2X: 22,
-	house2Y: 24,
-	barnX: 24,
-	barnY: 24,
-	characterX: 23,
-	characterY: 25,
-	speed: 0.5
-};
+// START used to live here. It is derived from the terrain now — see `findStart` in worldgen.ts —
+// because a written-down coordinate cannot notice that the ground under it has become a lake.
 
 export type OrderReason =
 	| 'OUT_OF_BOUNDS'
