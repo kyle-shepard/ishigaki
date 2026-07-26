@@ -1039,7 +1039,12 @@
 			     block below. Keyed on the type carrying a recipe, so every future workshop gets it. -->
 			{#if selWorkshop}
 				<h3>Make {outputOf(selWorkshop.id)}</h3>
-				{#if selBatch}
+				{#if selBatch && selBatch.startedAt === null}
+					<!-- The same waiting state a build site already has: the inputs are spent and held, and
+					     nothing more is asked of the player. -->
+					<p class="crew">Waiting for a crafter — starts itself as soon as someone is free.</p>
+					<p><button onclick={() => cancelSite(selBatch.id)}>Cancel — full refund</button></p>
+				{:else if selBatch}
 					<p class="crew">
 						Being made by {selBatch.workers
 							.map((w) => {

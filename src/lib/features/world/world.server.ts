@@ -413,9 +413,10 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 				);
 	}
 
-	// Builds that were waiting for a body. This is the one *starting* responsibility resolveWorld
-	// has — everything above it finishes work, and finishing is what frees the workers this reads.
-	await startQueuedBuilds(tx, playerId);
+	// Orders that were waiting for a body — builds and batches alike. This is the one *starting*
+	// responsibility resolveWorld has: everything above it finishes work, and finishing is what
+	// frees the workers this reads.
+	await startQueuedOperations(tx, playerId);
 
 	// Population and food, integrated from the settlement's own anchor — the same integrate-on-read
 	// shape as the gather accrual above, no tick. Ordering is load-bearing: this runs AFTER the
@@ -550,20 +551,28 @@ async function deleteCrewlessOperations(tx: Tx, playerId: number): Promise<void>
 }
 
 /**
- * Starts any queued build that a worker has since freed up for. Runs inside `resolveWorld`, so it
- * happens on every read — which is what makes a build start itself while nobody is looking.
+ * Starts any queued order — a build or a craft batch — that a worker has since freed up for. Runs
+ * inside `resolveWorld`, so it happens on every read, which is what makes an order start itself
+ * while nobody is looking. That is the whole of "order it and walk away".
  *
  * **It must cost nothing when nothing is queued**, because every read pays for it: one indexed
  * query, and an early return. When there *is* work, the idle set and the ranking inputs load once
- * and claimed bodies are struck off in memory, rather than re-querying per build.
+ * and claimed bodies are struck off in memory, rather than re-querying per order.
  *
- * FIFO by `id`, which is `serial` — the build that has waited longest goes first, for free.
+ * FIFO by `id`, which is `serial` — the order that has waited longest goes first, for free, and
+ * that already mixes builds and batches in one queue with nothing to arbitrate between them.
+ *
+ * **Two things vary by type, and both must**: a build ranks by Construction and takes its seconds
+ * from `build_seconds`, a batch ranks by what *produces its output* and takes them from
+ * `craft_seconds`. Getting the second one wrong is silent — a plank batch would simply be priced
+ * like the Sawmill that makes it — which is why the seed keeps those two numbers different and a
+ * check measures them apart.
  *
  * Concurrency: this is the second writer of worker assignment, but not a second *lock*. Every
  * writer calls `resolveWorld`, which opens by taking the settlement `FOR UPDATE`, so an auto-start
  * and a hand-placed order serialise behind the same row. No new race surface.
  */
-async function startQueuedBuilds(tx: Tx, playerId: number): Promise<void> {
+async function startQueuedOperations(tx: Tx, playerId: number): Promise<void> {
 	const queued = await tx
 		.select()
 		.from(operation)
@@ -574,24 +583,56 @@ async function startQueuedBuilds(tx: Tx, playerId: number): Promise<void> {
 	let free = await idleBodies(tx, playerId);
 	if (free.length === 0) return;
 
-	const rank = await loadRanker(tx, await constructionSkillId(tx));
 	const grid = await loadGrid(tx, playerId);
-	const buildSecondsOf = new Map(
+	const types = new Map(
 		(
 			await tx
-				.select({ id: buildingType.id, seconds: buildingType.buildSeconds })
+				.select({
+					id: buildingType.id,
+					buildSeconds: buildingType.buildSeconds,
+					craftSeconds: buildingType.craftSeconds,
+					producesResourceId: buildingType.producesResourceId
+				})
 				.from(buildingType)
-		).map((t) => [t.id, t.seconds])
+		).map((t) => [t.id, t])
 	);
+	const skillOfResource = new Map(
+		(await tx.select({ id: resource.id, skillId: resource.skillId }).from(resource)).map((r) => [
+			r.id,
+			r.skillId
+		])
+	);
+	// One ranker per *distinct* skill rather than one for the whole pass, built on demand: a queue of
+	// nothing but builds still loads exactly the one it used to.
+	const rankers = new Map<number, Awaited<ReturnType<typeof loadRanker>>>();
+	const rankerFor = async (skillId: number) => {
+		const cached = rankers.get(skillId);
+		if (cached) return cached;
+		const made = await loadRanker(tx, skillId);
+		rankers.set(skillId, made);
+		return made;
+	};
+	let construction: number | null = null;
 
 	for (const op of queued) {
+		const type = types.get(op.buildingTypeId!);
+		if (!type) continue;
+		// A workshop whose recipe was removed while a batch sat in the queue. Leaving it queued is
+		// the safe reading — it holds its inputs, and cancelling refunds them.
+		const craft = op.type === 'craft';
+		if (craft && (type.craftSeconds === null || type.producesResourceId === null)) continue;
+		const skillId = craft
+			? skillOfResource.get(type.producesResourceId!)
+			: (construction ??= await constructionSkillId(tx));
+		if (skillId == null) continue;
+
 		const eligible = free.filter((c) => admits(op.allowedProfessionIds, c.professionId));
 		if (eligible.length === 0) continue;
-		const crew = rank(eligible).slice(0, op.crewSize);
+		const crew = (await rankerFor(skillId))(eligible).slice(0, op.crewSize);
 
 		const solved = solveCrew(
 			crew,
-			buildSecondsOf.get(op.buildingTypeId!)!,
+			craft ? type.craftSeconds! : type.buildSeconds,
 			op.destX,
 			op.destY,
 			movementCostIn(grid)
@@ -607,7 +648,7 @@ async function startQueuedBuilds(tx: Tx, playerId: number): Promise<void> {
 			.where(eq(operation.id, op.id));
 		await insertCrew(tx, op.id, solved.crew);
 
-		// Struck off in memory rather than re-queried, so two queued builds can't both claim the
+		// Struck off in memory rather than re-queried, so two queued orders can't both claim the
 		// same body in one pass.
 		const taken = new Set(crew.map((m) => m.character.id));
 		free = free.filter((c) => !taken.has(c.id));
@@ -1526,11 +1567,12 @@ async function planCraft(
 				'run `npm run seed` against this database'
 		);
 
+	// Nobody free is not a refusal: the batch waits, exactly as a build does. Refusing would lose
+	// the reservation — the inputs are taken at order time, so a queued batch holds its wood the way
+	// a queued build holds its cost, and a player told to come back later would be retrying against
+	// stock something else may have spent in the meantime.
 	const ranked = await rankIdleWorkers(tx, playerId, out.skillId, allowed);
 	const crew = ranked.slice(0, wanted);
-	// ponytail: no crafter free is a refusal *this slice only* — nothing is written yet, so no
-	// reservation is lost. Slice 2 replaces it with the queue a build already has.
-	if (crew.length === 0) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
 
 	// `craft_seconds` is ideal effort, the same units as `build_seconds` — so a crew divides it by
 	// its own pace through exactly the arithmetic a build uses, travel included.
@@ -1590,27 +1632,33 @@ export async function createCraftOrder(
 				.where(and(eq(stock.settlementId, settlementId), eq(stock.resourceId, c.resourceId)));
 		}
 
+		// No crew means nobody qualified, so the batch waits: it holds the workshop and the inputs it
+		// has already paid, remembers how many bodies it wanted and who may work it, and
+		// `resolveWorld` starts it the moment a crafter frees. This is the epic's offline promise —
+		// order it and walk away.
+		const queued = crew.length === 0;
 		const [op] = await tx
 			.insert(operation)
 			.values({
 				playerId,
 				type: 'craft',
-				status: 'in-progress',
+				status: queued ? 'queued' : 'in-progress',
 				destX: x,
 				destY: y,
 				// The workshop, not something being raised — this is how completion finds the recipe.
 				buildingTypeId,
 				// How well the batch was made. Nothing reads it yet, but a completed operation is kept
 				// forever, so every batch already carries a permanent record of its own workmanship —
-				// which is the thing that could not be reconstructed afterwards.
-				qualityMultiplier: quality!,
+				// which is the thing that could not be reconstructed afterwards. A queued batch has no
+				// crew yet, so it keeps the column's default until it starts.
+				...(queued ? {} : { qualityMultiplier: quality! }),
 				allowedProfessionIds: allowed,
 				crewSize: wanted,
-				startedAt: sql`now()`,
-				completeAt: sql`now() + ${`${seconds} seconds`}::interval`
+				startedAt: queued ? null : sql`now()`,
+				completeAt: queued ? null : sql`now() + ${`${seconds} seconds`}::interval`
 			})
 			.returning({ id: operation.id });
-		await insertCrew(tx, op.id, crew);
+		if (!queued) await insertCrew(tx, op.id, crew);
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});

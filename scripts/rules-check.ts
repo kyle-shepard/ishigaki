@@ -749,6 +749,118 @@ check(
 );
 await api(`/api/orders/${byCarpenter.id}`, { method: 'DELETE' });
 
+// ---- The queue: order it and walk away ---------------------------------------------------------
+//
+// A batch placed with nobody free waits rather than bouncing, holding the inputs it has already
+// paid — and starts itself on the next read after somebody frees, with no one looking.
+const busyEveryone = async () => {
+	const idle = (await api('/api/world')).body.characters.length;
+	for (const [gx, gy] of [
+		[11, 1],
+		[12, 1],
+		[11, 2],
+		[12, 2],
+		[13, 1],
+		[13, 2]
+	] as const) {
+		const w = (await api('/api/world')).body;
+		if (w.operations.filter((o: { type: string }) => o.type === 'gather').length >= idle) break;
+		await assign(gx, gy);
+	}
+};
+await busyEveryone();
+const woodBeforeQueue = woodHeld((await api('/api/world')).body);
+const heldBatch = await craft(...mill, 1);
+const held = craftOp(heldBatch.body);
+check(
+	'with everyone busy a batch waits rather than refusing, and reserves its inputs up front',
+	[
+		heldBatch.status,
+		held?.startedAt,
+		held?.completeAt,
+		held?.workers.length,
+		woodHeld(heldBatch.body)
+	],
+	[200, null, null, 0, woodBeforeQueue - 20]
+);
+const droppedQueue = await api(`/api/orders/${held!.id}`, { method: 'DELETE' });
+check(
+	'cancelling a waiting batch refunds it in full',
+	[droppedQueue.status, woodHeld(droppedQueue.body)],
+	[200, woodBeforeQueue]
+);
+check(
+	'cancelling a waiting batch twice is refused, not a second refund',
+	(await api(`/api/orders/${held!.id}`, { method: 'DELETE' })).body.reason,
+	'UNKNOWN_OPERATION'
+);
+
+// **The misprice trap.** A queued batch must be timed from `craft_seconds` (30), not from the
+// Sawmill's `build_seconds` (40) — the two differ in the seed precisely so a wrong dereference is
+// measurable. Queue one of each, free two *settlers* (the Carpenter stays out gathering, so both
+// are worked at the same untrained pace), and the batch has to come out the quicker of the two.
+const waitingBatch = craftOp((await craft(...mill, 1)).body);
+const spare = fromWorld(START.characterX - 2, START.characterY + 1);
+const waitingBuild = (await order(...spare, sawmill, 1)).body.operations?.find(
+	(o: { type: string; startedAt: string | null }) => o.type === 'build' && o.startedAt === null
+);
+if (!waitingBatch || !waitingBuild)
+	throw new Error('the misprice trap could not queue both orders');
+// Two settlers back, by recalling the gathers they are on — a specialist is skipped, so the
+// Carpenter keeps working and cannot be the one that starts either order.
+const busyNow = (await api('/api/world')).body;
+const settlerIds = new Set(
+	busyNow.characters
+		.filter((c: { professionId: number | null }) => c.professionId === null)
+		.map((c: { id: number }) => c.id)
+);
+const settlerGathers = busyNow.operations.filter(
+	(o: { type: string; workers: { characterId: number }[] }) =>
+		o.type === 'gather' && o.workers.some((wk) => settlerIds.has(wk.characterId))
+);
+for (const g of settlerGathers.slice(0, 2))
+	await api(`/api/assignments/${g.id}`, { method: 'DELETE' });
+const restarted = (await api('/api/world')).body;
+const startedBatch = restarted.operations.find((o: { id: number }) => o.id === waitingBatch.id);
+const startedBuild = restarted.operations.find((o: { id: number }) => o.id === waitingBuild.id);
+check(
+	'freeing a worker starts the waiting batch by itself, on the very next read',
+	[
+		startedBatch?.startedAt !== null,
+		startedBatch?.completeAt !== null,
+		startedBatch?.workers.length
+	],
+	[true, true, 1]
+);
+const took = (o: { startedAt: string; completeAt: string }) =>
+	(Date.parse(o.completeAt) - Date.parse(o.startedAt)) / 1000;
+// The comparison below is only honest if both were worked at the same pace. A Carpenter picked up
+// by the batch would make it quicker for the right reason and hide a wrong one, so this pins that
+// the two freed bodies really were untrained.
+const workedBySettler = (o: { workers: { characterId: number }[] } | undefined) =>
+	!!o && o.workers.length > 0 && o.workers.every((wk) => settlerIds.has(wk.characterId));
+check(
+	'both auto-started orders were taken by untrained settlers, so the pace is held constant',
+	[workedBySettler(startedBatch), workedBySettler(startedBuild)],
+	[true, true]
+);
+check(
+	`an auto-started batch is timed from craft_seconds, not the Sawmill's build_seconds ` +
+		`(${startedBuild ? took(startedBuild) : '?'}s to build one, ${startedBatch ? took(startedBatch) : '?'}s to run one)`,
+	startedBatch && startedBuild ? took(startedBatch) < took(startedBuild) : 'one never started',
+	true
+);
+// Frees the workshop again for the affordability check below.
+await api(`/api/orders/${waitingBatch.id}`, { method: 'DELETE' });
+await api(`/api/orders/${waitingBuild.id}`, { method: 'DELETE' });
+// And quiets the realm. Half the tiles the queue group occupied are forest, so woodcutters are
+// still earning — and "the refusal moved no Wood" measured against a rising number is a race, not
+// an assertion. Same reasoning as `heldOf` naming one resource rather than comparing all of stock.
+for (const g of (await api('/api/world')).body.operations.filter(
+	(o: { type: string }) => o.type === 'gather'
+))
+	await api(`/api/assignments/${g.id}`, { method: 'DELETE' });
+
 // Cannot afford it beats everyone is busy: the first is a standing fact about the realm, the second
 // is a minute old. Draining by ordering Houses is what makes this reachable — every order takes its
 // cost at once, whether it starts or queues.
