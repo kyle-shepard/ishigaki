@@ -905,5 +905,84 @@ check(
 	woodWhenBroke
 );
 
+// ---- The chain pays off: Wood → Planks → Furniture → a Longhouse -------------------------------
+//
+// The slowest group here by a distance, because it runs the ladder for real rather than asserting
+// the rows it is made of: a Sawmill raised, three plank batches, a Joinery those planks paid for,
+// and a furniture batch at it. Nothing here is a proxy.
+const joinery = typeId('Joinery');
+const longhouse = typeId('Longhouse');
+
+const capacityOf = (name: string) =>
+	world.body.buildingTypes.find((t: { displayName: string }) => t.displayName === name)
+		.housingCapacity;
+check(
+	`a Longhouse houses more than a House (${capacityOf('Longhouse')} against ${capacityOf('House')})`,
+	capacityOf('Longhouse') > capacityOf('House'),
+	true
+);
+check(
+	'no terrain anywhere yields Furniture — it exists only at the end of a chain',
+	world.body.terrainTypes.some(
+		(t: { yieldsResourceId: number | null }) =>
+			t.yieldsResourceId ===
+			world.body.resources.find((r: { displayName: string }) => r.displayName === 'Furniture').id
+	),
+	false
+);
+
+cookie = '';
+const ladder = await api('/api/world');
+check(
+	'a fresh realm is rich in Wood and still cannot buy a Longhouse',
+	[woodHeld(ladder.body) >= 100, (await order(...spare, longhouse, 3)).body.reason],
+	[true, 'INSUFFICIENT_RESOURCES']
+);
+check(
+	'nor a Joinery — the middle good is load-bearing, not decorative',
+	(await order(...yard, joinery, 3)).body.reason,
+	'INSUFFICIENT_RESOURCES'
+);
+
+/** Places an order (or a batch) and sleeps out its clock, returning the world it landed in. */
+async function runOut(label: string, placed: { status: number; body: any }) {
+	const op = placed.body.operations?.find(
+		(o: { completeAt: string | null }) => o.completeAt !== null
+	);
+	if (!op) throw new Error(`${label} was refused: ${JSON.stringify(placed.body)}`);
+	return waitOut(op);
+}
+
+await runOut('the ladder Sawmill', await order(...mill, sawmill, 3));
+let rung = await runOut('the first plank batch', await craft(...mill, 3));
+check('the Sawmill turns Wood into Planks nobody could gather', heldOf(rung, 'Planks'), 10);
+
+const joinerySite = await order(...yard, joinery, 3);
+check(
+	'with Planks in hand the Joinery is accepted — bought with a good that had to be made',
+	[joinerySite.status, heldOf(joinerySite.body, 'Planks')],
+	[200, 0]
+);
+await runOut('the Joinery', joinerySite);
+// Two more batches, because the Joinery's own price ate the first one. A workshop runs one batch at
+// a time, so these are genuinely sequential.
+await runOut('the second plank batch', await craft(...mill, 3));
+rung = await runOut('the third plank batch', await craft(...mill, 3));
+check('three batches and a Joinery later, the planks are stacked up', heldOf(rung, 'Planks'), 20);
+
+const crafted = await runOut('the furniture batch', await craft(...yard, 3));
+check(
+	'the Joinery turns Planks into Furniture — the middle good spent on the far one',
+	[heldOf(crafted, 'Furniture'), heldOf(crafted, 'Planks')],
+	[4, 8]
+);
+// What is left between here and a Longhouse is Wood and time, which is the payoff being *earned*
+// rather than handed over. The price itself is what this pins: it is not payable in raw wood.
+check(
+	'and a Longhouse is still priced beyond one afternoon — the payoff is worked for',
+	(await order(...spare, longhouse, 3)).body.reason,
+	'INSUFFICIENT_RESOURCES'
+);
+
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

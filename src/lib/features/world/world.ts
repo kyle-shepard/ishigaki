@@ -160,6 +160,10 @@ export type WorldPayload = {
 		displayName: string;
 		icon: string;
 		buildSeconds: number;
+		// How many settlers this type houses — the population cap is the SUM over what you have
+		// built. On the wire so the build menu can say "houses 10" beside the price, which is the
+		// only way a Longhouse's whole point is legible *before* you pay for it.
+		housingCapacity: number;
 		// What this type does to the ground's movement cost; null means nothing. Non-null is what
 		// makes a type *linear infrastructure* — the client draws it as arms joining its own kind
 		// rather than as a single building sprite, and routing walks bodies onto it.

@@ -1955,6 +1955,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			displayName: t.displayName,
 			icon: t.icon,
 			buildSeconds: t.buildSeconds,
+			housingCapacity: t.housingCapacity,
 			movementCost: t.movementCost,
 			requiresBuildingTypeId: t.requiresBuildingTypeId,
 			// All three or none — non-null is what makes this type a workshop, and the client reads

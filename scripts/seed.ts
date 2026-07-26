@@ -90,7 +90,15 @@ const buildingTypes = await db
 		// The first building that *makes* something. Every other type is a place to stand; a Sawmill
 		// turns 20 Wood into 10 Planks, which is a good no tile anywhere on the map yields. Its
 		// recipe columns are set in a second pass below — `resource` does not exist yet up here.
-		{ displayName: 'Sawmill', icon: 'sawmill', buildSeconds: 40, housingCapacity: 0 }
+		{ displayName: 'Sawmill', icon: 'sawmill', buildSeconds: 40, housingCapacity: 0 },
+		// The second rung, and the one that makes the middle good load-bearing: a Joinery is priced
+		// in **Planks**, so it cannot be reached without running the Sawmill first. That is also what
+		// forces the winnability walker below to traverse a recipe rather than only costs.
+		{ displayName: 'Joinery', icon: 'joinery', buildSeconds: 60, housingCapacity: 0 },
+		// The payoff. Houses 10 against a House's 4 — and it is priced in Planks and Furniture, so no
+		// amount of raw wood could ever have bought it. This is where the chain lands in the one
+		// number a player already watches.
+		{ displayName: 'Longhouse', icon: 'longhouse', buildSeconds: 120, housingCapacity: 10 }
 	])
 	// Keyed on the name, so re-running against a live world retunes the row a player's
 	// buildings already point at rather than making a second one beside it.
@@ -235,9 +243,11 @@ const RESOURCE_SKILL: Record<string, string> = {
 	Stone: 'Quarrying',
 	Clay: 'Digging',
 	'Iron ore': 'Mining',
-	// Made, not taken. No terrain yields it and its rate is 0, so the only way a plank enters the
-	// world is through a recipe — which is the point of the whole epic.
-	Planks: 'Carpentry'
+	// Made, not taken. No terrain yields either of these and their rate is 0, so the only way one
+	// enters the world is through a recipe — which is the point of the whole epic. Furniture goes
+	// one further: its own input is made too, so it exists only at the end of a two-step chain.
+	Planks: 'Carpentry',
+	Furniture: 'Carpentry'
 };
 const resources = await db
 	.insert(resource)
@@ -293,6 +303,15 @@ const resources = await db
 			unitsPerHour: 0,
 			startingStock: 0,
 			skillId: sk[RESOURCE_SKILL.Planks]
+		},
+		// The far end of the chain: made from a made thing. Nothing gathers it, nothing starts with
+		// it, and the only building that wants it is the one the whole epic is aimed at.
+		{
+			displayName: 'Furniture',
+			icon: 'res-furniture',
+			unitsPerHour: 0,
+			startingStock: 0,
+			skillId: sk[RESOURCE_SKILL.Furniture]
 		}
 	])
 	.onConflictDoUpdate({
@@ -337,7 +356,15 @@ const COSTS = [
 	{ building: 'Road', resource: 'Wood', quantity: 2 },
 	// Priced in Wood alone, like the Quarry: it is the rung that unlocks Planks, so charging planks
 	// for it would seal the ladder shut before anybody could climb it.
-	{ building: 'Sawmill', resource: 'Wood', quantity: 20 }
+	{ building: 'Sawmill', resource: 'Wood', quantity: 20 },
+	// The Joinery *is* priced in Planks, deliberately — the middle good is load-bearing before it is
+	// decorative, and this is the cost the winnability walker has to traverse a recipe to satisfy.
+	{ building: 'Joinery', resource: 'Wood', quantity: 15 },
+	{ building: 'Joinery', resource: 'Planks', quantity: 10 },
+	// And the Longhouse is priced in both made goods. No amount of raw wood buys one.
+	{ building: 'Longhouse', resource: 'Planks', quantity: 20 },
+	{ building: 'Longhouse', resource: 'Furniture', quantity: 6 },
+	{ building: 'Longhouse', resource: 'Wood', quantity: 10 }
 ];
 await db
 	.insert(buildingCost)
@@ -399,6 +426,15 @@ const RECIPES = [
 		outputQuantity: 10,
 		craftSeconds: 30,
 		inputs: [{ resource: 'Wood', quantity: 20 }]
+	},
+	// The second step, and the one that makes Planks a *middle* good rather than an end in itself:
+	// its only input is something that had to be made.
+	{
+		building: 'Joinery',
+		produces: 'Furniture',
+		outputQuantity: 4,
+		craftSeconds: 60,
+		inputs: [{ resource: 'Planks', quantity: 12 }]
 	}
 ];
 // A second pass, like REQUIRES above: `building_type` is inserted before `resource` exists, so the
@@ -464,9 +500,15 @@ await db.execute(
 
 // A world starts with nothing, so every building has to be reachable *eventually* — not
 // necessarily at once. Walk the ladder: whatever can be gathered bare-handed is reachable,
-// anything payable from reachable resources is buildable, and any resource whose required
-// building is buildable becomes reachable in turn. A building left outside that closure can
-// never be built by anyone, which is a world that quietly cannot be won.
+// anything payable from reachable resources is buildable, and a resource becomes reachable in turn
+// by either of the two ways one can be produced — extracted behind a building that is buildable, or
+// **made by a recipe whose workshop is buildable and whose every input is already reachable**. A
+// building left outside that closure can never be built by anyone, which is a world that quietly
+// cannot be won.
+//
+// The recipe clause is not decoration: the Joinery is priced in Planks, which nothing gathers, so
+// without it this throws on a perfectly climbable ladder — and with a *wrong* one it would wave
+// through a Longhouse nobody could ever pay for.
 //
 // Cheap to check, silent to break, and a future cost edit is exactly how it would break.
 //
@@ -485,6 +527,11 @@ for (let pass = 0; pass < buildingTypes.length; pass++) {
 		if (needs.every((c) => reachable.has(c.resource))) buildable.add(t.displayName);
 	}
 	for (const r of takeable) if (REQUIRES[r] && buildable.has(REQUIRES[r])) reachable.add(r);
+	// The third way in. Unlike `takeable`, a made good has no rate and appears on no tile, so this
+	// clause is the only thing that can ever mark one reachable.
+	for (const r of RECIPES)
+		if (buildable.has(r.building) && r.inputs.every((i) => reachable.has(i.resource)))
+			reachable.add(r.produces);
 }
 const stranded = buildingTypes.filter((t) => !buildable.has(t.displayName));
 if (stranded.length > 0)

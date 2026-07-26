@@ -1092,6 +1092,12 @@
 								<input type="radio" bind:group={chosen} value={bt.id} disabled={bt.blocked} />
 								{bt.displayName}
 								<span class="price">{priceOf(bt.id)}</span>
+								<!-- What the price *buys*, for the one type where that is the whole point: a
+								     Longhouse is worth its planks because it holds ten people, and reading
+								     that after paying would be reading it too late. -->
+								{#if bt.housingCapacity > 0}
+									<span class="price">houses {bt.housingCapacity}</span>
+								{/if}
 								{#if bt.blocked}<span class="requires">Requires a {bt.needName}</span>{/if}
 							</label>
 						</li>

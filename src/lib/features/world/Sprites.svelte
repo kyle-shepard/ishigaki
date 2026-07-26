@@ -165,6 +165,36 @@
 			<rect x="4" y="27" width="24" height="1.6" fill="#00000022" />
 		</symbol>
 
+		<!-- A joiner's workshop: a bench under a lean-to, with a finished frame standing against it.
+		     Distinct from the Sawmill by having no blade — this shapes boards, it does not cut them. -->
+		<symbol id="i-joinery" viewBox="0 0 32 32">
+			<rect x="4" y="15" width="24" height="13" fill="#cbb083" />
+			<path d="M2 15 L16 7 L30 15 Z" fill="#7b5637" />
+			<rect x="6" y="20" width="13" height="2.6" fill="#8a5a33" />
+			<g fill="#8a5a33">
+				<rect x="6.5" y="22.6" width="2" height="5.4" />
+				<rect x="16.5" y="22.6" width="2" height="5.4" />
+			</g>
+			<g fill="none" stroke="#6f4726" stroke-width="1.6">
+				<rect x="21" y="17.5" width="6.5" height="10.5" />
+			</g>
+			<rect x="4" y="27" width="24" height="1.6" fill="#00000022" />
+		</symbol>
+
+		<!-- A longhouse: one long low hall, twice the House's doors. Read as "many people live here"
+		     at 32px, which is the whole reason it exists. -->
+		<symbol id="i-longhouse" viewBox="0 0 32 32">
+			<rect x="2" y="16" width="28" height="12" fill="#d8c8a4" />
+			<path d="M1 16 L7 8 H25 L31 16 Z" fill="#5c3f2a" />
+			<path d="M4.5 16 L8.6 10.4 H23.4 L27.5 16 Z" fill="#7a5439" />
+			<g fill="#5b3a22">
+				<rect x="6" y="20" width="4.5" height="8" />
+				<rect x="13.75" y="20" width="4.5" height="8" />
+				<rect x="21.5" y="20" width="4.5" height="8" />
+			</g>
+			<rect x="2" y="27" width="28" height="1.6" fill="#00000022" />
+		</symbol>
+
 		<!-- The resource bar's icons, keyed `res-*` off resource.icon. Unlike the terrain and building
 		     symbols these are drawn on the header band rather than on a tile colour, at about half
 		     the size, so they are chunkier and fewer-marked: five shapes have to stay apart from each
@@ -216,6 +246,18 @@
 				<rect x="3" y="8" width="26" height="5" />
 				<rect x="3" y="14.5" width="26" height="5" />
 				<rect x="3" y="21" width="26" height="5" />
+			</g>
+		</symbol>
+
+		<!-- A chair, side on: the one piece of furniture whose silhouette survives 18px. Deliberately
+		     not boards — what you hold at this rung is *shaped*, not merely sawn. -->
+		<symbol id="i-res-furniture" viewBox="0 0 32 32">
+			<rect x="9" y="4" width="4" height="24" fill="#8a5a33" />
+			<rect x="9" y="15" width="16" height="3.5" fill="#c9a066" />
+			<rect x="21" y="18.5" width="4" height="9.5" fill="#8a5a33" />
+			<g fill="#a87b45">
+				<rect x="10" y="7" width="12" height="2.4" />
+				<rect x="10" y="11" width="12" height="2.4" />
 			</g>
 		</symbol>
 
