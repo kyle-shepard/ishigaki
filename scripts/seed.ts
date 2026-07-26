@@ -3,7 +3,7 @@
 // same as drizzle.config.ts does.
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import { eq, sql } from 'drizzle-orm';
+import { eq, inArray, sql } from 'drizzle-orm';
 import {
 	buildingCost,
 	buildingType,
@@ -11,6 +11,7 @@ import {
 	player,
 	profession,
 	professionSkill,
+	recipeInput,
 	resource,
 	skill,
 	terrainType,
@@ -85,7 +86,11 @@ const buildingTypes = await db
 			buildSeconds: 6,
 			housingCapacity: 0,
 			movementCost: 0.4
-		}
+		},
+		// The first building that *makes* something. Every other type is a place to stand; a Sawmill
+		// turns 20 Wood into 10 Planks, which is a good no tile anywhere on the map yields. Its
+		// recipe columns are set in a second pass below — `resource` does not exist yet up here.
+		{ displayName: 'Sawmill', icon: 'sawmill', buildSeconds: 40, housingCapacity: 0 }
 	])
 	// Keyed on the name, so re-running against a live world retunes the row a player's
 	// buildings already point at rather than making a second one beside it.
@@ -146,7 +151,11 @@ const skills = await db
 		{ displayName: 'Quarrying', statA: 'strength', statB: 'constitution' },
 		{ displayName: 'Digging', statA: 'strength', statB: 'dexterity' },
 		{ displayName: 'Mining', statA: 'strength', statB: 'constitution' },
-		{ displayName: 'Construction', statA: 'dexterity', statB: 'intelligence' }
+		{ displayName: 'Construction', statA: 'dexterity', statB: 'intelligence' },
+		// The first skill that isn't about taking something off the ground. `resource.skill_id` means
+		// "which action-skill *produces* this" — gathered or made — so naming Carpentry on Planks is
+		// the whole of "a Carpenter finishes a plank batch faster than a settler".
+		{ displayName: 'Carpentry', statA: 'dexterity', statB: 'intelligence' }
 	])
 	.onConflictDoUpdate({
 		target: skill.displayName,
@@ -189,6 +198,10 @@ const BUNDLE = [
 	// The other two build trades. A Carpenter is the better builder outright; a Thatcher is
 	// modest but still well clear of an untrained settler.
 	{ profession: 'Carpenter', skill: 'Construction', value: 0.7 },
+	// One new skill, not two: both recipes in the chain are Carpentry, so it needs one specialist
+	// rather than a second School bottleneck. That makes the Carpenter the strongest profession —
+	// a tuning knob (drop either value), not a structural problem.
+	{ profession: 'Carpenter', skill: 'Carpentry', value: 0.7 },
 	{ profession: 'Thatcher', skill: 'Construction', value: 0.55 },
 	{ profession: 'Digger', skill: 'Digging', value: 0.7 },
 	{ profession: 'Miner', skill: 'Mining', value: 0.7 }
@@ -221,7 +234,10 @@ const RESOURCE_SKILL: Record<string, string> = {
 	Wood: 'Woodcutting',
 	Stone: 'Quarrying',
 	Clay: 'Digging',
-	'Iron ore': 'Mining'
+	'Iron ore': 'Mining',
+	// Made, not taken. No terrain yields it and its rate is 0, so the only way a plank enters the
+	// world is through a recipe — which is the point of the whole epic.
+	Planks: 'Carpentry'
 };
 const resources = await db
 	.insert(resource)
@@ -266,6 +282,17 @@ const resources = await db
 			unitsPerHour: 0,
 			startingStock: 50,
 			skillId: sk[RESOURCE_SKILL['Iron ore']]
+		},
+		// The first made good. Rate 0 and on no terrain's yield list, so unlike Clay and Iron ore
+		// this is not "seeded but unwired" — there is genuinely no tile to stand on for it, and a
+		// gather order naming one is refused TILE_YIELDS_NOTHING as it should be. Starting stock 0:
+		// a runway of something you are meant to make would undercut the first thing you make.
+		{
+			displayName: 'Planks',
+			icon: 'res-planks',
+			unitsPerHour: 0,
+			startingStock: 0,
+			skillId: sk[RESOURCE_SKILL.Planks]
 		}
 	])
 	.onConflictDoUpdate({
@@ -307,7 +334,10 @@ const COSTS = [
 	// Per *tile*, and a network is dozens of them: 2 Wood is a road you lay as you go rather than
 	// save up for. Wood rather than Stone deliberately — Stone is gated behind a Quarry, and roads
 	// should be something a hamlet can do on its first afternoon.
-	{ building: 'Road', resource: 'Wood', quantity: 2 }
+	{ building: 'Road', resource: 'Wood', quantity: 2 },
+	// Priced in Wood alone, like the Quarry: it is the rung that unlocks Planks, so charging planks
+	// for it would seal the ladder shut before anybody could climb it.
+	{ building: 'Sawmill', resource: 'Wood', quantity: 20 }
 ];
 await db
 	.insert(buildingCost)
@@ -355,6 +385,82 @@ for (const [b, req] of Object.entries(BUILDING_REQUIRES)) {
 		.set({ requiresBuildingTypeId: bt[req] })
 		.where(eq(buildingType.displayName, b));
 }
+
+// The recipes. One per building type — a type carrying these *is* a workshop, which is the whole of
+// "a Sawmill makes planks; that is what a Sawmill is". All content (VISION #10): retuning a batch
+// size, a duration or an input list is an UPDATE against a live world.
+//
+// craftSeconds is *ideal* effort, the same units as buildSeconds — a settler at 0.15 spends about
+// three and a half minutes on a plank batch, a good Carpenter well under one.
+const RECIPES = [
+	{
+		building: 'Sawmill',
+		produces: 'Planks',
+		outputQuantity: 10,
+		craftSeconds: 30,
+		inputs: [{ resource: 'Wood', quantity: 20 }]
+	}
+];
+// A second pass, like REQUIRES above: `building_type` is inserted before `resource` exists, so the
+// FK cannot be set in the original upsert.
+for (const r of RECIPES) {
+	await db
+		.update(buildingType)
+		.set({
+			producesResourceId: res[r.produces],
+			outputQuantity: r.outputQuantity,
+			craftSeconds: r.craftSeconds
+		})
+		.where(eq(buildingType.displayName, r.building));
+}
+// And the second pass is checked, because it is an UPDATE … WHERE display_name: a rename or a typo
+// matches zero rows and every workshop comes out recipe-less, while the winnability walker below —
+// which reads these constants and never the database — still passes happily. Same idiom as the
+// capacity/regrow mismatch and the no-outcrop throw further down.
+const workshops = await db
+	.select({
+		displayName: buildingType.displayName,
+		producesResourceId: buildingType.producesResourceId
+	})
+	.from(buildingType)
+	.where(
+		inArray(
+			buildingType.displayName,
+			RECIPES.map((r) => r.building)
+		)
+	);
+const recipeless = RECIPES.map((r) => r.building).filter(
+	(name) => !workshops.some((w) => w.displayName === name && w.producesResourceId !== null)
+);
+if (recipeless.length > 0)
+	throw new Error(
+		`recipe not written for: ${recipeless.join(', ')} — the name in RECIPES matches no ` +
+			'building_type row, so these would be workshops that make nothing'
+	);
+
+await db
+	.insert(recipeInput)
+	.values(
+		RECIPES.flatMap((r) =>
+			r.inputs.map((i) => ({
+				buildingTypeId: bt[r.building],
+				resourceId: res[i.resource],
+				quantity: i.quantity
+			}))
+		)
+	)
+	.onConflictDoUpdate({
+		target: [recipeInput.buildingTypeId, recipeInput.resourceId],
+		set: { quantity: sql`excluded.quantity` }
+	});
+// An input dropped from RECIPES has to actually stop being charged — same argument as building_cost
+// and profession_skill: upserts alone would leave the stale row behind and quietly keep taking it.
+await db.execute(
+	sql`DELETE FROM recipe_input WHERE (building_type_id, resource_id) NOT IN (${sql.join(
+		RECIPES.flatMap((r) => r.inputs.map((i) => sql`(${bt[r.building]}, ${res[i.resource]})`)),
+		sql`, `
+	)})`
+);
 
 // A world starts with nothing, so every building has to be reachable *eventually* — not
 // necessarily at once. Walk the ladder: whatever can be gathered bare-handed is reachable,

@@ -151,6 +151,20 @@
 			<rect x="5" y="27" width="22" height="1.6" fill="#00000022" />
 		</symbol>
 
+		<!-- A sawmill: a shed with a blade standing proud of the roof and a log on the bench. The
+		     blade is the read at 32px — it is what says "this cuts" rather than "this stores". -->
+		<symbol id="i-sawmill" viewBox="0 0 32 32">
+			<rect x="4" y="16" width="24" height="12" fill="#b98a52" />
+			<path d="M3 16 L16 9 L29 16 Z" fill="#6d4a2a" />
+			<g stroke="#5c3d20" stroke-width="1.1">
+				<path d="M8 16v12M16 16v12M24 16v12" />
+			</g>
+			<circle cx="16" cy="12" r="6" fill="#c9ced3" stroke="#7d8489" stroke-width="1.1" />
+			<circle cx="16" cy="12" r="1.6" fill="#7d8489" />
+			<rect x="6" y="22" width="11" height="4" rx="2" fill="#8a5a33" />
+			<rect x="4" y="27" width="24" height="1.6" fill="#00000022" />
+		</symbol>
+
 		<!-- The resource bar's icons, keyed `res-*` off resource.icon. Unlike the terrain and building
 		     symbols these are drawn on the header band rather than on a tile colour, at about half
 		     the size, so they are chunkier and fewer-marked: five shapes have to stay apart from each
@@ -192,6 +206,16 @@
 				<circle cx="12" cy="18" r="2" />
 				<circle cx="18.5" cy="21" r="1.6" />
 				<circle cx="20" cy="15.5" r="1.8" />
+			</g>
+		</symbol>
+
+		<!-- Sawn boards, stacked and squared off — flat ends and straight edges, against the logs'
+		     rounded ones, so "made" reads differently from "cut down" at 18px in the bar. -->
+		<symbol id="i-res-planks" viewBox="0 0 32 32">
+			<g fill="#c9a066" stroke="#8a6a3c" stroke-width="1.2">
+				<rect x="3" y="8" width="26" height="5" />
+				<rect x="3" y="14.5" width="26" height="5" />
+				<rect x="3" y="21" width="26" height="5" />
 			</g>
 		</symbol>
 

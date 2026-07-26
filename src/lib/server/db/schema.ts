@@ -33,36 +33,73 @@ export const player = pgTable('player', {
 // is a row, and it has to be able to say how it looks); the art itself is vector paths, so it
 // stays in code — a path string in a column would be undiffable and still need a deploy to
 // change. An unknown key renders nothing, which is a missing icon, not a broken tile.
-export const buildingType = pgTable('building_type', {
-	id: serial('id').primaryKey(),
-	// Unique because it is the natural key: the seed upserts on it so a deploy can carry content
-	// forward without destroying realms, and `ensurePlayer` looks the hamlet up by it. Two rows
-	// called "House" would make both of those pick one arbitrarily.
-	displayName: text('display_name').notNull().unique(),
-	icon: text('icon').notNull(),
-	buildSeconds: integer('build_seconds').notNull(),
-	// How many settlers this building houses. The population cap is the SUM over a player's
-	// built buildings, so a House carries a number and everything else is 0 — build a House,
-	// room opens, people arrive. A column, not a constant, so "a dorm holds more" is a row
-	// edit (VISION #10), and so the cap is one relational SUM rather than a rule in code.
-	housingCapacity: integer('housing_capacity').notNull().default(0),
-	// What this building does to the ground it stands on: the movement cost a route pays to cross
-	// that tile, replacing the terrain's own. Null — every type but a Road — means it changes
-	// nothing, and a House is as slow to walk past as the meadow under it.
-	//
-	// This is the whole of what a road *is*. Routing already prefers cheap tiles, so a tile made
-	// cheap is a tile bodies choose to walk on, and no rule anywhere says "follow the road".
-	// A column rather than a constant so a paved road, a towpath or a bridge are row edits
-	// (VISION #10), and so the number is tunable against travel times in a live world.
-	movementCost: real('movement_cost'),
-	// A realm-wide build prerequisite: this type can't be placed until the player owns one of
-	// the referenced type *anywhere* (a Stone wall needs a Quarry standing). Distinct from the
-	// tile-local gate on resource.requiresBuildingTypeId (a Quarry on *this* outcrop before
-	// Stone) — different scope, so its own column. Nullable self-FK; null means no prerequisite.
-	requiresBuildingTypeId: integer('requires_building_type_id').references(
-		(): AnyPgColumn => buildingType.id
-	)
-});
+export const buildingType = pgTable(
+	'building_type',
+	{
+		id: serial('id').primaryKey(),
+		// Unique because it is the natural key: the seed upserts on it so a deploy can carry content
+		// forward without destroying realms, and `ensurePlayer` looks the hamlet up by it. Two rows
+		// called "House" would make both of those pick one arbitrarily.
+		displayName: text('display_name').notNull().unique(),
+		icon: text('icon').notNull(),
+		buildSeconds: integer('build_seconds').notNull(),
+		// How many settlers this building houses. The population cap is the SUM over a player's
+		// built buildings, so a House carries a number and everything else is 0 — build a House,
+		// room opens, people arrive. A column, not a constant, so "a dorm holds more" is a row
+		// edit (VISION #10), and so the cap is one relational SUM rather than a rule in code.
+		housingCapacity: integer('housing_capacity').notNull().default(0),
+		// What this building does to the ground it stands on: the movement cost a route pays to cross
+		// that tile, replacing the terrain's own. Null — every type but a Road — means it changes
+		// nothing, and a House is as slow to walk past as the meadow under it.
+		//
+		// This is the whole of what a road *is*. Routing already prefers cheap tiles, so a tile made
+		// cheap is a tile bodies choose to walk on, and no rule anywhere says "follow the road".
+		// A column rather than a constant so a paved road, a towpath or a bridge are row edits
+		// (VISION #10), and so the number is tunable against travel times in a live world.
+		movementCost: real('movement_cost'),
+		// A realm-wide build prerequisite: this type can't be placed until the player owns one of
+		// the referenced type *anywhere* (a Stone wall needs a Quarry standing). Distinct from the
+		// tile-local gate on resource.requiresBuildingTypeId (a Quarry on *this* outcrop before
+		// Stone) — different scope, so its own column. Nullable self-FK; null means no prerequisite.
+		requiresBuildingTypeId: integer('requires_building_type_id').references(
+			(): AnyPgColumn => buildingType.id
+		),
+		// The recipe, if this type has one. **A type with these set *is* a workshop** — that is the
+		// whole of "one recipe per type", with no flag column and nothing to keep in sync. A Sawmill
+		// makes planks; that is what a Sawmill is.
+		//
+		// The inputs live in `recipe_input`, `building_cost`'s twin, rather than as a signed column on
+		// `building_cost` itself: that table's five readers all mean "what this type costs to place",
+		// and the first one that forgot a new filter would charge a Longhouse in planks it never took.
+		//
+		// The skill a batch is worked at is deliberately absent: it is the *output resource's*
+		// `skill_id`, which widens that column from "what takes this off a tile" to "what produces
+		// this". So a Carpenter finishes a plank batch faster than a settler with no rule saying so.
+		//
+		// Nullable and all-or-none (the shape `character_tier` uses), so a half-written recipe cannot
+		// exist — a workshop that produces nothing, or produces it in no time, would be a batch that
+		// pays out zero or completes instantly.
+		producesResourceId: integer('produces_resource_id').references((): AnyPgColumn => resource.id),
+		/** How much one batch makes. Fixed per recipe, not player-chosen — a row, retunable. */
+		outputQuantity: integer('output_quantity'),
+		/** Ideal effort for one batch, same units as build_seconds: a crew divides it by its own pace. */
+		craftSeconds: integer('craft_seconds')
+	},
+	(t) => [
+		check(
+			'building_type_recipe',
+			sql`(${t.producesResourceId} IS NULL AND ${t.outputQuantity} IS NULL AND ${t.craftSeconds} IS NULL)
+			 OR (${t.producesResourceId} IS NOT NULL AND ${t.outputQuantity} IS NOT NULL AND ${t.craftSeconds} IS NOT NULL)`
+		),
+		// Every quantity column in this schema carries its own bound; the all-or-none check above only
+		// says the three are set together, and 0 of them is set together perfectly well.
+		check(
+			'building_type_output_positive',
+			sql`${t.outputQuantity} IS NULL OR ${t.outputQuantity} > 0`
+		),
+		check('building_type_craft_positive', sql`${t.craftSeconds} IS NULL OR ${t.craftSeconds} > 0`)
+	]
+);
 
 // A row exists only once built — presence *is* built, so there is no status column.
 export const building = pgTable(
@@ -223,6 +260,26 @@ export const buildingCost = pgTable(
 		// A zero-cost row and a missing row would mean the same thing said two ways; a negative
 		// one would pay you to build.
 		check('building_cost_positive', sql`${t.quantity} > 0`)
+	]
+);
+
+// What one batch consumes — `building_cost`'s twin, and deliberately a second table rather than a
+// direction column on it (see building_type.produces_resource_id). Same shape, same rules: content,
+// not code (VISION #10), no row for a type means that side of the recipe takes nothing.
+export const recipeInput = pgTable(
+	'recipe_input',
+	{
+		buildingTypeId: integer('building_type_id')
+			.notNull()
+			.references(() => buildingType.id),
+		resourceId: integer('resource_id')
+			.notNull()
+			.references(() => resource.id),
+		quantity: integer('quantity').notNull()
+	},
+	(t) => [
+		primaryKey({ columns: [t.buildingTypeId, t.resourceId] }),
+		check('recipe_input_positive', sql`${t.quantity} > 0`)
 	]
 );
 
@@ -491,9 +548,13 @@ export const operation = pgTable(
 		// A queued build is exempt: it is precisely the row that has a building type but no
 		// completion time yet, and this CHECK demanding one unconditionally is why a queued build
 		// could not be written before.
+		//
+		// A craft is held to the same invariant, because it is the same shape: its building type
+		// names the *workshop* (which is how completion finds the recipe) and its completion time
+		// is when the batch lands.
 		check(
 			'operation_build_is_complete',
-			sql`${t.type} <> 'build' OR ${t.status} = 'queued' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
+			sql`${t.type} NOT IN ('build', 'craft') OR ${t.status} = 'queued' OR (${t.buildingTypeId} IS NOT NULL AND ${t.completeAt} IS NOT NULL)`
 		),
 		check(
 			'operation_in_progress_has_started',

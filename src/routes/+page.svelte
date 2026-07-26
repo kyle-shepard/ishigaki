@@ -35,7 +35,9 @@
 		NO_IDLE_SETTLER: 'You have no idle settler to train.',
 		MISSING_SCHOOL: 'Training needs a School on the tile.',
 		UNKNOWN_PROFESSION: "That isn't a profession anyone can learn.",
-		NOT_A_ROAD: "That isn't a road you can change."
+		NOT_A_ROAD: "That isn't a road you can change.",
+		NOT_A_WORKSHOP: 'Nothing on that tile makes anything.',
+		WORKSHOP_BUSY: 'That workshop is already working on a batch.'
 	};
 
 	// A click selects a tile; the inspector panel to the right of the map owns the verbs. No
@@ -233,12 +235,13 @@
 		const tick = () => {
 			nowMs = Date.now() - clockOffset;
 
-			// One refetch when a build comes due — the server resolves it on read. Gathers are
-			// excluded because they never come due; they are collected by the idle heartbeat
-			// above, which is also what keeps the resource bar creeping upward.
+			// One refetch when a build or a batch comes due — the server resolves it on read. Gathers
+			// are excluded because they never come due; they are collected by the idle heartbeat
+			// above, which is also what keeps the resource bar creeping upward. A batch has to be in
+			// here or the planks it made would sit unseen until the 30 s heartbeat noticed them.
 			const due = world?.operations.filter(
 				(o) =>
-					o.type === 'build' &&
+					(o.type === 'build' || o.type === 'craft') &&
 					o.completeAt !== null &&
 					Date.parse(o.completeAt) <= nowMs &&
 					!settled.has(o.id)
@@ -320,8 +323,19 @@
 		});
 	}
 
+	// Order a batch at the workshop on the selected tile. No building type in the body — the thing
+	// standing there is the recipe.
+	function craftHere() {
+		if (!selected) return;
+		const { x, y } = selected;
+		act('/api/craft', {
+			method: 'POST',
+			body: JSON.stringify({ x, y, crewSize, allowedProfessionIds })
+		});
+	}
+
 	const recall = (id: number) => act(`/api/assignments/${id}`, { method: 'DELETE' });
-	// Cancel an in-progress build; the server deletes the operation and refunds the full cost.
+	// Cancel an unfinished build or batch; the server deletes the operation and refunds in full.
 	const cancelSite = (id: number) => act(`/api/orders/${id}`, { method: 'DELETE' });
 
 	async function newGame() {
@@ -378,13 +392,18 @@
 		return `Tile ${x}, ${y} — ${t.displayName}${yield_}${on}`;
 	}
 	const typeName = (id: number) => buildingTypeById.get(id)?.displayName ?? '?';
-	// A building with no cost rows is free, and says so rather than showing an empty bracket.
-	function priceOf(id: number) {
-		const parts = (world?.buildingCosts ?? [])
+	// A build's price and a recipe's inputs are the same shape asked of two tables, so one formatter
+	// serves both — "6 Wood", "20 Wood + 10 Planks". Empty for a type with no rows.
+	const quantities = (
+		rows: { buildingTypeId: number; resourceId: number; quantity: number }[],
+		id: number
+	) =>
+		rows
 			.filter((c) => c.buildingTypeId === id)
-			.map((c) => `${c.quantity} ${resourceName.get(c.resourceId)}`);
-		return parts.length ? parts.join(' + ') : 'free';
-	}
+			.map((c) => `${c.quantity} ${resourceName.get(c.resourceId)}`)
+			.join(' + ');
+	// A building with no cost rows is free, and says so rather than showing an empty bracket.
+	const priceOf = (id: number) => quantities(world?.buildingCosts ?? [], id) || 'free';
 	const resourceAt = (x: number, y: number) => {
 		const id = terrainById.get(world!.terrain[y * GRID_SIZE + x])?.yieldsResourceId;
 		return id ? resourceName.get(id) : 'nothing';
@@ -426,7 +445,16 @@
 		if (leg && travelFraction(leg, nowMs) < 1) return `walking to ${op.destX}, ${op.destY}`;
 		if (op.type === 'build') return `building ${typeName(op.buildingTypeId!)}`;
 		if (op.type === 'train') return `training as ${professionName.get(op.professionId!)}`;
+		// Before this branch existed, the fall-through reported a crafter as "gathering nothing" —
+		// a craft's buildingTypeId names the workshop, so it names what is being *made*, not raised.
+		if (op.type === 'craft') return `making ${outputOf(op.buildingTypeId!)}`;
 		return `gathering ${resourceAt(op.destX, op.destY)}`;
+	}
+	// What a workshop type makes, as a phrase: "10 Planks". Empty for a type with no recipe.
+	function outputOf(typeId: number) {
+		const t = buildingTypeById.get(typeId);
+		if (!t || t.producesResourceId === null) return '';
+		return `${t.outputQuantity} ${resourceName.get(t.producesResourceId)}`;
 	}
 
 	// Everything the panel reads off the selected tile. Derived, so a build landing or a worker
@@ -471,6 +499,21 @@
 	const chosenOk = $derived(buildOptions.some((o) => o.id === chosen && !o.blocked));
 	// Training is offered where a finished School stands on the selected tile.
 	const selIsSchool = $derived(!!selBuilt && typeName(selBuilt.buildingTypeId) === 'School');
+	// A workshop is a *type* that carries a recipe — keyed on that rather than on the name 'Sawmill',
+	// which is the reskin column (VISION #10), so a Joinery needs no client change to offer its verb.
+	const selWorkshop = $derived.by(() => {
+		const t = selBuilt ? buildingTypeById.get(selBuilt.buildingTypeId) : undefined;
+		return t && t.producesResourceId !== null ? t : undefined;
+	});
+	// The batch in flight at the selected tile, if there is one. One at a time, so `find` is the
+	// whole answer rather than the first of several.
+	const selBatch = $derived(
+		selected
+			? world?.operations.find(
+					(o) => o.type === 'craft' && o.destX === selected!.x && o.destY === selected!.y
+				)
+			: undefined
+	);
 	const present = $derived(
 		selected && world
 			? world.characters.filter((c) => {
@@ -990,6 +1033,33 @@
 						.join(', ')}
 				</p>
 				<p><button onclick={() => cancelSite(selSite.id)}>Cancel — full refund</button></p>
+			{/if}
+
+			<!-- A verb that appears on one kind of building only — the same shape as the School's Train
+			     block below. Keyed on the type carrying a recipe, so every future workshop gets it. -->
+			{#if selWorkshop}
+				<h3>Make {outputOf(selWorkshop.id)}</h3>
+				{#if selBatch}
+					<p class="crew">
+						Being made by {selBatch.workers
+							.map((w) => {
+								const c = characterById.get(w.characterId);
+								return c ? who(c) : 'someone';
+							})
+							.join(', ')}
+					</p>
+					<p><button onclick={() => cancelSite(selBatch.id)}>Cancel — full refund</button></p>
+				{:else}
+					<!-- The inputs leave stock the moment you press the button, so they are named before
+					     it rather than discovered after. -->
+					<p class="price">Uses {quantities(world.recipeInputs, selWorkshop.id)}</p>
+					<label class="crew-size">
+						Crew
+						<input type="number" min="1" max={world.characters.length} bind:value={crewSize} />
+						<span class="price">more hands, less craft</span>
+					</label>
+					<button onclick={craftHere}>Make a batch</button>
+				{/if}
 			{/if}
 
 			{#if present.length}

@@ -11,6 +11,7 @@ import {
 	player,
 	profession,
 	professionSkill,
+	recipeInput,
 	resource,
 	settlement,
 	skill,
@@ -31,6 +32,7 @@ import {
 	route,
 	skillValue,
 	type EstimateResponse,
+	type OperationType,
 	type OrderReason,
 	type WorldPayload
 } from './world';
@@ -325,7 +327,7 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			continue;
 		}
 
-		// Build and train are both edge-triggered — due or not.
+		// Build, train and craft are all edge-triggered — due or not.
 		if (op.completeAt!.getTime() > nowMs) continue;
 		await tx.update(operation).set({ status: 'completed' }).where(eq(operation.id, op.id));
 
@@ -362,16 +364,43 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			continue;
 		}
 
-		await tx.insert(building).values({
-			playerId,
-			x: op.destX,
-			y: op.destY,
-			buildingTypeId: op.buildingTypeId!,
-			// The crew's workmanship, carried onto the thing they made. This is the last moment it
-			// exists: the operation that knows it is about to be history.
-			quality: op.qualityMultiplier
-		});
-		// The whole crew ends up standing at the site they raised.
+		if (op.type === 'craft') {
+			// A batch ends by adding to stock rather than by raising a building. `building_type_id`
+			// names the workshop, which is how completion finds the recipe — read now rather than
+			// snapshotted at order time, so a live retune of the output reaches batches in flight
+			// the same way a retuned profession reaches the next job (VISION #10).
+			//
+			// Stock rows exist for every resource from creation (and the seed backfills resources
+			// added later), so this is a plain UPDATE like the other four stock writes.
+			const [made] = await tx
+				.select({
+					producesResourceId: buildingType.producesResourceId,
+					outputQuantity: buildingType.outputQuantity
+				})
+				.from(buildingType)
+				.where(eq(buildingType.id, op.buildingTypeId!));
+			// A workshop whose recipe was removed while a batch was in flight. Paying nothing is
+			// the safe reading, the same one the gather branch gives a tile that stopped yielding.
+			if (made?.producesResourceId != null && made.outputQuantity != null)
+				await tx
+					.update(stock)
+					.set({ quantity: sql`${stock.quantity} + ${made.outputQuantity}` })
+					.where(
+						and(eq(stock.settlementId, home.id), eq(stock.resourceId, made.producesResourceId))
+					);
+		} else {
+			await tx.insert(building).values({
+				playerId,
+				x: op.destX,
+				y: op.destY,
+				buildingTypeId: op.buildingTypeId!,
+				// The crew's workmanship, carried onto the thing they made. This is the last moment it
+				// exists: the operation that knows it is about to be history.
+				quality: op.qualityMultiplier
+			});
+		}
+		// The whole crew ends up standing where they worked — the site they raised, or the
+		// workshop they ran. Shared by both branches rather than copied into each.
 		if (crew.length)
 			await tx
 				.update(character)
@@ -450,12 +479,23 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 	}
 }
 
-/** Puts a build's full cost back — the placement deduction run with `+` instead of `-`. */
-async function refundBuild(tx: Tx, settlementId: number, buildingTypeId: number): Promise<void> {
-	const costs = await tx
-		.select()
-		.from(buildingCost)
-		.where(eq(buildingCost.buildingTypeId, buildingTypeId));
+/**
+ * Puts an order's full charge back — the order-time deduction run with `+` instead of `-`.
+ *
+ * Which table that charge came from follows the type, and nothing else: a build was priced by
+ * `building_cost`, a batch by `recipe_input`. Reading the wrong one would silently refund nothing,
+ * which is how a famine could eat a batch's wood and return none of it.
+ */
+async function refundOrder(
+	tx: Tx,
+	settlementId: number,
+	type: OperationType,
+	buildingTypeId: number
+): Promise<void> {
+	const costs =
+		type === 'craft'
+			? await tx.select().from(recipeInput).where(eq(recipeInput.buildingTypeId, buildingTypeId))
+			: await tx.select().from(buildingCost).where(eq(buildingCost.buildingTypeId, buildingTypeId));
 	for (const c of costs) {
 		await tx
 			.update(stock)
@@ -465,7 +505,7 @@ async function refundBuild(tx: Tx, settlementId: number, buildingTypeId: number)
 }
 
 /**
- * Deletes any in-progress operation left with nobody on it, refunding the builds among them.
+ * Deletes any in-progress operation left with nobody on it, refunding the ones that were paid for.
  *
  * An operation *is* its crew — with the crew gone there is nobody to move on completion and
  * nobody to pay, so leaving the row would strand a build that completes into a building nobody
@@ -492,11 +532,13 @@ async function deleteCrewlessOperations(tx: Tx, playerId: number): Promise<void>
 		);
 	if (crewless.length === 0) return;
 
-	const builds = crewless.filter((op) => op.type === 'build');
-	if (builds.length) {
+	// Both paid-at-order types, not just builds: a craft's inputs left stock the moment it was
+	// ordered, so a famine that eats the crew must hand them back too, or the wood is simply gone.
+	const paid = crewless.filter((op) => op.type === 'build' || op.type === 'craft');
+	if (paid.length) {
 		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
 		if (!home) throw new Error(`player ${playerId} has no settlement`);
-		for (const b of builds) await refundBuild(tx, home.id, b.buildingTypeId!);
+		for (const b of paid) await refundOrder(tx, home.id, b.type, b.buildingTypeId!);
 	}
 	// The membership rows go with it by cascade — there are none left to go.
 	await tx.delete(operation).where(
@@ -1374,6 +1416,206 @@ export async function assignTraining(
 	});
 }
 
+/** A batch as it *would* happen — a build plan, plus the workshop whose recipe it runs. */
+export type CraftPlan = BuildPlan & { buildingTypeId: number };
+export type CraftPlanResult = { ok: true; plan: CraftPlan } | { ok: false; reason: OrderReason };
+
+/**
+ * Everything ordering a batch decides, and none of what it writes — `planBuild`'s twin, refusals as
+ * values for the same reason.
+ *
+ * A batch *is* a build in all but its ending, so it reuses that path wholesale: the same crew
+ * ranking, the same `solveCrew` arithmetic, the same pay-in-full-at-order model. Two things differ.
+ * The type is not chosen — the building standing on the tile is the recipe, so there is nothing for
+ * a client to name and nothing for it to get wrong. And the crew is ranked by the **output
+ * resource's** skill, which is the whole of "a Carpenter makes planks faster than a settler": no
+ * rule anywhere says so, `resource.skill_id` does.
+ *
+ * The caller must have run `resolveWorld` first, same as `planBuild` — a stale idle set would send
+ * a worker who is already busy.
+ */
+async function planCraft(
+	tx: Tx,
+	playerId: number,
+	x: number,
+	y: number,
+	crewSize: number,
+	allowedProfessionIds: number[] | null | undefined
+): Promise<CraftPlanResult> {
+	// Both normalised exactly as `planBuild` does them — a crew size is a dial, and an empty filter
+	// is a player who unchecked everything rather than one who wants nobody.
+	const wanted = Number.isFinite(crewSize) ? Math.max(1, Math.floor(crewSize)) : 1;
+	const allowed = allowedProfessionIds?.length ? allowedProfessionIds : null;
+
+	if (!Number.isInteger(x) || !Number.isInteger(y)) return { ok: false, reason: 'OUT_OF_BOUNDS' };
+	if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE)
+		return { ok: false, reason: 'OUT_OF_BOUNDS' };
+
+	// An array element takes no foreign key, so a filter naming a profession that doesn't exist has
+	// to fail loudly here — see the column comment and `planBuild`'s copy of this check.
+	if (allowed) {
+		const known = new Set(
+			(await tx.select({ id: profession.id }).from(profession)).map((p) => p.id)
+		);
+		if (allowed.some((id) => !known.has(id))) return { ok: false, reason: 'UNKNOWN_PROFESSION' };
+	}
+
+	// A building you own, standing on this tile, whose type carries a recipe. All three failures are
+	// one reason on purpose: a building that isn't yours must not be distinguishable from one that
+	// isn't there (the same argument NOT_A_ROAD makes).
+	const [shop] = await tx
+		.select({
+			buildingTypeId: buildingType.id,
+			producesResourceId: buildingType.producesResourceId,
+			craftSeconds: buildingType.craftSeconds
+		})
+		.from(building)
+		.innerJoin(buildingType, eq(building.buildingTypeId, buildingType.id))
+		.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
+	if (!shop || shop.producesResourceId === null || shop.craftSeconds === null)
+		return { ok: false, reason: 'NOT_A_WORKSHOP' };
+
+	// One batch at a time. Without this a Sawmill is not a bottleneck — you would build one and run
+	// six batches through it at once, and there would be no reason for the catalog to grow.
+	// Queued as well as in-progress: a batch waiting for a crafter is still this workshop's batch.
+	//
+	// The build path needs no matching change: its own occupancy probe filters `type = 'build'`, so
+	// a batch never blocks a build, and a tile with a building on it already refuses one.
+	const [running] = await tx
+		.select({ id: operation.id })
+		.from(operation)
+		.where(
+			and(
+				eq(operation.playerId, playerId),
+				ne(operation.status, 'completed'),
+				eq(operation.type, 'craft'),
+				eq(operation.destX, x),
+				eq(operation.destY, y)
+			)
+		);
+	if (running) return { ok: false, reason: 'WORKSHOP_BUSY' };
+
+	// The inputs, judged in full before anything is spent — a two-resource recipe can't half-pay.
+	// Judged *before* the crew, unlike a build: "you don't have the materials" is a standing fact
+	// about the realm, while "everyone is busy" is a minute old, and the standing one is the more
+	// useful sentence when both are true.
+	const costs = await tx
+		.select()
+		.from(recipeInput)
+		.where(eq(recipeInput.buildingTypeId, shop.buildingTypeId));
+	const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
+	if (!home) throw new Error(`player ${playerId} has no settlement`);
+	const held = new Map(
+		(await tx.select().from(stock).where(eq(stock.settlementId, home.id))).map((s) => [
+			s.resourceId,
+			s.quantity
+		])
+	);
+	if (costs.some((c) => (held.get(c.resourceId) ?? 0) < c.quantity))
+		return { ok: false, reason: 'INSUFFICIENT_RESOURCES' };
+
+	// The skill that *produces* the output — gathered or made, one column either way. A resource
+	// with none is an unseeded catalog rather than a game rule, so it throws like the others.
+	const [out] = await tx
+		.select({ skillId: resource.skillId })
+		.from(resource)
+		.where(eq(resource.id, shop.producesResourceId));
+	if (!out?.skillId)
+		throw new Error(
+			`resource ${shop.producesResourceId} is produced by a recipe but has no skill — ` +
+				'run `npm run seed` against this database'
+		);
+
+	const ranked = await rankIdleWorkers(tx, playerId, out.skillId, allowed);
+	const crew = ranked.slice(0, wanted);
+	// ponytail: no crafter free is a refusal *this slice only* — nothing is written yet, so no
+	// reservation is lost. Slice 2 replaces it with the queue a build already has.
+	if (crew.length === 0) return { ok: false, reason: 'NO_IDLE_CHARACTER' };
+
+	// `craft_seconds` is ideal effort, the same units as `build_seconds` — so a crew divides it by
+	// its own pace through exactly the arithmetic a build uses, travel included.
+	const grid = await loadGrid(tx, playerId);
+	const solved = solveCrew(crew, shop.craftSeconds, x, y, movementCostIn(grid));
+
+	return {
+		ok: true,
+		plan: {
+			crew: solved.crew,
+			seconds: solved.seconds,
+			quality: solved.quality,
+			costs: costs.map((c) => ({ resourceId: c.resourceId, quantity: c.quantity })),
+			settlementId: home.id,
+			allowed,
+			crewSize: wanted,
+			buildingTypeId: shop.buildingTypeId
+		}
+	};
+}
+
+/**
+ * Orders a batch at a workshop: the plan above, then the writes it implies — the inputs spent, the
+ * operation, and one membership row per member of the crew.
+ *
+ * Inputs leave stock at order time, not on completion, for the same reason a build's cost does:
+ * there is a cancel path that refunds in full, and a charge that failed at completion would fail
+ * silently while the player was away — which is exactly when completion happens.
+ */
+export async function createCraftOrder(
+	playerId: number,
+	x: number,
+	y: number,
+	crewSize: number = 1,
+	allowedProfessionIds: number[] | null = null
+): Promise<OrderResult> {
+	return db.transaction(async (tx): Promise<OrderResult> => {
+		await resolveWorld(tx, playerId);
+
+		const planned = await planCraft(tx, playerId, x, y, crewSize, allowedProfessionIds);
+		if (!planned.ok) return { ok: false, reason: planned.reason };
+		const {
+			crew,
+			seconds,
+			quality,
+			costs,
+			settlementId,
+			allowed,
+			crewSize: wanted,
+			buildingTypeId
+		} = planned.plan;
+
+		for (const c of costs) {
+			await tx
+				.update(stock)
+				.set({ quantity: sql`${stock.quantity} - ${c.quantity}` })
+				.where(and(eq(stock.settlementId, settlementId), eq(stock.resourceId, c.resourceId)));
+		}
+
+		const [op] = await tx
+			.insert(operation)
+			.values({
+				playerId,
+				type: 'craft',
+				status: 'in-progress',
+				destX: x,
+				destY: y,
+				// The workshop, not something being raised — this is how completion finds the recipe.
+				buildingTypeId,
+				// How well the batch was made. Nothing reads it yet, but a completed operation is kept
+				// forever, so every batch already carries a permanent record of its own workmanship —
+				// which is the thing that could not be reconstructed afterwards.
+				qualityMultiplier: quality!,
+				allowedProfessionIds: allowed,
+				crewSize: wanted,
+				startedAt: sql`now()`,
+				completeAt: sql`now() + ${`${seconds} seconds`}::interval`
+			})
+			.returning({ id: operation.id });
+		await insertCrew(tx, op.id, crew);
+
+		return { ok: true, world: await readWorld(tx, playerId) };
+	});
+}
+
 /** Ends an assignment. `resolveWorld` above has already paid out the final stretch. */
 export async function recallWorker(playerId: number, operationId: number): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
@@ -1413,26 +1655,31 @@ export async function recallWorker(playerId: number, operationId: number): Promi
 }
 
 /**
- * Cancels an in-progress build and refunds its full cost. Unlike `recallWorker` — which marks a
- * gather completed so the worker is paid out and left standing — a cancelled build must **delete**
- * the operation row: a lingering in-progress build op becomes a building on the next `resolveWorld`
- * read. Deleting frees the worker and the tile automatically, since both occupancy checks key on
- * the in-progress op.
+ * Cancels an unfinished build or craft batch and refunds its full charge. Unlike `recallWorker` —
+ * which marks a gather completed so the worker is paid out and left standing — a cancelled order
+ * must **delete** the operation row: a lingering in-progress one becomes a building, or a payout,
+ * on the next `resolveWorld` read. Deleting frees the worker and the tile automatically, since
+ * every occupancy check keys on the unfinished op.
  *
- * The refund is the placement deduction (`createBuildOrder`) run with `+` instead of `-`, always in
- * full — payment was taken in full at order and never prorated, so the return is too.
+ * The refund is the order-time deduction run with `+` instead of `-`, always in full — payment was
+ * taken in full at order and never prorated, so the return is too.
+ *
+ * **The two refundable types, and only those.** Widening this to "anything not completed" would let
+ * `DELETE /api/orders/<a-gather-id>` delete a working gather: it would find no cost rows for its
+ * null `building_type_id`, refund nothing, and free the body with none of `recallWorker`'s
+ * semantics. A gather is recalled, not cancelled.
  *
  * **Delete-first, refund-only-on-RETURNING.** A double-clicked Cancel sends two DELETEs; a
- * select-then-refund-then-delete order would let both refund one build (a trivially-triggered
+ * select-then-refund-then-delete order would let both refund one order (a trivially-triggered
  * resource dupe). So the `DELETE … RETURNING` is the single point that picks a winner: exactly one
  * racer gets the row back and refunds, the loser gets nothing and returns `UNKNOWN_OPERATION`.
  * (`recallWorker`'s status-flip is idempotent enough to skip this; a refund is not.)
  */
-export async function cancelBuild(playerId: number, operationId: number): Promise<OrderResult> {
+export async function cancelOrder(playerId: number, operationId: number): Promise<OrderResult> {
 	return db.transaction(async (tx): Promise<OrderResult> => {
-		// resolveWorld may complete this very build first (turning it into a building), or start a
-		// queued one; either way the delete below matches on "not completed", so a build that
-		// finished while the player was deciding is correctly refused rather than refunded.
+		// resolveWorld may complete this very order first (turning it into a building, or into
+		// stock), or start a queued one; either way the delete below matches on "not completed", so
+		// one that finished while the player was deciding is correctly refused rather than refunded.
 		await resolveWorld(tx, playerId);
 
 		const [cancelled] = await tx
@@ -1441,18 +1688,18 @@ export async function cancelBuild(playerId: number, operationId: number): Promis
 				and(
 					eq(operation.id, operationId),
 					eq(operation.playerId, playerId),
-					// Queued as well as in-progress: a build you have got tired of waiting for is
+					// Queued as well as in-progress: an order you have got tired of waiting for is
 					// exactly the one you want to take back, and the refund is identical either way.
 					ne(operation.status, 'completed'),
-					eq(operation.type, 'build')
+					inArray(operation.type, ['build', 'craft'])
 				)
 			)
-			.returning({ buildingTypeId: operation.buildingTypeId });
+			.returning({ type: operation.type, buildingTypeId: operation.buildingTypeId });
 		if (!cancelled) return { ok: false, reason: 'UNKNOWN_OPERATION' };
 
 		const [home] = await tx.select().from(settlement).where(eq(settlement.playerId, playerId));
 		if (!home) throw new Error(`player ${playerId} has no settlement`);
-		await refundBuild(tx, home.id, cancelled.buildingTypeId!);
+		await refundOrder(tx, home.id, cancelled.type, cancelled.buildingTypeId!);
 
 		return { ok: true, world: await readWorld(tx, playerId) };
 	});
@@ -1507,6 +1754,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 	// Ordered, because the client picks a default from this list by position.
 	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
 	const costs = await tx.select().from(buildingCost);
+	// `building_cost`'s twin: what one batch consumes at each workshop.
+	const recipes = await tx.select().from(recipeInput);
 	// Terrain and resources are global catalogs, unfiltered by player — same split as
 	// buildingTypes. The ground is the world's, not yours.
 	const terrainTypes = await tx.select().from(terrainType);
@@ -1647,6 +1896,11 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			resourceId: c.resourceId,
 			quantity: c.quantity
 		})),
+		recipeInputs: recipes.map((r) => ({
+			buildingTypeId: r.buildingTypeId,
+			resourceId: r.resourceId,
+			quantity: r.quantity
+		})),
 		terrain,
 		buildingTypes: types.map((t) => ({
 			id: t.id,
@@ -1654,7 +1908,12 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			icon: t.icon,
 			buildSeconds: t.buildSeconds,
 			movementCost: t.movementCost,
-			requiresBuildingTypeId: t.requiresBuildingTypeId
+			requiresBuildingTypeId: t.requiresBuildingTypeId,
+			// All three or none — non-null is what makes this type a workshop, and the client reads
+			// exactly that to decide whether a tile offers "Make 10 Planks".
+			producesResourceId: t.producesResourceId,
+			outputQuantity: t.outputQuantity,
+			craftSeconds: t.craftSeconds
 		})),
 		buildings: buildings.map((b) => ({
 			id: b.id,

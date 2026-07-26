@@ -29,7 +29,12 @@ export type OrderReason =
 	// Restyling something that is not a road you own. Deliberately one reason for both halves —
 	// "no such building" and "not a road" — because a building belonging to somebody else must not
 	// be distinguishable from one that does not exist.
-	| 'NOT_A_ROAD';
+	| 'NOT_A_ROAD'
+	// Crafting: the tile holds no workshop of yours (no building, someone else's, or one whose type
+	// carries no recipe — one reason for all three, same argument as NOT_A_ROAD), and a workshop
+	// already working a batch takes no second one.
+	| 'NOT_A_WORKSHOP'
+	| 'WORKSHOP_BUSY';
 
 // crewSize is how many bodies to send — a *maximum*, not a requirement: the order takes up to that
 // many of the qualifying idle workers and is happy with fewer. Optional on the wire so an older
@@ -46,6 +51,15 @@ export type OrderRequest = {
 	allowedProfessionIds?: number[] | null;
 };
 export type TrainRequest = { x: number; y: number; professionId: number };
+// Ordering a batch at a workshop. No buildingTypeId: the tile already holds the building, and that
+// building's type *is* the recipe — asking the client to name it would be asking it to agree with
+// what is standing there.
+export type CraftRequest = {
+	x: number;
+	y: number;
+	crewSize?: number;
+	allowedProfessionIds?: number[] | null;
+};
 
 // The same shape as an order, because it asks the same question — it just doesn't spend.
 export type EstimateRequest = OrderRequest;
@@ -127,6 +141,9 @@ export type WorldPayload = {
 	stock: { resourceId: number; quantity: number; ratePerHour: number }[];
 	// What each building type costs. A type with no entries is free.
 	buildingCosts: { buildingTypeId: number; resourceId: number; quantity: number }[];
+	// What one batch consumes at each workshop — the same shape as buildingCosts, because it is the
+	// same question asked of the other table. Only workshop types appear.
+	recipeInputs: { buildingTypeId: number; resourceId: number; quantity: number }[];
 	// Row-major, index = y * gridSize + x, value = terrainTypeId — the same flat indexing the
 	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
 	// client estimates travel.
@@ -150,6 +167,11 @@ export type WorldPayload = {
 		// The type that must stand somewhere in your realm before this one can be placed; null if
 		// none. The client greys a type whose prerequisite isn't owned, labelled with its name.
 		requiresBuildingTypeId: number | null;
+		// The recipe, all three or none of them. Non-null is what makes a type a **workshop**: the
+		// client offers "Make 10 Planks" on one you own, and nothing else in the payload says so.
+		producesResourceId: number | null;
+		outputQuantity: number | null;
+		craftSeconds: number | null;
 	}[];
 	// quality is how well it was built — null on anything raised before it was recorded, which
 	// reads as nothing at all rather than as "unknown". roadMask is the player's override of a
@@ -183,7 +205,10 @@ export type WorldPayload = {
 	operations: {
 		id: number;
 		type: OperationType;
-		// Both null on a gather: it builds nothing, and it never finishes on its own.
+		// Both null on a gather: it builds nothing, and it never finishes on its own. On a **craft**
+		// this names the workshop the batch is being made at, not something being raised — which is
+		// why every site-ghost and build-list filter here keys on `type === 'build'` rather than on
+		// this being set.
 		buildingTypeId: number | null;
 		// The profession a train operation will grant; null on build/gather.
 		professionId: number | null;
@@ -205,7 +230,9 @@ export type WorldPayload = {
 	}[];
 };
 
-export type OperationType = 'build' | 'gather' | 'train';
+// 'craft' is a batch at a workshop: a build in all but its ending — cost taken up front, crew solved
+// by the same arithmetic, one completion time — that adds to stock instead of raising a building.
+export type OperationType = 'build' | 'gather' | 'train' | 'craft';
 
 export type AssignRequest = { x: number; y: number };
 

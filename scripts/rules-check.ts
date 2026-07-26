@@ -60,13 +60,18 @@ const typeId = (name: string) => {
 	return t.id;
 };
 const house = typeId('House');
-const woodHeld = (w: {
+type Held = {
 	stock: { resourceId: number; quantity: number }[];
 	resources: { id: number; displayName: string }[];
-}) => {
-	const wood = w.resources.find((r) => r.displayName === 'Wood')!.id;
-	return w.stock.find((s) => s.resourceId === wood)!.quantity;
 };
+// How much of one named resource a payload says you hold. Named rather than whole-stock, because
+// `resolveWorld` runs inside every writer and drains Food as it goes — a before/after comparison of
+// the *whole* of stock would be flaky rather than strict.
+const heldOf = (w: Held, name: string) => {
+	const id = w.resources.find((r) => r.displayName === name)!.id;
+	return w.stock.find((s) => s.resourceId === id)?.quantity ?? 0;
+};
+const woodHeld = (w: Held) => heldOf(w, 'Wood');
 
 // A realm now starts with nothing, so a costed building can't be used to assert anything
 // about *terrain* — every such order would be refused for want of Wood, and the check would
@@ -548,6 +553,244 @@ check(
 	'cancelling a queued build twice is refused, not a second refund',
 	(await api(`/api/orders/${toCancel.id}`, { method: 'DELETE' })).body.reason,
 	'UNKNOWN_OPERATION'
+);
+
+// ---- Production: a Sawmill turns 20 Wood into 10 Planks ---------------------------------------
+//
+// One sandbox for the whole group, because everything here needs a Sawmill *standing* and raising
+// one is the slow part. The waits are real elapsed time rather than polling: "a batch left alone
+// past its completion lands on the next read" is only proved by not reading until then.
+const sawmill = typeId('Sawmill');
+const schoolType = typeId('School');
+const carpenter = professionId('Carpenter');
+// The clear grass the hamlet is guaranteed (see START_MARGIN in worldgen.ts): one tile below the
+// settlers' own row, so the crew yardly walks, and one further along for the empty-tile case.
+const mill = fromWorld(START.characterX, START.characterY + 1);
+const yard = fromWorld(START.characterX + 2, START.characterY + 1);
+
+const craft = (cx: number, cy: number, crewSize?: number, allowedProfessionIds?: number[]) => {
+	const [x, y] = core(cx, cy);
+	return api('/api/craft', {
+		method: 'POST',
+		body: JSON.stringify({ x, y, crewSize, allowedProfessionIds })
+	});
+};
+/** Sleeps until an operation is genuinely due, then reads **once**. Nothing looks in between. */
+async function waitOut(op: { completeAt: string }, slackMs = 2000) {
+	const wait = Date.parse(op.completeAt) - Date.now() + slackMs;
+	if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+	return (await api('/api/world')).body;
+}
+const stands = (
+	w: { buildings: { x: number; y: number }[] },
+	[cx, cy]: readonly [number, number]
+) => {
+	const [x, y] = core(cx, cy);
+	return w.buildings.some((b) => b.x === x && b.y === y);
+};
+type WireOp = {
+	id: number;
+	type: string;
+	startedAt: string;
+	completeAt: string;
+	workers: { characterId: number }[];
+};
+const craftOp = (w: { operations: WireOp[] }) => w.operations.find((o) => o.type === 'craft');
+
+cookie = '';
+const shopStart = await api('/api/world');
+const woodAtStart = woodHeld(shopStart.body);
+const raising = await order(...mill, sawmill, 3);
+const millSite = raising.body.operations?.find((o: { type: string }) => o.type === 'build');
+if (!millSite) throw new Error(`the Sawmill order was refused: ${JSON.stringify(raising.body)}`);
+let realm = await waitOut(millSite);
+check('a Sawmill can be raised, and stands', stands(realm, mill), true);
+
+// Nothing on the tile, and something on the tile that makes nothing, are the same refusal — a
+// building that is not yours must not be distinguishable from one that is not there.
+check(
+	'crafting on empty ground is refused — nothing there makes anything',
+	[(await craft(...yard)).status, (await craft(...yard)).body.reason],
+	[400, 'NOT_A_WORKSHOP']
+);
+const atHamlet = fromWorld(START.hamletX, START.hamletY);
+check(
+	'crafting at a House is refused too — a workshop is a type that carries a recipe',
+	(await craft(...atHamlet)).body.reason,
+	'NOT_A_WORKSHOP'
+);
+
+// A gather is recalled, not cancelled. The cancel path widened to crafts, not to everything: left
+// as "anything unfinished", this would delete a working gather, refund nothing, and free the body
+// with none of recallWorker's semantics.
+const working = (await assign(11, 1)).body.operations.find(
+	(o: { type: string }) => o.type === 'gather'
+);
+check(
+	'a gather id is still refused by the build/craft cancel path',
+	(await api(`/api/orders/${working.id}`, { method: 'DELETE' })).body.reason,
+	'UNKNOWN_OPERATION'
+);
+check(
+	'and the gather is still running, not quietly deleted',
+	(await api('/api/world')).body.operations.some((o: { id: number }) => o.id === working.id),
+	true
+);
+await api(`/api/assignments/${working.id}`, { method: 'DELETE' });
+
+// The order itself: inputs leave stock at the click, and the batch is one operation with a clock.
+const woodBeforeBatch = woodHeld((await api('/api/world')).body);
+const settlerBatch = await craft(...mill, 1);
+const solo = craftOp(settlerBatch.body);
+if (!solo) throw new Error(`the settler batch was refused: ${JSON.stringify(settlerBatch.body)}`);
+check(
+	'ordering a batch takes its inputs up front and writes one craft op with a completion time',
+	[
+		settlerBatch.status,
+		woodHeld(settlerBatch.body),
+		solo?.type,
+		solo?.completeAt !== null,
+		solo?.workers.length
+	],
+	[200, woodBeforeBatch - 20, 'craft', true, 1]
+);
+// Without this a Sawmill is not a bottleneck at all — you would build one and run six through it.
+check(
+	'a second batch at a working Sawmill is refused',
+	[(await craft(...mill)).status, (await craft(...mill)).body.reason],
+	[400, 'WORKSHOP_BUSY']
+);
+// How long one settler takes, kept for the skill comparison below — measured off the payload's own
+// clock rather than by waiting it out.
+const settlerSeconds = (Date.parse(solo.completeAt) - Date.parse(solo.startedAt)) / 1000;
+
+const unwound = await api(`/api/orders/${solo.id}`, { method: 'DELETE' });
+check(
+	'cancelling a batch refunds its inputs in full',
+	[unwound.status, woodHeld(unwound.body)],
+	[200, woodBeforeBatch]
+);
+check(
+	'cancelling a batch twice is refused, not a second refund',
+	(await api(`/api/orders/${solo.id}`, { method: 'DELETE' })).body.reason,
+	'UNKNOWN_OPERATION'
+);
+check(
+	'and stock holds exactly one refund after the double cancel',
+	woodHeld((await api('/api/world')).body),
+	woodBeforeBatch
+);
+
+// The payoff, and the offline promise with it: order it, walk away, and the planks are there when
+// you come back — credited once, on the first read that happens after it was due.
+const planksBefore = heldOf((await api('/api/world')).body, 'Planks');
+const batch = craftOp((await craft(...mill, 3)).body);
+if (!batch) throw new Error('the plank batch was refused');
+realm = await waitOut(batch);
+check(
+	'a batch left alone past its completion lands on the very next read, exactly one output',
+	heldOf(realm, 'Planks'),
+	planksBefore + 10
+);
+check(
+	'and a second read does not credit it again',
+	heldOf((await api('/api/world')).body, 'Planks'),
+	planksBefore + 10
+);
+check(
+	'the finished batch is gone from the wire, and left no building behind',
+	[
+		craftOp(realm) === undefined,
+		realm.buildings.filter((b: { buildingTypeId: number }) => b.buildingTypeId === sawmill).length
+	],
+	[true, 1]
+);
+// Planks are made, never taken. This is the epic's whole claim in one assertion: a good that no
+// tile anywhere on the map yields, so a recipe is the only way it can enter the world.
+check(
+	'no terrain anywhere yields Planks',
+	realm.terrainTypes.some(
+		(t: { yieldsResourceId: number | null }) =>
+			t.yieldsResourceId ===
+			realm.resources.find((r: { displayName: string }) => r.displayName === 'Planks').id
+	),
+	false
+);
+
+// Who does the work changes the result — with no rule anywhere saying so, only `resource.skill_id`
+// naming Carpentry on Planks and feeding the same `rankIdleWorkers` a gather and a build use.
+const schooling = await order(...yard, schoolType, 3);
+const schoolSite = schooling.body.operations?.find((o: { type: string }) => o.type === 'build');
+if (!schoolSite) throw new Error(`the School order was refused: ${JSON.stringify(schooling.body)}`);
+await waitOut(schoolSite);
+const [bx, by] = core(...yard);
+const training = await api('/api/training', {
+	method: 'POST',
+	body: JSON.stringify({ x: bx, y: by, professionId: carpenter })
+});
+const lesson = training.body.operations?.find((o: { type: string }) => o.type === 'train');
+if (!lesson) throw new Error(`training was refused: ${JSON.stringify(training.body)}`);
+realm = await waitOut(lesson);
+check(
+	'a Carpenter can be trained',
+	realm.characters.some((c: { professionId: number | null }) => c.professionId === carpenter),
+	true
+);
+const trained = await craft(...mill, 1, [carpenter]);
+const byCarpenter = craftOp(trained.body);
+if (!byCarpenter)
+	throw new Error(`the Carpenter batch was refused: ${JSON.stringify(trained.body)}`);
+const carpenterSeconds =
+	(Date.parse(byCarpenter.completeAt) - Date.parse(byCarpenter.startedAt)) / 1000;
+check(
+	`a Carpenter finishes a batch sooner than a settler (${carpenterSeconds}s vs ${settlerSeconds}s)`,
+	carpenterSeconds < settlerSeconds,
+	true
+);
+await api(`/api/orders/${byCarpenter.id}`, { method: 'DELETE' });
+
+// Cannot afford it beats everyone is busy: the first is a standing fact about the realm, the second
+// is a minute old. Draining by ordering Houses is what makes this reachable — every order takes its
+// cost at once, whether it starts or queues.
+const spendable = (w: {
+	gridSize: number;
+	terrain: number[];
+	terrainTypes: { id: number; buildableTypeIds: number[] }[];
+	buildings: { x: number; y: number }[];
+	operations: { type: string; destX: number; destY: number }[];
+}) => {
+	const out: [number, number][] = [];
+	for (let i = 0; i < w.terrain.length; i++) {
+		const t = w.terrainTypes.find((tt) => tt.id === w.terrain[i]);
+		if (!t?.buildableTypeIds.includes(house)) continue;
+		const x = i % w.gridSize;
+		const y = Math.floor(i / w.gridSize);
+		if (w.buildings.some((b) => b.x === x && b.y === y)) continue;
+		if (w.operations.some((o) => o.type === 'build' && o.destX === x && o.destY === y)) continue;
+		out.push([x, y]);
+	}
+	return out;
+};
+let broke = (await api('/api/world')).body;
+for (const [x, y] of spendable(broke)) {
+	if (woodHeld(broke) < 20) break;
+	const spent = await api('/api/orders', {
+		method: 'POST',
+		body: JSON.stringify({ x, y, buildingTypeId: house })
+	});
+	if (spent.status === 200) broke = spent.body;
+}
+const woodWhenBroke = woodHeld(broke);
+const refused = await craft(...mill, 1);
+check(
+	'a batch you cannot afford is refused for the inputs, not for the workers',
+	[woodWhenBroke < 20, refused.status, refused.body.reason],
+	[true, 400, 'INSUFFICIENT_RESOURCES']
+);
+check(
+	'and the refusal moved no Wood at all',
+	woodHeld((await api('/api/world')).body),
+	woodWhenBroke
 );
 
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
