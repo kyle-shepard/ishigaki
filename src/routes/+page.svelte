@@ -4,6 +4,7 @@
 	// when the deployed build changes. Rolling our own version field on the world payload
 	// would have been the same feature, written twice.
 	import { updated } from '$app/state';
+	import MapCanvas from '$lib/features/world/MapCanvas.svelte';
 	import Sprites from '$lib/features/world/Sprites.svelte';
 	import {
 		GRID_SIZE,
@@ -12,14 +13,31 @@
 		roadArms,
 		ROAD_SIDES,
 		roadStyles,
+		TIER_CLOSE_MIN,
+		TIER_MIDDLE_MIN,
 		travelFraction,
+		zoomAbout,
 		type EstimateResponse,
 		type OrderReason,
 		type TravelLeg,
 		type WorldPayload
 	} from '$lib/features/world/world';
 
-	const CELL = 32;
+	// Continuous, where CELL was fixed — wheel, pinch and the +/- buttons all write this, and
+	// everything that used to read the constant now reads the state instead: `centreOn`, the
+	// `.grid` CSS var, and every overlay's own `translate(x * cell, y * cell)`.
+	let cell = $state(32);
+	// Past MAX_CELL there is nothing left to see that CLOSE tier doesn't already show; below
+	// MIN_CELL the 48-tile world is under 100px wide and going further out buys nothing but a
+	// smaller dot.
+	const MIN_CELL = 2;
+	const MAX_CELL = 64;
+	const clampCell = (c: number) => Math.min(MAX_CELL, Math.max(MIN_CELL, c));
+	// Derived, never set — there is no tier control anywhere in the UI. Same two numbers MapCanvas
+	// gates its own art on, so "where a tier starts" can't read two different answers in two files.
+	const tier = $derived(
+		cell >= TIER_CLOSE_MIN ? 'close' : cell >= TIER_MIDDLE_MIN ? 'middle' : 'far'
+	);
 
 	const REASON_TEXT: Record<OrderReason, string> = {
 		OUT_OF_BOUNDS: 'That tile is off the map.',
@@ -71,8 +89,8 @@
 		if (!pane) return;
 		// scrollTo clamps for us at every edge, so a tile in a corner just gets as centred as it can.
 		pane.scrollTo({
-			left: (x + 0.5) * CELL - pane.clientWidth / 2,
-			top: (y + 0.5) * CELL - pane.clientHeight / 2,
+			left: (x + 0.5) * cell - pane.clientWidth / 2,
+			top: (y + 0.5) * cell - pane.clientHeight / 2,
 			behavior: 'instant'
 		});
 	}
@@ -88,7 +106,8 @@
 	// testing, focus ring and aria label working while the map moves under them.
 	//
 	// Mouse only, deliberately: a touch already pans the pane natively, and handling it here as well
-	// would move the map twice as fast as the finger.
+	// would move the map twice as fast as the finger. A two-finger touch is pinch, tracked below —
+	// distinct from this drag, which only ever answers to a single mouse button.
 	// Plain, not $state: it is mutated on every pointermove and nothing renders from it. The cursor
 	// does, so that is a separate boolean rather than a reactive proxy re-firing per mouse move.
 	let pan: { lastX: number; lastY: number; travel: number } | null = null;
@@ -99,7 +118,44 @@
 	// Under this it is a click with an unsteady hand, not a pan.
 	const DRAG_SLOP = 4;
 
+	// Zoom about a point: the world coordinate under (px, py) is read before the scale changes and
+	// re-planted under that same pixel after. Wheel notches, pinch steps and the +/- buttons all
+	// funnel through this one function, so "zoom" has exactly one implementation to get right.
+	function zoomAt(px: number, py: number, factor: number) {
+		if (!pane) return;
+		const next = clampCell(cell * factor);
+		if (next === cell) return;
+		const left = zoomAbout(pane.scrollLeft, px, cell, next);
+		const top = zoomAbout(pane.scrollTop, py, cell, next);
+		cell = next;
+		pane.scrollLeft = left;
+		pane.scrollTop = top;
+	}
+	// The topbar buttons and the keyboard's +/- zoom about the pane's own centre — there is no
+	// cursor position to hold still for either of them.
+	function zoomButton(factor: number) {
+		if (!pane) return;
+		zoomAt(pane.clientWidth / 2, pane.clientHeight / 2, factor);
+	}
+
+	// Two-finger pinch, hand-rolled from pointer events: the browser's own pinch gesture zooms the
+	// *page* (a visual transform outside the DOM), which never touches `cell` and so would never
+	// change tier. `touch-action: pan-x pan-y` on the pane below is what stops the browser from also
+	// running that gesture while this one does. Keyed by pointerId because a pinch is two
+	// independent touch pointers, not one gesture object the platform hands us pre-summarised.
+	const touches = new Map<number, { x: number; y: number }>();
+	let pinchDist = 0;
+	const touchDistance = () => {
+		const [a, b] = [...touches.values()];
+		return Math.hypot(a.x - b.x, a.y - b.y);
+	};
+
 	function panStart(e: PointerEvent) {
+		if (e.pointerType === 'touch') {
+			touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+			if (touches.size === 2) pinchDist = touchDistance();
+			return;
+		}
 		if (e.button !== 0 || e.pointerType !== 'mouse') return;
 		pan = { lastX: e.clientX, lastY: e.clientY, travel: 0 };
 		panning = true;
@@ -108,6 +164,19 @@
 		dragged = false;
 	}
 	function panMove(e: PointerEvent) {
+		if (e.pointerType === 'touch' && touches.has(e.pointerId)) {
+			touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+			if (touches.size === 2 && pane) {
+				const dist = touchDistance();
+				if (pinchDist > 0) {
+					const [a, b] = [...touches.values()];
+					const rect = pane.getBoundingClientRect();
+					zoomAt((a.x + b.x) / 2 - rect.left, (a.y + b.y) / 2 - rect.top, dist / pinchDist);
+				}
+				pinchDist = dist;
+			}
+			return;
+		}
 		if (!pan || !pane) return;
 		const dx = e.clientX - pan.lastX;
 		const dy = e.clientY - pan.lastY;
@@ -120,7 +189,9 @@
 		pane.scrollLeft -= dx;
 		pane.scrollTop -= dy;
 	}
-	function panEnd() {
+	function panEnd(e: PointerEvent) {
+		touches.delete(e.pointerId);
+		pinchDist = touches.size === 2 ? touchDistance() : 0;
 		pan = null;
 		panning = false;
 	}
@@ -130,11 +201,28 @@
 		e.preventDefault();
 	}
 
+	// Attached imperatively rather than as an onwheel attribute: Svelte's synthetic listener is
+	// passive by default, and a passive listener's preventDefault is a silent no-op — the page would
+	// scroll *and* the map would zoom.
+	$effect(() => {
+		if (!pane) return;
+		const el = pane;
+		function onWheel(e: WheelEvent) {
+			e.preventDefault();
+			const rect = el.getBoundingClientRect();
+			// A fixed factor per event rather than one scaled by deltaY: a trackpad fires many small
+			// deltas and a mouse wheel fires few large ones, and pricing the *event* keeps both
+			// feeling like the same zoom speed instead of one crawling and the other flying.
+			zoomAt(e.clientX - rect.left, e.clientY - rect.top, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+		}
+		el.addEventListener('wheel', onWheel, { passive: false });
+		return () => el.removeEventListener('wheel', onWheel);
+	});
+
 	// Open on the hamlet rather than on the map's top-left corner. Not $state: writing it must not
 	// re-run the effect, and nothing renders from it.
 	let centred = false;
 	$effect(() => {
-		const home = world?.buildings[0] ?? world?.characters[0];
 		if (centred || !pane || !home) return;
 		centred = true;
 		// One task late, deliberately. Centring is measured off the pane's own size, and the effect
@@ -159,6 +247,10 @@
 	}
 
 	let world = $state<WorldPayload | null>(null);
+	// Where the keyboard cursor starts if nothing is selected yet, and where the far tier's one pin
+	// sits — "the hamlet, or wherever the first body happens to be", the same fallback the centring
+	// effect above uses to open the map on load.
+	const home = $derived(world?.buildings[0] ?? world?.characters[0] ?? null);
 	let message = $state('');
 	// Sticky: the server reports a lost realm on one response only, and a heartbeat refresh
 	// half a minute later must not quietly erase the notice before it has been read.
@@ -299,6 +391,48 @@
 		if (message !== TROUBLE) message = '';
 	}
 
+	// Nudges the pane just far enough that the tile is on screen — not centreOn's jump-to-middle,
+	// which would fight a player walking the cursor step by step across the map.
+	function scrollIntoView(x: number, y: number) {
+		if (!pane) return;
+		const left = x * cell;
+		const top = y * cell;
+		if (left < pane.scrollLeft) pane.scrollLeft = left;
+		else if (left + cell > pane.scrollLeft + pane.clientWidth)
+			pane.scrollLeft = left + cell - pane.clientWidth;
+		if (top < pane.scrollTop) pane.scrollTop = top;
+		else if (top + cell > pane.scrollTop + pane.clientHeight)
+			pane.scrollTop = top + cell - pane.clientHeight;
+	}
+
+	// Replaces the 2,304 (soon 16,384) tab stops the tile buttons used to be: one focusable surface
+	// (see the map-pane's own attributes below), an arrow-key cursor over the same coordinate space
+	// the mouse already selects in, and +/- for the same zoom the topbar buttons and the wheel drive.
+	function mapKeydown(e: KeyboardEvent) {
+		if (!world) return;
+		const step: Record<string, [number, number]> = {
+			ArrowUp: [0, -1],
+			ArrowDown: [0, 1],
+			ArrowLeft: [-1, 0],
+			ArrowRight: [1, 0]
+		};
+		const d = step[e.key];
+		if (d) {
+			e.preventDefault();
+			const base = selected ?? home ?? { x: 0, y: 0 };
+			const x = Math.min(GRID_SIZE - 1, Math.max(0, base.x + d[0]));
+			const y = Math.min(GRID_SIZE - 1, Math.max(0, base.y + d[1]));
+			selectTile(x, y);
+			scrollIntoView(x, y);
+		} else if (e.key === '+' || e.key === '=') {
+			e.preventDefault();
+			zoomButton(1.4);
+		} else if (e.key === '-' || e.key === '_') {
+			e.preventDefault();
+			zoomButton(1 / 1.4);
+		}
+	}
+
 	function buildHere() {
 		if (!selected || chosen === null) return;
 		const { x, y } = selected;
@@ -357,12 +491,6 @@
 		}
 	}
 
-	const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => ({
-		x: i % GRID_SIZE,
-		y: Math.floor(i / GRID_SIZE)
-	}));
-	// `terrain` is row-major over the same index this array was built from, so tiles[i] and
-	// terrain[i] line up with no second indexing concept.
 	const terrainById = $derived(new Map(world?.terrainTypes.map((t) => [t.id, t]) ?? []));
 	const resourceName = $derived(new Map(world?.resources.map((r) => [r.id, r.displayName]) ?? []));
 	const terrainAt = (i: number) => terrainById.get(world!.terrain[i]);
@@ -774,6 +902,10 @@
 		</ul>
 	{/if}
 	<div class="topbar-end">
+		<!-- Reachable without a wheel or a pinch. Both zoom about the pane's own centre, the same as
+		     the keyboard's +/- — there is no cursor position to hold still for a button press. -->
+		<button onclick={() => zoomButton(1 / 1.4)} disabled={!pane} aria-label="Zoom out">−</button>
+		<button onclick={() => zoomButton(1.4)} disabled={!pane} aria-label="Zoom in">+</button>
 		<button onclick={toggleTheme} aria-label="Toggle light or dark mode">
 			{theme === 'dark' ? '☀ Light' : '☾ Dark'}
 		</button>
@@ -801,99 +933,130 @@
 
 {#if world}
 	<!-- The map owns the window and pans by scrolling. 48×48 doesn't fit on any screen, and a
-	     viewport that shows the whole world is the one thing a map this size can't be. -->
+	     viewport that shows the whole world is the one thing a map this size can't be.
+
+	     One focusable surface replaces what used to be 2,304 tile buttons: role="application" because
+	     the arrow keys are claimed for the map's own cursor rather than for scrolling the page, and
+	     the aria-live region below carries the same sentence `tileLabel` always has, so what a mouse
+	     click showed on screen and what a keyboard user hears are the same wording. -->
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+	<!-- Both rules read the element's *implicit* role and stop there: <main> is a landmark, so a
+	     tabindex and a keydown handler on it look like a mistake. The explicit role="application"
+	     directly above is the thing that makes them correct — it is what tells a screen reader to
+	     hand the arrow keys to the map's own cursor instead of using them to browse. Kept as <main>
+	     rather than a <div> that would silence the linter for free, because the map genuinely is
+	     this page's main content and dropping the landmark to please a lint rule is the worse
+	     accessibility trade. -->
 	<main
 		class="map-pane"
 		class:panning
 		bind:this={pane}
+		tabindex="0"
+		role="application"
+		aria-label="World map"
 		onpointerdown={panStart}
 		onpointermove={panMove}
 		onpointerup={panEnd}
 		onpointercancel={panEnd}
 		onpointerleave={panEnd}
 		onclickcapture={swallowClick}
+		onkeydown={mapKeydown}
 	>
-		<div class="grid" style="--cell: {CELL}px; --size: {GRID_SIZE}">
-			{#each tiles as t, i (t.x + ',' + t.y)}
-				<button
-					class="tile"
-					class:blocked={terrainAt(i)?.buildable === false}
-					class:selected={selected?.x === t.x && selected?.y === t.y}
-					style="background: {terrainAt(i)?.color}"
-					onclick={() => selectTile(t.x, t.y)}
-					aria-label={tileLabel(i, t.x, t.y)}
-				>
-					<!-- Mirrored on every other tile so a run of forest doesn't read as wallpaper.
-				     Parity of x+y rather than of the index, or the flips line up into stripes. -->
+		<!-- The terrain layer. Canvas, not DOM — see MapCanvas's own header comment for why. -->
+		<MapCanvas {world} {selected} {cell} onselect={selectTile} />
+		<div
+			class="grid"
+			style="--cell: {cell}px; width: {cell * GRID_SIZE}px; height: {cell * GRID_SIZE}px"
+		>
+			{#if tier === 'close'}
+				<!-- Roads first, so anything standing beside one is painted over its arms rather than
+				     under them — and because a road is the ground, not a thing on it. -->
+				{#each world.buildings.filter((b) => roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
 					<svg
-						class="art"
+						class="over road"
 						viewBox="0 0 32 32"
-						style:transform={(t.x + t.y) % 2 ? 'scaleX(-1)' : null}
+						style="transform: translate({b.x * cell}px, {b.y * cell}px)"
 					>
-						<use href="#i-{terrainAt(i)?.icon}" />
+						<use href="#p-road-hub" />
+						<!-- One arm per side it joins, rotated about the tile's centre. The shape of a
+						     crossing, a corner and a dead end all fall out of this. -->
+						{#each armsOf(b) as degrees (degrees)}
+							<use href="#p-road-arm" transform="rotate({degrees} 16 16)" />
+						{/each}
 					</svg>
-				</button>
-			{/each}
-			<!-- Roads first, so anything standing beside one is painted over its arms rather than
-			     under them — and because a road is the ground, not a thing on it. -->
-			{#each world.buildings.filter((b) => roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
-				<svg
-					class="over road"
-					viewBox="0 0 32 32"
-					style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
-				>
-					<use href="#p-road-hub" />
-					<!-- One arm per side it joins, rotated about the tile's centre. The shape of a
-					     crossing, a corner and a dead end all fall out of this. -->
-					{#each armsOf(b) as degrees (degrees)}
-						<use href="#p-road-arm" transform="rotate({degrees} 16 16)" />
-					{/each}
-				</svg>
-			{/each}
-			{#each world.buildings.filter((b) => !roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
-				<svg
-					class="over"
-					viewBox="0 0 32 32"
-					style="transform: translate({b.x * CELL}px, {b.y * CELL}px)"
-				>
-					<use href="#i-{typeIcon(b.buildingTypeId)}" />
-				</svg>
-			{/each}
-			<!-- Under construction is drawn from the operation: a building row only exists once
-		     built, so presence in `buildings` means finished. Same art, ghosted and pegged out —
-		     what's coming is legible before it's there. Builds only: a gather has no building
-		     type, and would otherwise paint an empty dashed square wherever someone is working. -->
-			{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
-				<svg
-					class="over site"
-					class:waiting={o.startedAt === null}
-					viewBox="0 0 32 32"
-					style="transform: translate({o.destX * CELL}px, {o.destY * CELL}px)"
-				>
-					<use href="#i-{typeIcon(o.buildingTypeId!)}" />
-				</svg>
-			{/each}
-			{#each dots as d (d.id)}
-				{@const off = slotOffset(d.slot)}
-				<svg
-					class="over"
-					viewBox="0 0 32 32"
-					style="transform: translate({d.x * CELL}px, {d.y * CELL}px)"
-				>
-					<circle class="dot" cx={16 + off[0]} cy={16 + off[1]} r="5" />
-				</svg>
-			{/each}
-			<!-- Specialists are pawns, not dots — a named individual reads as a body, not one of a
-			     crowd. Distinct from the settler dots by silhouette. -->
-			{#each specialists as c (c.id)}
-				<svg
-					class="over"
-					viewBox="0 0 32 32"
-					style="transform: translate({at(c).x * CELL}px, {at(c).y * CELL}px)"
-				>
-					<use href="#i-pawn" />
-				</svg>
-			{/each}
+				{/each}
+				{#each world.buildings.filter((b) => !roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
+					<svg
+						class="over"
+						viewBox="0 0 32 32"
+						style="transform: translate({b.x * cell}px, {b.y * cell}px)"
+					>
+						<use href="#i-{typeIcon(b.buildingTypeId)}" />
+					</svg>
+				{/each}
+				<!-- Under construction is drawn from the operation: a building row only exists once
+			     built, so presence in `buildings` means finished. Same art, ghosted and pegged out —
+			     what's coming is legible before it's there. Builds only: a gather has no building
+			     type, and would otherwise paint an empty dashed square wherever someone is working. -->
+				{#each world.operations.filter((o) => o.type === 'build') as o (o.id)}
+					<svg
+						class="over site"
+						class:waiting={o.startedAt === null}
+						viewBox="0 0 32 32"
+						style="transform: translate({o.destX * cell}px, {o.destY * cell}px)"
+					>
+						<use href="#i-{typeIcon(o.buildingTypeId!)}" />
+					</svg>
+				{/each}
+				{#each dots as d (d.id)}
+					{@const off = slotOffset(d.slot)}
+					<svg
+						class="over"
+						viewBox="0 0 32 32"
+						style="transform: translate({d.x * cell}px, {d.y * cell}px)"
+					>
+						<circle class="dot" cx={16 + off[0]} cy={16 + off[1]} r="5" />
+					</svg>
+				{/each}
+				<!-- Specialists are pawns, not dots — a named individual reads as a body, not one of a
+				     crowd. Distinct from the settler dots by silhouette. -->
+				{#each specialists as c (c.id)}
+					<svg
+						class="over"
+						viewBox="0 0 32 32"
+						style="transform: translate({at(c).x * cell}px, {at(c).y * cell}px)"
+					>
+						<use href="#i-pawn" />
+					</svg>
+				{/each}
+			{:else if tier === 'far' && home}
+				<!-- Pulled back far enough that individual tiles stop being the point — one mark for
+				     where the realm actually is, same fallback the map opens centred on. -->
+				<div
+					class="pin"
+					style="transform: translate({home.x * cell + cell / 2 - 5}px, {home.y * cell +
+						cell / 2 -
+						5}px)"
+				></div>
+			{/if}
+			<!-- The selection ring: a div rather than an outline on a button, now that a tile is a
+			     patch of canvas and not an element of its own to put an outline on. Drawn at every
+			     tier — the keyboard cursor has to stay visible whether or not the buildings it's
+			     walking past are. -->
+			{#if selected}
+				<div
+					class="ring"
+					style="transform: translate({selected.x * cell}px, {selected.y *
+						cell}px); width: {cell}px; height: {cell}px"
+				></div>
+			{/if}
+		</div>
+		<!-- The keyboard's answer to the art: the same sentence the old per-tile aria-label gave,
+		     spoken when the cursor moves rather than read tile-by-tile off a button that no longer
+		     exists. -->
+		<div class="sr-only" aria-live="polite">
+			{selected ? tileLabel(selIndex, selected.x, selected.y) : ''}
 		</div>
 	</main>
 
@@ -1296,6 +1459,11 @@
 		/* A drag across tiles must not start selecting them. */
 		user-select: none;
 		cursor: grab;
+		/* Permits native single-finger scrolling (unchanged from before) but withholds the browser's
+		   own pinch-to-zoom gesture, which would otherwise zoom the *page* — a visual transform that
+		   never touches `cell` — at the same time the hand-rolled pointer-event pinch above tries to.
+		   Two zooms racing each other is worse than either alone. */
+		touch-action: pan-x pan-y;
 	}
 	.map-pane::-webkit-scrollbar {
 		display: none;
@@ -1305,52 +1473,21 @@
 	}
 	.grid {
 		position: relative;
-		display: grid;
-		grid-template-columns: repeat(var(--size), var(--cell));
-		width: max-content;
+		/* Width and height come from the inline style (cell × GRID_SIZE) now, not from grid-template
+		   sizing children — nothing inside is a grid item any more. The terrain layer moved to
+		   MapCanvas's own fixed-position canvas; everything left here (buildings, roads, sites, dots,
+		   pawns, the selection ring) is absolutely positioned by transform, and none of it is what a
+		   click should hit — MapCanvas is. Every element below already carries its own
+		   pointer-events: none; this catches the padding and the box itself so a click over open
+		   ground reaches the canvas instead of stopping here. */
+		pointer-events: none;
 		/* So the eastern edge of the map can be scrolled out from under the inspector. Right only:
 		   an absolutely positioned overlay is placed against the padding box, so left or top padding
 		   would slide every building off its tile. */
 		padding-right: 21rem;
 	}
-	.tile {
-		/* The containing block for .art — without it the art sizes against .grid and one tile's
-		   mountain covers the map. */
-		position: relative;
-		width: var(--cell);
-		height: var(--cell);
-		border: 1px solid rgba(0, 0, 0, 0.15);
-		box-sizing: border-box;
-		padding: 0;
-		cursor: pointer;
-		/* ponytail: 2304 tiles all paint their <use> art on every scroll frame. This lets the browser
-		   skip the art of tiles that aren't on screen — the cell is sized by width/height either way,
-		   so nothing reflows. Unlike `hidden`, `auto` keeps the button focusable and in the a11y tree.
-		   Ceiling: still 2304 DOM nodes. A canvas or tile-atlas renderer if that stops being enough. */
-		content-visibility: auto;
-		contain-intrinsic-size: auto var(--cell);
-	}
-	/* Brightness, not a background: a hover colour would erase the terrain underneath. */
-	.tile:hover {
-		filter: brightness(1.12);
-	}
-	/* Hints, doesn't enforce — the button stays enabled on purpose. Letting the click reach
-	   the server and showing the server's own refusal is what proves the rule lives there. */
-	.tile.blocked {
-		cursor: not-allowed;
-	}
-	/* Terrain art fills its tile and never eats the click — the whole cell stays the button. */
-	.art {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		pointer-events: none;
-	}
 	/* Overlays are absolutely positioned and moved with transform: animating left/top would
-	   relayout every cell on the map every frame. z-index keeps them above a *selected* tile —
-	   which lifts itself to z-index 1 for its ring — so clicking a building doesn't bury it under
-	   the raised grass tile. */
+	   relayout every one of them every frame. */
 	.over {
 		position: absolute;
 		top: 0;
@@ -1377,12 +1514,32 @@
 		opacity: 0.22;
 		outline-style: dotted;
 	}
-	/* A ring on the selected tile — outline so it sits over the art without shrinking it, same
-	   trick as .site. Drawn above neighbours so the ring isn't clipped by the next cell's border. */
-	.tile.selected {
+	/* The selected tile's ring, now a div rather than an outline on a button — the canvas underneath
+	   has no element of its own to put one on. Same trick as .site (outline, not border, so it sits
+	   over the art without shrinking it) and the same z-index .tile.selected used to carry, below
+	   .over's 2 so a building on the selected tile still paints over its own ring. */
+	.ring {
+		position: absolute;
+		top: 0;
+		left: 0;
 		outline: 2px solid #1d4ed8;
 		outline-offset: -2px;
 		z-index: 1;
+		pointer-events: none;
+	}
+	/* The far tier's one mark: the settlement, not the selection. A filled dot rather than an
+	   outline — at a cell size this small an outline would be a hairline nobody could see. */
+	.pin {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
+		background: #1d4ed8;
+		box-shadow: 0 0 0 2px #f5f2ea;
+		z-index: 2;
+		pointer-events: none;
 	}
 	/* Pinned to the window's right edge rather than laid out beside the map.
 

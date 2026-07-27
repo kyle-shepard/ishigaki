@@ -7,6 +7,33 @@ export const GRID_SIZE = 48;
 // START used to live here. It is derived from the terrain now — see `findStart` in worldgen.ts —
 // because a written-down coordinate cannot notice that the ground under it has become a lake.
 
+// Zoom is continuous, but what the client draws is not — three named tiers, and these two numbers
+// are the whole boundary between them. One pair of constants rather than a fact restated in both
+// +page.svelte's tier derivation and MapCanvas's own "is this far enough out to skip the art" check,
+// so the two can't quietly drift apart.
+export const TIER_MIDDLE_MIN = 8; // below this: flat colour only, no art, no overlays
+export const TIER_CLOSE_MIN = 24; // at or above this: full art, and buildings/pawns/roads draw
+
+/**
+ * The world coordinate (in cell units, fractional) under a pane-relative pixel — read the pane's
+ * own scrollLeft/scrollTop as `scroll` and a pixel offset from the pane's edge as `px`, on the same
+ * axis. The one piece of arithmetic MapCanvas's hit testing and the zoom-about-cursor maths below
+ * both need, so it exists once rather than as two copies that could disagree about a half-pixel.
+ */
+export function tileAt(scroll: number, px: number, cell: number): number {
+	return (scroll + px) / cell;
+}
+
+/**
+ * The scroll offset that keeps the same world point under the same pixel after `cell` becomes
+ * `nextCell` — "zoom about the cursor" is just `tileAt` read backwards at the new scale. Wheel,
+ * pinch and the +/- buttons all call this once per step; the invariant it guarantees — the point
+ * under the pointer never drifts — is what world.test.ts pins.
+ */
+export function zoomAbout(scroll: number, px: number, cell: number, nextCell: number): number {
+	return tileAt(scroll, px, cell) * nextCell - px;
+}
+
 export type OrderReason =
 	| 'OUT_OF_BOUNDS'
 	| 'UNKNOWN_BUILDING_TYPE'

@@ -19,7 +19,9 @@ import {
 	STAT_MAX,
 	STAT_MIN,
 	route,
-	travelFraction
+	tileAt,
+	travelFraction,
+	zoomAbout
 } from './world.ts';
 
 // A 16-tile test grid, small enough to reason about by hand. The routing tests below use it rather
@@ -640,4 +642,36 @@ test('only a junction offers a choice of shape, and only of the straights it con
 	assert.deepEqual(roadStyles(N | S), [null]);
 	assert.deepEqual(roadStyles(N), [null]);
 	assert.deepEqual(roadStyles(0), [null]);
+});
+
+// ---- Zoom-about-cursor -------------------------------------------------------------------------
+// The map-client epic's own arithmetic: where the cursor sits in world space, and how to hold that
+// point still while the scale under it changes. Both pure and scroll-position-free of the DOM, so
+// the one property that actually matters — nothing drifts as you zoom — is a test, not a squint.
+
+test('tileAt reads the world coordinate under a pane pixel', () => {
+	assert.equal(tileAt(0, 0, 32), 0);
+	// Scrolled ten tiles in, sixteen pixels further right: still inside tile 10.
+	assert.equal(tileAt(320, 16, 32), 10.5);
+});
+
+test('zoomAbout keeps the point under the cursor fixed across a zoom step', () => {
+	const scroll = 320;
+	const px = 200;
+	const cell = 32;
+	const before = tileAt(scroll, px, cell);
+	for (const nextCell of [48, 16, 64, 3]) {
+		const nextScroll = zoomAbout(scroll, px, cell, nextCell);
+		const after = tileAt(nextScroll, px, nextCell);
+		assert.ok(Math.abs(after - before) < 1e-9, `drifted to ${after} at cell ${nextCell}`);
+	}
+});
+
+test('zoomAbout round-trips: zooming out and back in lands on the original scroll', () => {
+	const scroll = 517;
+	const px = 137;
+	const cell = 32;
+	const out = zoomAbout(scroll, px, cell, 12);
+	const back = zoomAbout(out, px, 12, cell);
+	assert.ok(Math.abs(back - scroll) < 1e-9, `round-trip drifted by ${back - scroll}`);
 });

@@ -1,0 +1,226 @@
+<!--
+	The terrain layer, and only terrain — buildings, roads, sites, dots and pawns stay DOM/SVG in
+	+page.svelte, because they are dozens of nodes and every bit of code that draws, positions and
+	labels them already works. Terrain was the part that had to stop being 2,304 (soon 16,384)
+	buttons; one <canvas>, redrawn on scroll and zoom, is the whole fix.
+
+	Owns: the canvas element, the rasterised art atlas, and hit testing (a click here becomes an
+	`onselect(x, y)` call). Does not own: `cell`, which +page.svelte holds because every overlay's
+	own position depends on it too, or the scroll offset, which the pane +page.svelte binds already
+	carries and this component reads by finding that ancestor rather than by taking it as a fourth
+	prop.
+-->
+<script lang="ts">
+	import { GRID_SIZE, TIER_CLOSE_MIN, TIER_MIDDLE_MIN, tileAt, type WorldPayload } from './world';
+
+	type Props = {
+		world: WorldPayload;
+		// Accepted for interface symmetry with the selection ring +page.svelte draws as its own
+		// absolutely-positioned div over this canvas — nothing drawn *here* depends on which tile is
+		// selected, so this prop is never read below.
+		selected: { x: number; y: number } | null;
+		cell: number;
+		onselect: (x: number, y: number) => void;
+	};
+	let { world, cell, onselect }: Props = $props();
+
+	let canvasEl: HTMLCanvasElement | undefined = $state();
+	let ctx: CanvasRenderingContext2D | null = null;
+	// Found once the canvas exists rather than threaded through as a prop: everything read off it
+	// (scrollLeft/scrollTop, client size, a place to hang a scroll listener) is read, never written.
+	let pane: HTMLElement | null = null;
+
+	const terrainById = $derived(new Map(world.terrainTypes.map((t) => [t.id, t])));
+	const terrainAt = (i: number) => terrainById.get(world.terrain[i]);
+
+	// ---- The atlas ----------------------------------------------------------------------------
+	// Three fixed rasterisations of each terrain symbol, quantised rather than keyed on the live
+	// cell size: zoom is continuous, so a cache keyed on it would grow without bound as a player
+	// zooms back and forth. Seven terrain icons × three sizes is at most 21 small canvases, built
+	// lazily and never evicted.
+	const ATLAS_SIZES = [8, 16, 32] as const;
+	function atlasSizeFor(c: number): (typeof ATLAS_SIZES)[number] {
+		if (c >= TIER_CLOSE_MIN) return 32;
+		if (c >= 16) return 16;
+		return 8;
+	}
+	const atlas = new Map<string, HTMLCanvasElement>();
+	const rasterising = new Set<string>();
+
+	// Rasterises one <symbol> from Sprites.svelte at a fixed pixel size. A symbol's own markup
+	// references shared primitives by id (#p-tree, #p-rock), which only resolve inside a document —
+	// a standalone SVG string needs those definitions riding along, or the art comes back blank.
+	// Sprites.svelte has already rendered them into the live page by the time this ever mounts (it
+	// sits above the map in +page.svelte), so this reads them out of the DOM rather than keeping a
+	// second copy of the art anywhere.
+	async function rasterise(icon: string, size: number): Promise<HTMLCanvasElement> {
+		const out = document.createElement('canvas');
+		out.width = size;
+		out.height = size;
+		const symbol = document.getElementById(`i-${icon}`);
+		// An unknown icon draws nothing — the same fallback the old <use href> gave a missing key.
+		if (!symbol) return out;
+		const primitives = Array.from(document.querySelectorAll('defs [id^="p-"]'))
+			.map((el) => el.outerHTML)
+			.join('');
+		const svg =
+			`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" ` +
+			`viewBox="0 0 32 32"><defs>${primitives}</defs>${symbol.innerHTML}</svg>`;
+		const img = new Image();
+		const loaded = new Promise<void>((resolve, reject) => {
+			img.onload = () => resolve();
+			img.onerror = () => reject(new Error(`atlas rasterise failed for #i-${icon}`));
+		});
+		img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+		await loaded;
+		out.getContext('2d')!.drawImage(img, 0, 0, size, size);
+		return out;
+	}
+
+	// Built lazily on first use. Returns null while a rasterisation is still in flight, and the
+	// caller's fillRect underneath is left standing for that one frame — cheaper than blocking the
+	// draw loop on an image load, and invisible past the first paint of a given icon/size pair.
+	function atlasTile(icon: string, size: number): HTMLCanvasElement | null {
+		const key = `${icon}:${size}`;
+		const hit = atlas.get(key);
+		if (hit) return hit;
+		if (!rasterising.has(key)) {
+			rasterising.add(key);
+			rasterise(icon, size)
+				.then((canvas) => {
+					atlas.set(key, canvas);
+					draw();
+				})
+				.catch(() => {
+					/* Missing art stays flat colour; nothing else on the map depends on this settling. */
+				})
+				.finally(() => rasterising.delete(key));
+		}
+		return null;
+	}
+
+	// ---- Drawing --------------------------------------------------------------------------------
+	let rafPending = false;
+	// Coalesces the flurry of native 'scroll' events a drag or a momentum scroll fires into one
+	// redraw a frame — not the character-position rAF tick (that one moves DOM overlays and never
+	// touches this canvas), just this canvas keeping up with its own scroll listener.
+	function scheduleDraw() {
+		if (rafPending) return;
+		rafPending = true;
+		requestAnimationFrame(() => {
+			rafPending = false;
+			draw();
+		});
+	}
+
+	function draw() {
+		if (!ctx || !pane) return;
+		const w = pane.clientWidth;
+		const h = pane.clientHeight;
+		ctx.clearRect(0, 0, w, h);
+		const scrollLeft = pane.scrollLeft;
+		const scrollTop = pane.scrollTop;
+		const firstX = Math.max(0, Math.floor(tileAt(scrollLeft, 0, cell)));
+		const firstY = Math.max(0, Math.floor(tileAt(scrollTop, 0, cell)));
+		const lastX = Math.min(GRID_SIZE - 1, Math.floor(tileAt(scrollLeft, w, cell)));
+		const lastY = Math.min(GRID_SIZE - 1, Math.floor(tileAt(scrollTop, h, cell)));
+		// The far tier's whole point: past this, the art costs more than it says. TIER_MIDDLE_MIN is
+		// the same number +page.svelte derives its own tier from, so "far is flat colour" is one
+		// shared threshold rather than a fact repeated in two files that could disagree.
+		const drawArt = cell >= TIER_MIDDLE_MIN;
+		const size = atlasSizeFor(cell);
+		for (let y = firstY; y <= lastY; y++) {
+			for (let x = firstX; x <= lastX; x++) {
+				const t = terrainAt(y * GRID_SIZE + x);
+				if (!t) continue;
+				const px = x * cell - scrollLeft;
+				const py = y * cell - scrollTop;
+				ctx.fillStyle = t.color;
+				ctx.fillRect(px, py, cell, cell);
+				if (!drawArt || !t.icon) continue;
+				const img = atlasTile(t.icon, size);
+				if (!img) continue;
+				// Mirrored on every other tile by parity of x+y, the same rule the DOM version drew
+				// with — so a run of forest still doesn't read as wallpaper now that canvas paints it.
+				if ((x + y) % 2) {
+					ctx.save();
+					ctx.translate(px + cell, py);
+					ctx.scale(-1, 1);
+					ctx.drawImage(img, 0, 0, cell, cell);
+					ctx.restore();
+				} else {
+					ctx.drawImage(img, px, py, cell, cell);
+				}
+			}
+		}
+	}
+
+	// Canvas sized to the pane's own client box × devicePixelRatio, or it is blurry on every retina
+	// display — CSS stretches the backing store to the pane's CSS size, and ctx.scale(dpr, dpr) is
+	// what makes drawing commands still speak in CSS pixels rather than physical ones.
+	function resize() {
+		if (!canvasEl || !pane) return;
+		const dpr = window.devicePixelRatio || 1;
+		canvasEl.width = pane.clientWidth * dpr;
+		canvasEl.height = pane.clientHeight * dpr;
+		ctx = canvasEl.getContext('2d');
+		ctx?.scale(dpr, dpr);
+		draw();
+	}
+
+	// The one click target the whole map now has. Converts the click's pane-relative pixel to a
+	// tile with the same `tileAt` the zoom maths uses, so "where you clicked" and "where the map
+	// thinks you clicked" can never read two different coordinate systems.
+	function handleClick(e: MouseEvent) {
+		if (!canvasEl || !pane) return;
+		const rect = canvasEl.getBoundingClientRect();
+		const x = Math.floor(tileAt(pane.scrollLeft, e.clientX - rect.left, cell));
+		const y = Math.floor(tileAt(pane.scrollTop, e.clientY - rect.top, cell));
+		if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) return;
+		onselect(x, y);
+	}
+
+	// Finds its scrolling ancestor once the canvas exists, sizes itself to it, and redraws on that
+	// ancestor's own resize and scroll — the only two things that ever move what this canvas has to
+	// show, short of the payload itself changing (the effect below).
+	$effect(() => {
+		if (!canvasEl) return;
+		pane = canvasEl.closest('.map-pane');
+		if (!pane) return;
+		resize();
+		const ro = new ResizeObserver(resize);
+		ro.observe(pane);
+		const onScroll = () => scheduleDraw();
+		pane.addEventListener('scroll', onScroll);
+		return () => {
+			ro.disconnect();
+			pane?.removeEventListener('scroll', onScroll);
+		};
+	});
+
+	// Redraws on a payload swap (a fresh realm changes every terrain id) or a zoom step. Deliberately
+	// not on the rAF tick that interpolates character positions — those are DOM overlays this canvas
+	// never touches, and redrawing 2,304+ cells sixty times a second for a dot that isn't even on it
+	// would be the whole regression this component exists to avoid.
+	$effect(() => {
+		world;
+		cell;
+		draw();
+	});
+</script>
+
+<canvas bind:this={canvasEl} onclick={handleClick} aria-hidden="true"></canvas>
+
+<style>
+	canvas {
+		/* Pinned to the same viewport rect as .map-pane itself (see its own `inset` rule), so it
+		   never scrolls with the content — only what's drawn onto it changes, on the pane's own
+		   scroll event. This is what keeps the canvas at a fixed, small size regardless of how big
+		   the world is: the map-client epic's actual complaint was 2,304+ DOM nodes, not 2,304+
+		   cells of drawing, and a full-world canvas would have started paying the second cost too. */
+		position: fixed;
+		inset: var(--header-h) 0 0 0;
+		display: block;
+		cursor: pointer;
+	}
+</style>
