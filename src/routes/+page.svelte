@@ -1323,6 +1323,12 @@
 		box-sizing: border-box;
 		padding: 0;
 		cursor: pointer;
+		/* ponytail: 2304 tiles all paint their <use> art on every scroll frame. This lets the browser
+		   skip the art of tiles that aren't on screen — the cell is sized by width/height either way,
+		   so nothing reflows. Unlike `hidden`, `auto` keeps the button focusable and in the a11y tree.
+		   Ceiling: still 2304 DOM nodes. A canvas or tile-atlas renderer if that stops being enough. */
+		content-visibility: auto;
+		contain-intrinsic-size: auto var(--cell);
 	}
 	/* Brightness, not a background: a hover colour would erase the terrain underneath. */
 	.tile:hover {
