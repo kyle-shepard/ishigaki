@@ -16,6 +16,7 @@
 		TIER_CLOSE_MIN,
 		TIER_MIDDLE_MIN,
 		travelFraction,
+		withinReach,
 		zoomAbout,
 		type EstimateResponse,
 		type OrderReason,
@@ -55,7 +56,8 @@
 		UNKNOWN_PROFESSION: "That isn't a profession anyone can learn.",
 		NOT_A_ROAD: "That isn't a road you can change.",
 		NOT_A_WORKSHOP: 'Nothing on that tile makes anything.',
-		WORKSHOP_BUSY: 'That workshop is already working on a batch.'
+		WORKSHOP_BUSY: 'That workshop is already working on a batch.',
+		OUTSIDE_REACH: "That's outside your settlement's reach."
 	};
 
 	// A click selects a tile; the inspector panel to the right of the map owns the verbs. No
@@ -601,12 +603,23 @@
 				)
 			: undefined
 	);
-	// Build is offered only where the ground allows *some* type and nothing already stands or is
-	// rising. Keys on the terrain's eligible list (per-terrain, server-authored), not the bare
-	// `buildable` flag — so a deposit still offers its extractor and Mountain offers nothing.
-	const canBuild = $derived(
+	// Whether the selected tile is inside the realm's own sphere of influence — the same arithmetic
+	// (`withinReach`) MapCanvas draws as a circle and the server enforces, so this can never predict
+	// a refusal the server wouldn't also give, or the other way round.
+	const selWithinReach = $derived(
+		!!selected && !!world && withinReach(selected.x, selected.y, world.reach)
+	);
+	// Build is offered only where the ground allows *some* type, nothing already stands or is
+	// rising, and the tile is inside reach. Keys on the terrain's eligible list (per-terrain,
+	// server-authored), not the bare `buildable` flag — so a deposit still offers its extractor and
+	// Mountain offers nothing.
+	const buildableHere = $derived(
 		!!selected && (selTerrain?.buildableTypeIds.length ?? 0) > 0 && !selBuilt && !selSite
 	);
+	const canBuild = $derived(buildableHere && selWithinReach);
+	// Buildable, but outside the circle — the doomed-button case the panel explains instead of
+	// offering, per the reach's own refusal (OUTSIDE_REACH).
+	const outsideReachToBuild = $derived(buildableHere && !selWithinReach);
 	// The building types the player owns, for greying a type whose realm-wide prerequisite isn't met.
 	const ownedTypeIds = $derived(new Set(world?.buildings.map((b) => b.buildingTypeId) ?? []));
 	// The menu for the selected tile: only types this terrain allows, each flagged if its
@@ -1322,10 +1335,25 @@
 					<p class="estimate price">{REASON_TEXT[estimateRefusal] ?? estimateRefusal}</p>
 				{/if}
 				<button onclick={buildHere} disabled={!chosenOk}>Build</button>
+			{:else if outsideReachToBuild}
+				<!-- No Build button offered at all — a doomed order is a worse UX than no order, and
+				     the line drawn on the map (MapCanvas's arc) is what should have told you this
+				     already. Same wording the server's own OUTSIDE_REACH refusal gives. -->
+				<p class="price">
+					Outside your reach — your settlement reaches {world.reach?.radius ?? 0} tiles.
+				</p>
 			{/if}
 
 			{#if selYields !== null}
-				<p><button onclick={gatherHere}>Send someone to gather</button></p>
+				{#if selWithinReach}
+					<p><button onclick={gatherHere}>Send someone to gather</button></p>
+				{:else}
+					<!-- Gathering is gated the same as building now — a sphere of influence, not a
+					     building permit — so this refuses just as predictably. -->
+					<p class="price">
+						Outside your reach — your settlement reaches {world.reach?.radius ?? 0} tiles.
+					</p>
+				{/if}
 			{/if}
 
 			{#if selIsSchool}

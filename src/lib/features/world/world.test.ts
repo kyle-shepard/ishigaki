@@ -12,6 +12,7 @@ import {
 	population,
 	positionAt,
 	qualityBand,
+	reachFor,
 	roadArms,
 	roadStyles,
 	rollStats,
@@ -21,6 +22,7 @@ import {
 	route,
 	tileAt,
 	travelFraction,
+	withinReach,
 	zoomAbout
 } from './world.ts';
 
@@ -369,11 +371,12 @@ test('a week away on a finite tile equals many visits', () => {
 
 // eligibleTypeIds — the terrain-menu rule authored once for the server gate and the wire allow-list.
 const CATALOG = [
-	{ id: 1 }, // House
-	{ id: 2 }, // Barn
-	{ id: 3 }, // Quarry — the one extractor (Stone requires it)
-	{ id: 4 }, // Stone wall
-	{ id: 5 } // School
+	{ id: 1, playerBuildable: true }, // House
+	{ id: 2, playerBuildable: true }, // Barn
+	{ id: 3, playerBuildable: true }, // Quarry — the one extractor (Stone requires it)
+	{ id: 4, playerBuildable: true }, // Stone wall
+	{ id: 5, playerBuildable: true }, // School
+	{ id: 6, playerBuildable: false } // Marketplace — never offered, whatever the ground
 ];
 // Only Stone names a required building; everything else is gathered bare-handed.
 const RES = [
@@ -384,7 +387,7 @@ const RES = [
 	{ id: 14, requiresBuildingTypeId: null } // Iron — no extractor exists
 ];
 
-test('plain ground offers every type except an extractor', () => {
+test('plain ground offers every player-buildable type except an extractor', () => {
 	const meadow = { buildable: true, isDeposit: false, yieldsResourceId: 10 };
 	assert.deepEqual(eligibleTypeIds(meadow, CATALOG, RES), [1, 2, 4, 5]);
 });
@@ -404,6 +407,59 @@ test('a deposit with no extractor yet offers nothing', () => {
 test('unbuildable ground offers nothing, subsuming the old buildable check', () => {
 	const mountain = { buildable: false, isDeposit: false, yieldsResourceId: null };
 	assert.deepEqual(eligibleTypeIds(mountain, CATALOG, RES), []);
+});
+
+// ---- Reach --------------------------------------------------------------------------------------
+// The sphere of influence: one Euclidean test shared by the drawn circle and the server gate
+// (`withinReach`), and one milestone lookup shared by the tested function and the SQL ratchet that
+// only ever does GREATEST (`reachFor`).
+
+test('withinReach is a circle, and the edge itself counts as inside', () => {
+	const reach = { x: 10, y: 10, radius: 5 };
+	assert.equal(withinReach(10, 10, reach), true, 'the centre is inside its own reach');
+	assert.equal(withinReach(15, 10, reach), true, 'exactly on the radius is inside');
+	assert.equal(withinReach(16, 10, reach), false, 'one tile past the radius is outside');
+	// Off-axis: a 3-4-5 triangle lands exactly on the boundary too.
+	assert.equal(withinReach(13, 14, reach), true, '3-4-5 puts this exactly on the radius');
+	assert.equal(withinReach(14, 14, reach), false);
+});
+
+test('withinReach has nothing to be inside with no reach at all', () => {
+	assert.equal(withinReach(0, 0, null), false);
+});
+
+const MILESTONES = [
+	{ population: 3, radius: 6 },
+	{ population: 8, radius: 9 },
+	{ population: 15, radius: 13 },
+	{ population: 25, radius: 18 },
+	{ population: 40, radius: 24 }
+];
+
+test('reachFor is 0 below the first milestone — no reach earned yet', () => {
+	assert.equal(reachFor(0, MILESTONES), 0);
+	assert.equal(reachFor(2, MILESTONES), 0);
+});
+
+test('reachFor steps at each threshold and holds until the next one', () => {
+	assert.equal(reachFor(3, MILESTONES), 6);
+	assert.equal(reachFor(7, MILESTONES), 6);
+	assert.equal(reachFor(8, MILESTONES), 9);
+	assert.equal(reachFor(14, MILESTONES), 9);
+	assert.equal(reachFor(15, MILESTONES), 13);
+	assert.equal(reachFor(24, MILESTONES), 13);
+	assert.equal(reachFor(25, MILESTONES), 18);
+	assert.equal(reachFor(39, MILESTONES), 18);
+	assert.equal(reachFor(40, MILESTONES), 24);
+	assert.equal(reachFor(999, MILESTONES), 24, 'the last milestone holds forever past it');
+});
+
+test('reachFor takes the highest threshold met, regardless of table order', () => {
+	assert.equal(reachFor(20, [...MILESTONES].reverse()), 13);
+});
+
+test('reachFor with an empty table is 0 — the case the seed throws to prevent', () => {
+	assert.equal(reachFor(100, []), 0);
 });
 
 // ---- The crew ---------------------------------------------------------------------------------

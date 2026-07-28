@@ -11,6 +11,7 @@ import {
 	player,
 	profession,
 	professionSkill,
+	reachMilestone,
 	recipeInput,
 	resource,
 	settlement,
@@ -28,9 +29,11 @@ import {
 	netRates,
 	pickName,
 	population,
+	reachFor,
 	rollStats,
 	route,
 	skillValue,
+	withinReach,
 	type EstimateResponse,
 	type OperationType,
 	type OrderReason,
@@ -88,6 +91,10 @@ function startBlockFrom(hamletX: number, hamletY: number) {
 		house2Y: hamletY,
 		barnX: hamletX + 1,
 		barnY: hamletY,
+		// The Marketplace, and so the centre of the realm's reach — one tile north of the hamlet,
+		// the exact tile worldgen.ts's START.marketX/marketY names.
+		marketX: hamletX,
+		marketY: hamletY - 1,
 		characterX: hamletX,
 		characterY: hamletY + 1
 	};
@@ -135,9 +142,10 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 		const catalog = new Map((await tx.select().from(buildingType)).map((t) => [t.displayName, t]));
 		const house = catalog.get('House');
 		const barn = catalog.get('Barn');
-		if (!house || !barn)
+		const market = catalog.get('Marketplace');
+		if (!house || !barn || !market)
 			throw new Error(
-				'no House/Barn building_type rows — run `npm run seed` against this database'
+				'no House/Barn/Marketplace building_type rows — run `npm run seed` against this database'
 			);
 
 		const resources = await tx.select().from(resource);
@@ -178,7 +186,10 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 			// The barn stores nothing yet and gates nothing — with no capacity there is nothing
 			// for it to read. It is here so "where your stock lives" is a place on the map, and
 			// it is the row capacity will hang off when it arrives.
-			{ playerId: p.id, x: start.barnX, y: start.barnY, buildingTypeId: barn.id }
+			{ playerId: p.id, x: start.barnX, y: start.barnY, buildingTypeId: barn.id },
+			// The reach's anchor, placed once and never again — there is no demolish path, and
+			// player_buildable false keeps it out of every build menu forever after this.
+			{ playerId: p.id, x: start.marketX, y: start.marketY, buildingTypeId: market.id }
 		]);
 		// Side by side along the row below the hamlet, so three pawns don't stack into one.
 		await tx.insert(character).values(
@@ -501,11 +512,23 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 			);
 		if (died > 0) await removeSettlers(tx, playerId, died);
 
+		// The reach's ratchet: `reachFor` (world.ts) is the tested arithmetic, so the target radius
+		// for this population is computed in JS; the SQL side is only ever `GREATEST`, never a plain
+		// assignment. Population falls during starvation, and decision 9 forbids the border falling
+		// with it — a live-derived radius would shrink the moment a famine started, `GREATEST` cannot.
+		const milestones = await tx.select().from(reachMilestone);
+		const target = reachFor(pop, milestones);
+
 		// The anchor now advances fully to now every read (food must drain smoothly with the
-		// clock); the sub-person remainder rides in populationAccrued instead.
+		// clock); the sub-person remainder rides in populationAccrued instead. The reach update rides
+		// the same statement — one UPDATE, not two.
 		await tx
 			.update(settlement)
-			.set({ populationAsOf: sql`now()`, populationAccrued: accrued })
+			.set({
+				populationAsOf: sql`now()`,
+				populationAccrued: accrued,
+				reachRadius: sql`GREATEST(${settlement.reachRadius}, ${target})`
+			})
 			.where(eq(settlement.id, home.id));
 	}
 }
@@ -886,6 +909,42 @@ async function constructionSkillId(tx: Tx): Promise<number> {
 	return sk.id;
 }
 
+/**
+ * The realm's reach: a circle around its Marketplace, sized by `settlement.reach_radius`. Centred
+ * on the Marketplace itself rather than `settlement.x/y` — decision 6 anchors the reach on the
+ * building, not on the hamlet column that happens to sit one tile south of it — found the same way
+ * `assignTraining` finds a School: the building type by name, then the one standing tile of it.
+ *
+ * A realm without a Marketplace **throws**, matching every other missing-catalog-row case in this
+ * file (`run npm run seed`). It must never degrade into a silent radius of 0 at (0, 0) — that would
+ * refuse every build and gather while looking, to the player, exactly like a legitimate small reach.
+ */
+async function reachOf(
+	tx: Tx,
+	playerId: number
+): Promise<{ x: number; y: number; radius: number }> {
+	const [marketType] = await tx
+		.select({ id: buildingType.id })
+		.from(buildingType)
+		.where(eq(buildingType.displayName, 'Marketplace'));
+	if (!marketType)
+		throw new Error('no Marketplace building_type row — run `npm run seed` against this database');
+	const [market] = await tx
+		.select({ x: building.x, y: building.y })
+		.from(building)
+		.where(and(eq(building.playerId, playerId), eq(building.buildingTypeId, marketType.id)));
+	if (!market)
+		throw new Error(
+			`player ${playerId} has no Marketplace — run \`npm run seed\` against this database`
+		);
+	const [home] = await tx
+		.select({ radius: settlement.reachRadius })
+		.from(settlement)
+		.where(eq(settlement.playerId, playerId));
+	if (!home) throw new Error(`player ${playerId} has no settlement`);
+	return { x: market.x, y: market.y, radius: home.radius };
+}
+
 export type OrderResult = { ok: true; world: WorldPayload } | { ok: false; reason: OrderReason };
 export type EstimateResult =
 	{ ok: true; estimate: EstimateResponse } | { ok: false; reason: OrderReason };
@@ -1083,12 +1142,21 @@ async function planBuild(
 	// nothing at all. ponytail: reuses TILE_NOT_BUILDABLE rather than a dedicated
 	// TILE_WRONG_TERRAIN — a rarely-hit backstop behind the client's greyed menu; the sentence
 	// is slightly generous on a deposit but defensible. Upgrade the day it goes user-facing.
-	const catalogTypes = await tx.select({ id: buildingType.id }).from(buildingType);
+	const catalogTypes = await tx
+		.select({ id: buildingType.id, playerBuildable: buildingType.playerBuildable })
+		.from(buildingType);
 	const catalogResources = await tx
 		.select({ id: resource.id, requiresBuildingTypeId: resource.requiresBuildingTypeId })
 		.from(resource);
 	if (!eligibleTypeIds(groundAt(x, y), catalogTypes, catalogResources).includes(buildingTypeId))
 		return { ok: false, reason: 'TILE_NOT_BUILDABLE' };
+
+	// Your ground, next: legal ground first (above), occupancy and cost after (below). The reach is
+	// a sphere of influence, not a building permit — gates a gather assignment too (`assignWorker`),
+	// same reason, same `OUTSIDE_REACH`. Crafting and training get no matching check: both happen at
+	// a building, and a building is necessarily inside the reach that let it be built.
+	if (!withinReach(x, y, await reachOf(tx, playerId)))
+		return { ok: false, reason: 'OUTSIDE_REACH' };
 
 	// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
 	// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
@@ -1323,6 +1391,11 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		const yielded = (await tileYields(tx)).get(y * GRID_SIZE + x);
 		if (!yielded || yielded.unitsPerHour <= 0) return { ok: false, reason: 'TILE_YIELDS_NOTHING' };
 
+		// Same gate `planBuild` runs, same reason: the reach is a sphere of influence over both what
+		// you may raise and what you may take, not a building permit alone.
+		if (!withinReach(x, y, await reachOf(tx, playerId)))
+			return { ok: false, reason: 'OUTSIDE_REACH' };
+
 		// Extracted goods need their structure standing on the tile being worked — stone comes
 		// out of a quarry, not out of an outcrop. Gathered ones have no requirement and skip
 		// this entirely. Refused here alongside the other two, so every way a tile can turn a
@@ -1441,6 +1514,9 @@ export async function assignTraining(
 			);
 		if (!school) return { ok: false, reason: 'MISSING_SCHOOL' };
 
+		// No reach gate here either, for the same reason a craft has none: a School is a building, so
+		// standing here already proves this tile is inside the reach.
+
 		// A settler specifically — a specialist is already trained, and this is what makes holding
 		// one back a real choice. Idle (in no in-progress operation) and profession-less.
 		const [settler] = await tx
@@ -1545,6 +1621,10 @@ async function planCraft(
 		.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
 	if (!shop || shop.producesResourceId === null || shop.craftSeconds === null)
 		return { ok: false, reason: 'NOT_A_WORKSHOP' };
+
+	// No reach gate here, deliberately — unlike `planBuild` and `assignWorker`. A batch runs at a
+	// workshop, and a workshop is a building, so if one stands on this tile the reach already let it
+	// be built. A second check would be guarding a case that cannot arise.
 
 	// One batch at a time. Without this a Sawmill is not a bottleneck — you would build one and run
 	// six batches through it at once, and there would be no reason for the catalog to grow.
@@ -1829,6 +1909,10 @@ export async function restyleRoad(
 /** The world as stored, plus the DB's own `now` — the only clock anything trusts. */
 export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload> {
 	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
+	// The circle MapCanvas draws and world.server.ts's own gates enforce, from the same three
+	// numbers — see reachOf's own comment for why a missing Marketplace throws rather than shipping
+	// a silent radius of 0.
+	const reach = await reachOf(tx, playerId);
 	// Ordered, because the client picks a default from this list by position.
 	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
 	const costs = await tx.select().from(buildingCost);
@@ -1960,6 +2044,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 	return {
 		now: new Date(now).toISOString(),
 		gridSize: GRID_SIZE,
+		reach,
 		tileQuantity,
 		terrainTypes: terrainTypes.map((t) => ({
 			id: t.id,

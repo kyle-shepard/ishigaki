@@ -8,7 +8,7 @@
 // none of it is visible from the numeric census alone.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GRID_SIZE } from './world.ts';
+import { GRID_SIZE, START_REACH_RADIUS, withinReach } from './world.ts';
 import { START, terrainCharAt, terrainMap } from './worldgen.ts';
 
 const CHARS = new Set(['.', 'f', 'w', 'h', 'm', 's', 'c', 'i']);
@@ -53,6 +53,35 @@ test('a realm opens on grass, with two clear tiles on every side', () => {
 		[-1, 1, START.hamletY, START.hamletY]
 	);
 	assert.deepEqual([START.characterX, START.characterY], [START.hamletX, START.hamletY + 1]);
+});
+
+test('a realm opens with wood and stone inside its own reach, not merely on the map', () => {
+	// The reach gates gathering, not just building, so a realm can only work the circle it opens
+	// with until its population earns the next milestone. "Wood and stone somewhere on the map" is
+	// therefore not a playable start — this asserts they are inside the opening circle, around the
+	// Marketplace tile rather than the hamlet, because the Marketplace is what the reach is measured
+	// from.
+	//
+	// Counted, not merely present. An earlier version of this rule asked only whether a Forest tile
+	// existed in reach and was satisfied by exactly one — 25 Wood, stripped in about eight hours by
+	// three settlers, then thirty days of nothing, which is the rationing race the rule exists to
+	// prevent. A stone outcrop genuinely needs only one: it has no capacity and never runs down.
+	const reach = { x: START.marketX, y: START.marketY, radius: START_REACH_RADIUS };
+	let forest = 0;
+	let stone = 0;
+	for (let y = 0; y < GRID_SIZE; y++)
+		for (let x = 0; x < GRID_SIZE; x++) {
+			if (!withinReach(x, y, reach)) continue;
+			if (terrainCharAt(x, y) === 'f') forest++;
+			else if (terrainCharAt(x, y) === 's') stone++;
+		}
+	assert.ok(forest >= 8, `only ${forest} Forest tile(s) in the opening reach — a realm cannot cut`);
+	assert.ok(
+		stone >= 1,
+		`no Stone outcrop in the opening reach — the ladder is sealed at the start`
+	);
+	// The Marketplace stands one north of the hamlet, on ground the start block already cleared.
+	assert.deepEqual([START.marketX, START.marketY], [START.hamletX, START.hamletY - 1]);
 });
 
 // Four-way and eight-way, and which terrain gets which is a deliberate call per terrain, not a

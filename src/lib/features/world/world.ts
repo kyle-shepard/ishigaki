@@ -14,6 +14,14 @@ export const GRID_SIZE = 128;
 export const TIER_MIDDLE_MIN = 8; // below this: flat colour only, no art, no overlays
 export const TIER_CLOSE_MIN = 24; // at or above this: full art, and buildings/pawns/roads draw
 
+// The opening reach radius — one number, two jobs. It is the first rung of the seeded
+// reach_milestone table, and it is the circle `findStart` (worldgen.ts) must guarantee holds a
+// Forest and a Stone outcrop before it will settle on a hamlet: the sphere of influence gates
+// gathering as well as building, so "reachable" now means "in reach" from the very first tile.
+// Authored once here, in the `eligibleTypeIds` shape this codebase already prefers, so the search
+// and the seeded table it is searching for can never quietly disagree about where the ladder starts.
+export const START_REACH_RADIUS = 6;
+
 /**
  * The world coordinate (in cell units, fractional) under a pane-relative pixel — read the pane's
  * own scrollLeft/scrollTop as `scroll` and a pixel offset from the pane's edge as `px`, on the same
@@ -38,6 +46,12 @@ export type OrderReason =
 	| 'OUT_OF_BOUNDS'
 	| 'UNKNOWN_BUILDING_TYPE'
 	| 'TILE_NOT_BUILDABLE'
+	// Outside the realm's reach — the sphere of influence a Marketplace projects. Gates both a
+	// build order and a gather assignment (it's a sphere of influence, not a building permit); it
+	// does *not* gate crafting or training, because both happen at a building and a building is
+	// necessarily inside the reach that let it be built — a second check there would guard a case
+	// that cannot arise.
+	| 'OUTSIDE_REACH'
 	| 'TILE_OCCUPIED'
 	| 'NO_IDLE_CHARACTER'
 	| 'INSUFFICIENT_RESOURCES'
@@ -143,6 +157,13 @@ export type WorldPayload = {
 	// (the realm you asked for was gone), not about the world. True on exactly one response,
 	// so the client makes it sticky rather than re-reading it.
 	worldReset?: boolean;
+	// The realm's sphere of influence — a circle of `radius` tiles around its Marketplace, in the
+	// same (x, y) the rest of the wire uses. Drawn by the client (MapCanvas's `arc()`) and enforced
+	// by the server (world.server.ts's `withinReach` gate) from these same three numbers, so the
+	// line drawn and the line enforced can never disagree. Null only in principle — resolveWorld
+	// throws rather than ever shipping a realm with no Marketplace, so a live payload always
+	// carries a real circle; the type stays nullable for the moment before a world has loaded.
+	reach: { x: number; y: number; radius: number } | null;
 	terrainTypes: {
 		id: number;
 		displayName: string;
@@ -872,14 +893,15 @@ export function positionAt(
  *  - **A deposit** (Stone outcrop, Clay pit, Iron vein) → only the one extractor that takes its
  *    yield (Stone ⇒ Quarry), or `[]` when no extractor exists yet (Clay, Iron have none).
  *  - **Plain buildable ground** → every type *except* an extractor, so a Quarry can't squat on a
- *    meadow.
+ *    meadow — and except a type the catalog itself marks not player-buildable (the Marketplace),
+ *    which is placed once at realm creation and never offered again.
  *
  * Pure and database-free — the caller passes the catalogs it already holds — so the terrain-menu
  * rule is pinned in `npm test` rather than only felt through the browser.
  */
 export function eligibleTypeIds(
 	terrain: { buildable: boolean; isDeposit: boolean; yieldsResourceId: number | null },
-	buildingTypes: { id: number }[],
+	buildingTypes: { id: number; playerBuildable: boolean }[],
 	resources: { id: number; requiresBuildingTypeId: number | null }[]
 ): number[] {
 	if (!terrain.buildable) return [];
@@ -892,5 +914,43 @@ export function eligibleTypeIds(
 		const extractor = yielded?.requiresBuildingTypeId ?? null;
 		return extractor !== null ? [extractor] : [];
 	}
-	return buildingTypes.filter((t) => !extractors.has(t.id)).map((t) => t.id);
+	return buildingTypes.filter((t) => t.playerBuildable && !extractors.has(t.id)).map((t) => t.id);
+}
+
+/**
+ * Is (x, y) inside a reach circle? Euclidean, not the grid's own eight-way step distance — the
+ * circle a canvas `arc()` draws and the circle the server gate enforces have to be the same
+ * arithmetic, or the line drawn and the line enforced could disagree. Exactly on the radius counts
+ * as inside: a boundary tile is *in* your reach, not the first tile past it.
+ *
+ * Takes the circle as one nullable value rather than three separate arguments — a caller with no
+ * reach loaded yet (the world hasn't arrived) has nothing to be inside, which this answers as
+ * `false` rather than making every call site null-check first.
+ */
+export function withinReach(
+	x: number,
+	y: number,
+	reach: { x: number; y: number; radius: number } | null
+): boolean {
+	return reach !== null && Math.hypot(x - reach.x, y - reach.y) <= reach.radius;
+}
+
+/**
+ * The reach radius a settlement has *earned* at this population — the milestone lookup itself,
+ * pure so it is the thing `npm test` actually runs. The write side of the ratchet is one SQL
+ * keyword (`GREATEST(reach_radius, reachFor(...))` in world.server.ts's `resolveWorld`); this
+ * function is the arithmetic behind that number, tested here rather than only trusted there.
+ *
+ * The highest threshold met wins, not the last one in the array — `milestones` is seeded content
+ * (VISION #10) and nothing here assumes it arrives in population order. Below every threshold is
+ * `0`, not the lowest milestone's radius: a settlement that hasn't reached the first rung hasn't
+ * earned any reach yet.
+ */
+export function reachFor(
+	population: number,
+	milestones: { population: number; radius: number }[]
+): number {
+	let radius = 0;
+	for (const m of milestones) if (population >= m.population) radius = Math.max(radius, m.radius);
+	return radius;
 }

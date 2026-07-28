@@ -18,6 +18,7 @@ const BASE = process.env.RULES_CHECK_URL ?? 'http://localhost:5173';
 // wrong thing the next time WORLD_SEED changed — which is exactly what happened to the forty-odd
 // hardcoded coordinates this file used to carry.
 import { START } from '../src/lib/features/world/worldgen.ts';
+import { START_REACH_RADIUS } from '../src/lib/features/world/world.ts';
 
 // Every request carries the same cookie, so all cases play in one player's sandbox — the
 // occupancy checks are player-scoped and would read a different world otherwise.
@@ -210,6 +211,94 @@ check(
 	`(${START.hamletX},${START.hamletY}) holds the hamlet`,
 	[occupied.status, occupied.body.reason],
 	[400, 'TILE_OCCUPIED']
+);
+
+// ---- Reach ---------------------------------------------------------------------------------------
+//
+// The sphere of influence: a build (and, new this phase, a gather) just outside is refused
+// OUTSIDE_REACH; the same one exactly on the boundary — which `withinReach`'s `<=` counts as
+// inside — is accepted. Coordinates come from the payload's own `reach`, never written down, the
+// same discipline `findMany` already holds terrain to.
+//
+// Only the four cardinal offsets are tried: at the radii this map actually uses (6 and 7) they are
+// the only integer points on the circle at all — 6² and 7² have no other decomposition into two
+// squares — so there is nothing to gain from trying more, and the first one that is buildable,
+// unoccupied ground wins the same way `findMany` picks its first match.
+function reachEdge(dist: number): { x: number; y: number } {
+	const { x: cx, y: cy } = world.body.reach;
+	for (const [dx, dy] of [
+		[dist, 0],
+		[0, dist],
+		[-dist, 0],
+		[0, -dist]
+	]) {
+		const x = cx + dx;
+		const y = cy + dy;
+		if (x < 0 || y < 0 || x >= world.body.gridSize || y >= world.body.gridSize) continue;
+		const i = y * world.body.gridSize + x;
+		if (startBuildings.has(i)) continue;
+		const t = world.body.terrainTypes.find((tt: { id: number }) => tt.id === world.body.terrain[i]);
+		if (t?.buildableTypeIds.includes(free)) return { x, y };
+	}
+	throw new Error(`no buildable, unoccupied tile exactly ${dist} tiles from the reach centre`);
+}
+const insideEdge = reachEdge(world.body.reach.radius);
+const outsideEdge = reachEdge(world.body.reach.radius + 1);
+
+cookie = '';
+await api('/api/world');
+const buildOutside = await order(outsideEdge.x, outsideEdge.y, free);
+check(
+	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a build`,
+	[buildOutside.status, buildOutside.body.reason],
+	[400, 'OUTSIDE_REACH']
+);
+cookie = '';
+await api('/api/world');
+check(
+	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same build`,
+	(await order(insideEdge.x, insideEdge.y, free)).status,
+	200
+);
+
+cookie = '';
+await api('/api/world');
+const gatherOutside = await assign(outsideEdge.x, outsideEdge.y);
+check(
+	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a gather too — it's a` +
+		' sphere of influence, not a building permit',
+	[gatherOutside.status, gatherOutside.body.reason],
+	[400, 'OUTSIDE_REACH']
+);
+cookie = '';
+await api('/api/world');
+check(
+	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same gather`,
+	(await assign(insideEdge.x, insideEdge.y)).status,
+	200
+);
+
+// The ratchet, end to end. The SQL side of it is only ever `GREATEST(reach_radius, target)` — no
+// unit test pins that keyword itself (world.test.ts pins `reachFor`, the target arithmetic behind
+// it); this is the one place it actually runs. A fresh realm's starting population (3) sits exactly
+// on the first milestone, so the opening value is asserted directly against it, then read again
+// after a build and a real wait — as much population movement as a bounded script can afford (real
+// growth takes on the order of 30 real minutes at the seeded rate) — to prove what ran was the
+// ratchet and not a plain assignment that would have (correctly, here) produced the same number.
+cookie = '';
+const ratchetStart = await api('/api/world');
+check(
+	'a fresh realm opens at exactly the first reach milestone',
+	ratchetStart.body.reach.radius,
+	START_REACH_RADIUS
+);
+await order(meadow.x, meadow.y, house);
+await new Promise((r) => setTimeout(r, 2000));
+const ratchetEnd = await api('/api/world');
+check(
+	'the reach radius never fell across those reads',
+	ratchetEnd.body.reach.radius >= ratchetStart.body.reach.radius,
+	true
 );
 
 // Terrain has to change the route, not just cost time. This used to be a hand-placed lake between

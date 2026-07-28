@@ -208,6 +208,26 @@
 			<rect x="2" y="27" width="28" height="1.6" fill="#00000022" />
 		</symbol>
 
+		<!-- A market stall: a striped awning over an open counter, goods laid out on it — no walls,
+		     reads as "trade happens here" rather than "someone lives here". The one building nobody
+		     ever chooses from a menu (player_buildable false), but it still needs to be findable on
+		     the map the way every other building is. -->
+		<symbol id="i-market" viewBox="0 0 32 32">
+			<path d="M4 20 L16 7 L28 20 Z" fill="#b23b3b" />
+			<g fill="#e8d9b0">
+				<path d="M5.5 20 L10 20 L12.3 13.4 L7.3 13.4 Z" />
+				<path d="M13.3 20 L18.7 20 L18.7 13.4 L13.3 13.4 Z" />
+				<path d="M22 20 L26.5 20 L24.7 13.4 L19.7 13.4 Z" />
+			</g>
+			<rect x="6" y="20" width="20" height="8" fill="#c9a066" />
+			<g fill="#8a5a33">
+				<circle cx="11" cy="24" r="1.6" />
+				<circle cx="16" cy="23.3" r="1.3" />
+				<circle cx="21" cy="24" r="1.6" />
+			</g>
+			<rect x="6" y="27" width="20" height="1.6" fill="#00000022" />
+		</symbol>
+
 		<!-- The resource bar's icons, keyed `res-*` off resource.icon. Unlike the terrain and building
 		     symbols these are drawn on the header band rather than on a tile colour, at about half
 		     the size, so they are chunkier and fewer-marked: five shapes have to stay apart from each

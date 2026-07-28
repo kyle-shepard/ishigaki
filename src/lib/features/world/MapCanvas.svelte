@@ -153,6 +153,20 @@
 				}
 			}
 		}
+		// The reach circle — the sphere of influence a Marketplace projects, at the same threshold
+		// `drawArt` already turns art off at: below it (the far tier) individual tiles stop being the
+		// point, and a circle a few pixels wide would tell you nothing an arc at this scale can. Same
+		// `withinReach` arithmetic the server gate enforces, so the line drawn and the line enforced
+		// are the same circle rather than two implementations that could quietly disagree.
+		if (drawArt && world.reach) {
+			const cx = (world.reach.x + 0.5) * cell - scrollLeft;
+			const cy = (world.reach.y + 0.5) * cell - scrollTop;
+			ctx.beginPath();
+			ctx.arc(cx, cy, world.reach.radius * cell, 0, Math.PI * 2);
+			ctx.strokeStyle = '#1d4ed8';
+			ctx.lineWidth = 2;
+			ctx.stroke();
+		}
 	}
 
 	// Canvas sized to the pane's own client box × devicePixelRatio, or it is blurry on every retina

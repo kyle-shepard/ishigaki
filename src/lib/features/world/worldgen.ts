@@ -28,7 +28,7 @@
 
 // The `.ts` extension is load-bearing: this module is imported by `scripts/` under plain Node,
 // which does not resolve extensionless paths. Same reason world.test.ts writes it that way.
-import { GRID_SIZE } from './world.ts';
+import { GRID_SIZE, START_REACH_RADIUS, withinReach } from './world.ts';
 
 // Bumped for the 128×128 cut (decision 3): a clean break rather than 7× the old world regenerated
 // under standing buildings. `npm run seed -- --wipe` is the deliberate step that actually clears
@@ -551,9 +551,57 @@ const GRASS = '.';
 // what the authored core did before this rule existed.
 const START_MARGIN = 2;
 
+// Forest and Stone, the two terrain chars `hasStartingResources` below is watching for.
+const FOREST = 'f';
+const STONE = 's';
+
+// How much of each the opening circle has to hold. Stone is one tile because an outcrop never runs
+// down — `seed.ts` gives it no capacity, so one is an endless supply and a second adds nothing.
+//
+// Forest is eight because a forest tile very much does run down, and "at least one" turned out to
+// be a guarantee in name only. A tile holds 25 Wood and takes thirty days to grow back; the seed's
+// own note calls that ~90x gap the mechanic that "pushes you outward to new ground" — but the reach
+// gates outward now, so a realm cannot answer a stripped forest by walking to the next one until
+// its population earns the next milestone. One tile is 25 Wood, stripped in about eight hours by
+// the three settlers a realm opens with, and then a month of nothing. Eight is 200, which is a
+// couple of days' gathering — comfortably longer than growing 3 people to the 8 that widen the
+// circle to where the real woodland is.
+//
+// Cheap, too, which is why it is eight and not one: on the shipped seed, 69 of the 1,430 legal
+// start blocks clear this bar, and insisting on it moves the opening hamlet a single tile.
+const START_FOREST = 8;
+const START_STONE = 1;
+
+/**
+ * Does the *starting* reach — a `START_REACH_RADIUS` circle around where the Marketplace will
+ * stand, one tile north of the hamlet — actually hold enough wood and stone to open with? The reach
+ * gates gathering as well as building (it's a sphere of influence, not a building permit), so
+ * "reachable" now means "in reach": a hamlet with a forest and an outcrop somewhere on the map but
+ * outside its own opening circle is a rationing race nobody chose, not a playable start. Uses the
+ * same Euclidean test the server gate and the drawn circle use, so the search and the rule it is
+ * searching for can never quietly disagree about the shape of a circle.
+ */
+function hasStartingResources(hx: number, hy: number, charAt: (x: number, y: number) => string) {
+	const reach = { x: hx, y: hy - 1, radius: START_REACH_RADIUS };
+	let forest = 0;
+	let stone = 0;
+	for (let y = reach.y - reach.radius; y <= reach.y + reach.radius; y++)
+		for (let x = reach.x - reach.radius; x <= reach.x + reach.radius; x++) {
+			if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) continue;
+			if (!withinReach(x, y, reach)) continue;
+			const c = charAt(x, y);
+			if (c === FOREST) forest++;
+			else if (c === STONE) stone++;
+			if (forest >= START_FOREST && stone >= START_STONE) return true;
+		}
+	return false;
+}
+
 /**
  * Where a new realm opens: the hamlet tile, with its two flanking buildings, the settlers on the
- * row below, and `START_MARGIN` tiles of clear grass around the lot.
+ * row below, and `START_MARGIN` tiles of clear grass around the lot — plus, now that the reach gates
+ * gathering too, wood and stone inside the *starting* reach around the Marketplace tile just north
+ * of it.
  *
  * Searched rather than declared. A hand-placed constant was quietly wrong — the authored core put a
  * lake two tiles north of it — and a constant cannot notice when the ground under it moves, which
@@ -565,7 +613,8 @@ const START_MARGIN = 2;
  */
 function findStart(charAt: (x: number, y: number) => string) {
 	// Buildings on `y`, settlers on `y + 1`, three wide and centred on the hamlet — then the margin
-	// around all of it.
+	// around all of it. The Marketplace tile (hx, hy - 1) already sits inside this block, so a
+	// candidate that clears it needs no separate check to know the Marketplace's own tile is grass.
 	const clear = (hx: number, hy: number) => {
 		for (let x = hx - 1 - START_MARGIN; x <= hx + 1 + START_MARGIN; x++)
 			for (let y = hy - START_MARGIN; y <= hy + 1 + START_MARGIN; y++) {
@@ -579,7 +628,7 @@ function findStart(charAt: (x: number, y: number) => string) {
 	for (let y = 0; y < GRID_SIZE; y++)
 		for (let x = 0; x < GRID_SIZE; x++) {
 			const d = Math.hypot(x - mid, y - mid);
-			if ((best && d >= best.d) || !clear(x, y)) continue;
+			if ((best && d >= best.d) || !clear(x, y) || !hasStartingResources(x, y, charAt)) continue;
 			best = { x, y, d };
 		}
 	return best && { x: best.x, y: best.y };
@@ -601,7 +650,8 @@ const rolled = (() => {
 		if (start) return { seed, charAt, start };
 	}
 	throw new Error(
-		`no map in 50 rolls from seed ${WORLD_SEED} has ${START_MARGIN} tiles of clear grass around a hamlet`
+		`no map in 50 rolls from seed ${WORLD_SEED} has ${START_MARGIN} tiles of clear grass around a ` +
+			`hamlet with Forest and Stone within ${START_REACH_RADIUS} tiles of its Marketplace`
 	);
 })();
 
@@ -627,6 +677,10 @@ export const START = {
 	house2Y: rolled.start.y,
 	barnX: rolled.start.x + 1,
 	barnY: rolled.start.y,
+	// The Marketplace, and so the centre of the realm's reach — one tile north of the hamlet. Inside
+	// `findStart`'s cleared block and standing on nothing, so no other building has to move for it.
+	marketX: rolled.start.x,
+	marketY: rolled.start.y - 1,
 	// The settlers stand shoulder to shoulder on the row below, from characterX - 1.
 	characterX: rolled.start.x,
 	characterY: rolled.start.y + 1

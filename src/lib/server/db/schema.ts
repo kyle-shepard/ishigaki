@@ -57,6 +57,13 @@ export const buildingType = pgTable(
 		// A column rather than a constant so a paved road, a towpath or a bridge are row edits
 		// (VISION #10), and so the number is tunable against travel times in a live world.
 		movementCost: real('movement_cost'),
+		// Whether a player may ever order this type built. True for everything except the
+		// Marketplace, which every realm gets exactly once at creation (ensurePlayer) and can never
+		// raise a second of — there is no demolish path, so "offer it in the menu" would just be a
+		// button that always refuses. Filtered inside `eligibleTypeIds`, the one function the build
+		// gate and the wire allow-list already share, so this is one column and one predicate rather
+		// than a second code path next to it.
+		playerBuildable: boolean('player_buildable').notNull().default(true),
 		// A realm-wide build prerequisite: this type can't be placed until the player owns one of
 		// the referenced type *anywhere* (a Stone wall needs a Quarry standing). Distinct from the
 		// tile-local gate on resource.requiresBuildingTypeId (a Quarry on *this* outcrop before
@@ -286,30 +293,58 @@ export const recipeInput = pgTable(
 // Where a player's stock lives. One per player for now — the uniqueness is not decoration:
 // the read-modify-write lock is `WHERE player_id = $1 FOR UPDATE`, and a second row would
 // split the stock in two and lock only whichever came back first.
-export const settlement = pgTable('settlement', {
-	id: serial('id').primaryKey(),
-	playerId: integer('player_id')
-		.notNull()
-		.unique()
-		.references(() => player.id),
-	x: integer('x').notNull(),
-	y: integer('y').notNull(),
-	// The anchor population growth (and, later, food drain) is integrated from on read — the
-	// same integrate-on-read trick `tile_stock.as_of` uses for regrowth, one timestamp for the
-	// whole settlement. Defaults to now so a fresh realm starts counting from creation; existing
-	// realms backfill to deploy time and grow from then, with no retroactive population.
-	//
-	// Unlike Slice 3, this anchor now advances fully to `now` on every read: food is stored
-	// fractional and must drain smoothly with the clock, so the interval can't be held back the
-	// way whole-settler growth once was. The sub-person growth/starvation remainder is carried
-	// in populationAccrued instead — two concerns, two fields, each integrated cleanly.
-	populationAsOf: timestamp('population_as_of', { withTimezone: true }).notNull().defaultNow(),
-	// Signed fractional population pressure carried between reads: positive is a birth pending,
-	// negative a departure pending. A person is whole but growth and starvation are rates, so the
-	// leftover under one person rides here — this is what makes the result independent of how
-	// often the world is read (a week away equals a hundred visits).
-	populationAccrued: real('population_accrued').notNull().default(0)
-});
+export const settlement = pgTable(
+	'settlement',
+	{
+		id: serial('id').primaryKey(),
+		playerId: integer('player_id')
+			.notNull()
+			.unique()
+			.references(() => player.id),
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		// The anchor population growth (and, later, food drain) is integrated from on read — the
+		// same integrate-on-read trick `tile_stock.as_of` uses for regrowth, one timestamp for the
+		// whole settlement. Defaults to now so a fresh realm starts counting from creation; existing
+		// realms backfill to deploy time and grow from then, with no retroactive population.
+		//
+		// Unlike Slice 3, this anchor now advances fully to `now` on every read: food is stored
+		// fractional and must drain smoothly with the clock, so the interval can't be held back the
+		// way whole-settler growth once was. The sub-person growth/starvation remainder is carried
+		// in populationAccrued instead — two concerns, two fields, each integrated cleanly.
+		populationAsOf: timestamp('population_as_of', { withTimezone: true }).notNull().defaultNow(),
+		// Signed fractional population pressure carried between reads: positive is a birth pending,
+		// negative a departure pending. A person is whole but growth and starvation are rates, so the
+		// leftover under one person rides here — this is what makes the result independent of how
+		// often the world is read (a week away equals a hundred visits).
+		populationAccrued: real('population_accrued').notNull().default(0),
+		// The realm's build-and-gather radius, in tiles from its Marketplace — the sphere of influence
+		// gates both what you may raise and what you may take (world.ts's `withinReach`, `OUTSIDE_REACH`).
+		// Ratchets only: `resolveWorld` writes `GREATEST(reach_radius, reachFor(population, ...))`, so a
+		// famine that drops population can never shrink it back (decision 9) — the arithmetic that picks
+		// the target lives in world.ts's `reachFor`, tested there; this column only ever holds the
+		// high-water mark. Defaults to 0 so a settlement predating this column reads as "hasn't earned any
+		// reach yet" rather than an arbitrary guess, and the next read ratchets it up to where it belongs.
+		reachRadius: integer('reach_radius').notNull().default(0)
+	},
+	(t) => [
+		// Every quantity column in this schema carries its own bound; a radius is no exception.
+		check('settlement_reach_radius_non_negative', sql`${t.reachRadius} >= 0`)
+	]
+);
+
+// The reach radius steps at population milestones — LoL-style discrete jumps (decision 8), not a
+// tile per head. Content, not code (VISION #10): retuning a threshold or its radius is an UPDATE
+// against a live world, the same shape as building_cost. Natural-keyed on the population threshold
+// itself, since two rows can't both want that number to mean a different radius.
+export const reachMilestone = pgTable(
+	'reach_milestone',
+	{
+		population: integer('population').primaryKey(),
+		radius: integer('radius').notNull()
+	},
+	(t) => [check('reach_milestone_radius_positive', sql`${t.radius} > 0`)]
+);
 
 // Global scalars that shape play but aren't per-anything: growth rate now, food and skill
 // tuning as later slices need them. One typed row, not a stringly key/value bag — VISION #10

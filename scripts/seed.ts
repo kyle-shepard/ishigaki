@@ -11,13 +11,14 @@ import {
 	player,
 	profession,
 	professionSkill,
+	reachMilestone,
 	recipeInput,
 	resource,
 	skill,
 	terrainType,
 	tile
 } from '../src/lib/server/db/schema.ts';
-import { GRID_SIZE } from '../src/lib/features/world/world.ts';
+import { GRID_SIZE, START_REACH_RADIUS } from '../src/lib/features/world/world.ts';
 import { START, terrainCharAt } from '../src/lib/features/world/worldgen.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
@@ -98,7 +99,19 @@ const buildingTypes = await db
 		// The payoff. Houses 10 against a House's 4 — and it is priced in Planks and Furniture, so no
 		// amount of raw wood could ever have bought it. This is where the chain lands in the one
 		// number a player already watches.
-		{ displayName: 'Longhouse', icon: 'longhouse', buildSeconds: 120, housingCapacity: 10 }
+		{ displayName: 'Longhouse', icon: 'longhouse', buildSeconds: 120, housingCapacity: 10 },
+		// The reach's anchor. Placed once by ensurePlayer at realm creation (and backfilled onto
+		// every existing realm below) — never ordered, so buildSeconds is a number nothing ever
+		// reads. player_buildable: false is the whole of "never offer it in the menu"; no cost rows,
+		// because nobody ever pays for one. Added last so it stays the highest id, which is what
+		// keeps rules-check.ts's "pick the first free-to-build type" still landing on the Barn.
+		{
+			displayName: 'Marketplace',
+			icon: 'market',
+			buildSeconds: 0,
+			housingCapacity: 0,
+			playerBuildable: false
+		}
 	])
 	// Keyed on the name, so re-running against a live world retunes the row a player's
 	// buildings already point at rather than making a second one beside it.
@@ -108,7 +121,8 @@ const buildingTypes = await db
 			icon: sql`excluded.icon`,
 			buildSeconds: sql`excluded.build_seconds`,
 			housingCapacity: sql`excluded.housing_capacity`,
-			movementCost: sql`excluded.movement_cost`
+			movementCost: sql`excluded.movement_cost`,
+			playerBuildable: sql`excluded.player_buildable`
 		}
 	})
 	.returning();
@@ -154,6 +168,53 @@ await db
 			startY: sql`excluded.start_y`
 		}
 	});
+
+// The tuning data behind the reach's growth (decision 8: LoL-style discrete steps, not a tile per
+// head). Content, not code (VISION #10): retuning a threshold or its radius is an UPDATE against a
+// live world, same shape as building_cost below.
+const MILESTONES = [
+	{ population: 3, radius: 6 },
+	{ population: 8, radius: 9 },
+	{ population: 15, radius: 13 },
+	{ population: 25, radius: 18 },
+	{ population: 40, radius: 24 }
+];
+// The first rung has to be the same circle `findStart` already searched the generated map for
+// (world.ts's START_REACH_RADIUS, consumed there and here) — a mismatch would mean the map's own
+// guarantee of reachable wood and stone and the seeded table describing the reach disagree about
+// the shape of the opening circle.
+if (MILESTONES[0].radius !== START_REACH_RADIUS)
+	throw new Error(
+		`the first reach milestone is radius ${MILESTONES[0].radius}, but findStart searched the map ` +
+			`for a starting reach of ${START_REACH_RADIUS} — the two must agree`
+	);
+// A fresh realm opens at STARTING_CHARACTERS (world.server.ts) settlers — mirrored here as a plain
+// number rather than an import, because world.server.ts pulls in `$lib/server/db` and is
+// unimportable outside Vite (see the header comment). An empty or too-high milestone table would
+// leave every new realm at reach_radius 0, refusing every build and gather as "outside your reach"
+// — a world nobody could play, and one that would fail silently rather than at deploy time. Same
+// shape as the "ladder is sealed shut" and missing-School throws elsewhere in this file.
+const STARTING_POPULATION = 3;
+if (!MILESTONES.some((m) => m.population <= STARTING_POPULATION))
+	throw new Error(
+		`no reach milestone covers the starting population of ${STARTING_POPULATION} — every fresh ` +
+			'realm would open at reach_radius 0 and refuse every build and gather'
+	);
+await db
+	.insert(reachMilestone)
+	.values(MILESTONES)
+	.onConflictDoUpdate({
+		target: reachMilestone.population,
+		set: { radius: sql`excluded.radius` }
+	});
+// A milestone dropped from MILESTONES has to actually stop applying — same argument as
+// building_cost and the other tuning tables below: upserts alone would leave the stale rung behind.
+await db.execute(
+	sql`DELETE FROM reach_milestone WHERE population NOT IN (${sql.join(
+		MILESTONES.map((m) => sql`${m.population}`),
+		sql`, `
+	)})`
+);
 
 // The action-skill catalog — six skills, each governed by two of the four base stats. Content,
 // natural-keyed like everything else (VISION #10): a retuned governing stat is a row edit.
@@ -343,6 +404,20 @@ await db.execute(
 	sql`INSERT INTO stock (settlement_id, resource_id, quantity)
 	    SELECT s.id, r.id, 0 FROM settlement s CROSS JOIN resource r
 	    ON CONFLICT DO NOTHING`
+);
+
+// Same idea, one column over: every existing settlement gets the Marketplace it predates.
+// `ensurePlayer` places one for every *new* realm; this is what catches every realm made before
+// this building type existed. (x, y - 1) is the exact tile worldgen.ts's START.marketX/marketY
+// names and findStart's clear margin already guarantees empty — so nothing moves and no realm
+// resets, which is what makes this backfill an INSERT rather than the wipe-and-reroll every other
+// schema change in this epic needed. ON CONFLICT on the tile itself (building_tile_idx) rather than
+// a check-then-insert: idempotent the same way the stock backfill above is, and harmless to re-run.
+await db.execute(
+	sql`INSERT INTO building (player_id, x, y, building_type_id)
+	    SELECT s.player_id, s.x, s.y - 1, ${bt['Marketplace']}
+	    FROM settlement s
+	    ON CONFLICT (player_id, x, y) DO NOTHING`
 );
 
 // What a build costs. Rows, not constants: retuning this is an UPDATE against a live world,
@@ -540,7 +615,10 @@ for (let pass = 0; pass < buildingTypes.length; pass++) {
 		if (buildable.has(r.building) && r.inputs.every((i) => reachable.has(i.resource)))
 			reachable.add(r.produces);
 }
-const stranded = buildingTypes.filter((t) => !buildable.has(t.displayName));
+// A type nobody may ever order (the Marketplace) is placed once by ensurePlayer and never climbed
+// to by a player, so it has no business in a walk asking "could a player reach this" — skip it, or
+// it reports as stranded and this throws on a perfectly climbable ladder.
+const stranded = buildingTypes.filter((t) => t.playerBuildable && !buildable.has(t.displayName));
 if (stranded.length > 0)
 	throw new Error(
 		`unbuildable from a fresh world: ${stranded.map((t) => t.displayName).join(', ')} — ` +
@@ -709,6 +787,7 @@ const meadowAt = (x: number, y: number) => {
 meadowAt(START.hamletX, START.hamletY);
 meadowAt(START.house2X, START.house2Y);
 meadowAt(START.barnX, START.barnY);
+meadowAt(START.marketX, START.marketY);
 meadowAt(START.characterX, START.characterY);
 // The three starting characters stand shoulder to shoulder from characterX - 1 (see
 // STARTING_CHARACTERS in world.server.ts), so their tiles have to be open ground too.
