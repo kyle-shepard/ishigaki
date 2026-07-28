@@ -36,11 +36,9 @@ import {
 	type OrderReason,
 	type WorldPayload
 } from './world';
-// Where a realm opens is a fact about the terrain, so it comes from whatever drew the terrain.
-import { START } from './worldgen';
 
-// How fast a starting settler walks, in tiles per second. Not part of START, which is a placement
-// and knows nothing about legs.
+// How fast a starting settler walks, in tiles per second. Not part of the start block, which is
+// a placement and knows nothing about legs.
 const WALK_SPEED = 0.5;
 
 // How many people a realm starts with. An explicit placeholder for real population growth
@@ -73,6 +71,27 @@ export type PlayerSession = {
 	/** True when the caller arrived holding a realm that no longer exists — see below. */
 	worldReset: boolean;
 };
+
+/**
+ * The rest of the start block, derived from the hamlet tile alone. `game_config` stores only
+ * `start_x`/`start_y`, not six columns — worldgen.ts's `findStart` clears the same shape (a
+ * second House to the hamlet's west, the Barn to its east, the settlers on the row below) when it
+ * searches the generated ground, so re-deriving it here rather than storing it again is the same
+ * fact read once instead of kept twice. Named once so a placement rule only has to be right in
+ * one place, not repeated at every call site in `ensurePlayer`.
+ */
+function startBlockFrom(hamletX: number, hamletY: number) {
+	return {
+		hamletX,
+		hamletY,
+		house2X: hamletX - 1,
+		house2Y: hamletY,
+		barnX: hamletX + 1,
+		barnY: hamletY,
+		characterX: hamletX,
+		characterY: hamletY + 1
+	};
+}
 
 /**
  * Resolves the caller's sandbox, creating one on first visit. Returns the id to store in
@@ -125,10 +144,21 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 		if (resources.length === 0)
 			throw new Error('no resource rows — run `npm run seed` against this database');
 
+		// Where a realm opens is a fact about the terrain, generated once at seed time rather than
+		// on every cold start (see worldgen.ts's own header). A row with no start position is a
+		// database seeded before this column existed — the same "run npm run seed" throw every
+		// other missing-catalog-row case in this file already gives, never a guessed coordinate.
+		const [cfg] = await tx.select().from(gameConfig);
+		if (!cfg || cfg.startX === null || cfg.startY === null)
+			throw new Error(
+				'no start position in game_config — run `npm run seed` against this database'
+			);
+		const start = startBlockFrom(cfg.startX, cfg.startY);
+
 		const [p] = await tx.insert(player).values({}).returning();
 		const [s] = await tx
 			.insert(settlement)
-			.values({ playerId: p.id, x: START.hamletX, y: START.hamletY })
+			.values({ playerId: p.id, x: start.hamletX, y: start.hamletY })
 			.returning();
 		// A row per resource, present from the start rather than created on first gain: the
 		// accrual and the deduction are then both an UPDATE that either matches a row or does
@@ -142,20 +172,20 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 				resources.map((r) => ({ settlementId: s.id, resourceId: r.id, quantity: r.startingStock }))
 			);
 		await tx.insert(building).values([
-			{ playerId: p.id, x: START.hamletX, y: START.hamletY, buildingTypeId: house.id },
+			{ playerId: p.id, x: start.hamletX, y: start.hamletY, buildingTypeId: house.id },
 			// A second House, so a fresh realm's housing cap is eight and people keep arriving.
-			{ playerId: p.id, x: START.house2X, y: START.house2Y, buildingTypeId: house.id },
+			{ playerId: p.id, x: start.house2X, y: start.house2Y, buildingTypeId: house.id },
 			// The barn stores nothing yet and gates nothing — with no capacity there is nothing
 			// for it to read. It is here so "where your stock lives" is a place on the map, and
 			// it is the row capacity will hang off when it arrives.
-			{ playerId: p.id, x: START.barnX, y: START.barnY, buildingTypeId: barn.id }
+			{ playerId: p.id, x: start.barnX, y: start.barnY, buildingTypeId: barn.id }
 		]);
 		// Side by side along the row below the hamlet, so three pawns don't stack into one.
 		await tx.insert(character).values(
 			Array.from({ length: STARTING_CHARACTERS }, (_, i) => ({
 				playerId: p.id,
-				x: START.characterX + i - 1,
-				y: START.characterY,
+				x: start.characterX + i - 1,
+				y: start.characterY,
 				speed: WALK_SPEED
 			}))
 		);

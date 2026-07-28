@@ -125,6 +125,9 @@ const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 // settlerBaseline 0.15 and skillCurve 0.3 set the quality band: a settler works at 0.15 of the
 // reference rate, a matched specialist at ~0.6–0.85 (their ~0.7 bundle swung by rolled stats) —
 // the ~4–5× the Q asks for. Both tunable live (VISION #10).
+// startX/startY ride the same upsert as the rest of this row: the terrain's own answer
+// (worldgen.ts's findStart, via START), written here rather than recomputed at every cold
+// start — see world.server.ts, which reads these instead of importing worldgen at all.
 await db
 	.insert(gameConfig)
 	.values([
@@ -134,7 +137,9 @@ await db
 			foodPerCapitaHour: 0.4,
 			starvePerHour: 1,
 			settlerBaseline: 0.15,
-			skillCurve: 0.3
+			skillCurve: 0.3,
+			startX: START.hamletX,
+			startY: START.hamletY
 		}
 	])
 	.onConflictDoUpdate({
@@ -144,7 +149,9 @@ await db
 			foodPerCapitaHour: sql`excluded.food_per_capita_hour`,
 			starvePerHour: sql`excluded.starve_per_hour`,
 			settlerBaseline: sql`excluded.settler_baseline`,
-			skillCurve: sql`excluded.skill_curve`
+			skillCurve: sql`excluded.skill_curve`,
+			startX: sql`excluded.start_x`,
+			startY: sql`excluded.start_y`
 		}
 	});
 

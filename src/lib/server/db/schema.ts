@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import type { OperationType as WireOperationType } from '$lib/features/world/world';
+import { GRID_SIZE, type OperationType as WireOperationType } from '$lib/features/world/world';
 import {
 	type AnyPgColumn,
 	boolean,
@@ -332,9 +332,35 @@ export const gameConfig = pgTable(
 		// floor the whole quality curve is measured against.
 		settlerBaseline: real('settler_baseline').notNull().default(1),
 		// How much a specialist's governing stats swing their output around their trained value.
-		skillCurve: real('skill_curve').notNull().default(0)
+		skillCurve: real('skill_curve').notNull().default(0),
+		// Where a fresh realm's hamlet opens — worldgen.ts's own answer, written once by the seed
+		// rather than recomputed at every cold start (world.server.ts reads these instead of
+		// importing worldgen). Nullable, unlike this table's other columns: a row seeded before this
+		// column existed has no start position, and that is exactly the state world.server.ts must
+		// tell apart from "seeded" and throw on, the same "run npm run seed" throw every other
+		// missing-catalog-row case in that file already gives — a default would hide the gap instead
+		// of reporting it.
+		startX: integer('start_x'),
+		startY: integer('start_y')
 	},
-	(t) => [check('game_config_singleton', sql`${t.id} = 1`)]
+	(t) => [
+		check('game_config_singleton', sql`${t.id} = 1`),
+		// Every quantity column in this schema carries its own bound; a coordinate's bound is the
+		// grid. Two checks, not one combined, matching the building_type_output_positive /
+		// building_type_craft_positive split above — each column's own constraint, independently.
+		// `sql.raw` rather than `${GRID_SIZE}`: a plain interpolation binds it as a query parameter
+		// ($1), which a CHECK constraint's DDL cannot reference — drizzle-kit generates the literal
+		// as `< $1`, invalid outside a prepared statement. Raw inlines the number as constant SQL
+		// text, still sourced from the one constant rather than typed twice.
+		check(
+			'game_config_start_x_range',
+			sql`${t.startX} IS NULL OR (${t.startX} >= 0 AND ${t.startX} < ${sql.raw(String(GRID_SIZE))})`
+		),
+		check(
+			'game_config_start_y_range',
+			sql`${t.startY} IS NULL OR (${t.startY} >= 0 AND ${t.startY} < ${sql.raw(String(GRID_SIZE))})`
+		)
+	]
 );
 
 // Held stock, one row per (settlement, resource). No cap this epic — capacity is a later
