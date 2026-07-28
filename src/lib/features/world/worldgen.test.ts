@@ -1,8 +1,8 @@
 // Run: npm test  (node --test, no framework added)
 //
-// The generator is tuned by eye against `npm run map`, and eyes are not in CI. These are the two
-// things a threshold edit can quietly break that looking at a map you already believe in will not
-// catch: a world that is mostly sea, and a world whose authored middle has slid off its offset.
+// The generator is tuned by eye against `npm run map`, and eyes are not in CI. This is the thing a
+// threshold edit can quietly break that looking at a map you already believe in will not catch: a
+// world that is mostly sea or mountain, or one with nowhere left for a fresh hamlet to open.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GRID_SIZE } from './world.ts';
@@ -35,8 +35,8 @@ test('the world is somewhere to live, not an ocean or a mountain range', () => {
 test('a realm opens on grass, with two clear tiles on every side', () => {
 	// The rule the start search exists to hold, asserted from the outside: the three buildings, the
 	// settlers' row below them, and a two-tile margin around the lot — all of it meadow. This is the
-	// one that catches a retuned threshold or an edited LAYOUT quietly putting the hamlet in a lake,
-	// which is exactly what a hand-placed constant did before the search replaced it.
+	// one that catches a retuned threshold quietly putting the hamlet in a lake, which is exactly
+	// what a hand-placed constant did before the search replaced it.
 	for (let x = START.hamletX - 3; x <= START.hamletX + 3; x++)
 		for (let y = START.hamletY - 2; y <= START.hamletY + 3; y++) {
 			assert.ok(x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE, `(${x},${y}) is off the map`);
@@ -49,11 +49,4 @@ test('a realm opens on grass, with two clear tiles on every side', () => {
 		[-1, 1, START.hamletY, START.hamletY]
 	);
 	assert.deepEqual([START.characterX, START.characterY], [START.hamletX, START.hamletY + 1]);
-});
-
-test('the authored core sits where the offset says it does', () => {
-	// A 16-row LAYOUT centred in 48 starts at 16. Its first row opens with six mountains, and the
-	// iron vein on its second row is one tile in — both would move if the offset drifted.
-	assert.equal(map[16].slice(16, 22), 'mmmmmm');
-	assert.equal(terrainCharAt(18, 17), 'i');
 });

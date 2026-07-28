@@ -659,8 +659,8 @@ const terrainRows = await db
 	.returning();
 const byChar = new Map(TERRAIN.map((t, i) => [t.char, terrainRows[i]]));
 
-// The map itself — one char per tile, from worldgen.ts: hand-authored in the middle, generated
-// around it. This script's job is turning those chars into rows, and refusing anything it can't.
+// The map itself — one char per tile, from worldgen.ts's generator. This script's job is turning
+// those chars into rows, and refusing anything it can't.
 const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => {
 	const x = i % GRID_SIZE;
 	const y = Math.floor(i / GRID_SIZE);
@@ -676,11 +676,11 @@ const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => {
 	return { x, y, terrainTypeId: t.id, quantity: spec.capacity ?? null };
 });
 
-// Every new player's hamlet and characters land on these tiles, so the authored core is drawn
-// around them. This is the one check that ties the two together: a moved LAYOUT_OFFSET, a
-// one-character typo, or a START edit that walks off the authored block all land here rather
-// than putting somebody in a lake. It reads the real terrain row, so it also catches '.' being
-// retuned to something that isn't Meadow.
+// Every new player's hamlet and characters land on these tiles, so this is the one check that
+// ties the generated map to the start it hands out: a retuned threshold, a one-character typo,
+// or a START edit that walks off the clear block all land here rather than putting somebody in a
+// lake. It reads the real terrain row, so it also catches '.' being retuned to something that
+// isn't Meadow.
 const meadowAt = (x: number, y: number) => {
 	const at = tiles[y * GRID_SIZE + x];
 	const name = terrainRows.find((t) => t.id === at.terrainTypeId)!.displayName;
@@ -712,13 +712,24 @@ for (const name of Object.keys(REQUIRES)) {
 
 // Upserted, never truncated: `tile_stock` has a foreign key into this table, so deleting and
 // reinserting the grid would take every player's harvested-forest record with it.
-await db
-	.insert(tile)
-	.values(tiles)
-	.onConflictDoUpdate({
-		target: [tile.x, tile.y],
-		set: { terrainTypeId: sql`excluded.terrain_type_id`, quantity: sql`excluded.quantity` }
-	});
+//
+// Chunked, because one statement for the whole grid stopped fitting: `tile` has 4 columns
+// (x, y, terrainTypeId, quantity), so one INSERT for all of them at 128×128 binds
+// 16,384 × 4 = 65,536 parameters against Postgres's limit of 65,535 — over by exactly one row's
+// worth. 4,000 rows a batch keeps every batch to 16,000 params, comfortably clear, and the last
+// batch is just whatever remains.
+function* chunks<T>(items: T[], size: number): Generator<T[]> {
+	for (let i = 0; i < items.length; i += size) yield items.slice(i, i + size);
+}
+for (const batch of chunks(tiles, 4000)) {
+	await db
+		.insert(tile)
+		.values(batch)
+		.onConflictDoUpdate({
+			target: [tile.x, tile.y],
+			set: { terrainTypeId: sql`excluded.terrain_type_id`, quantity: sql`excluded.quantity` }
+		});
+}
 
 console.log(
 	(WIPE ? `WIPED ${players} player realm(s), then ` : 'content only, no realms touched: ') +

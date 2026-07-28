@@ -9,17 +9,15 @@
 // Deliberately not wired into `npm test`, which must stay runnable with no server.
 const BASE = process.env.RULES_CHECK_URL ?? 'http://localhost:5173';
 
-// Every coordinate below is written against the map's **hand-authored core** — the lake, the stone
-// outcrop, the hamlet's own tile — because that is where those features are authored and that frame
-// is stable (scripts/seed.ts, LAYOUT in worldgen.ts). The core sits in the middle of a generated
-// 48×48 world, so it has to be shifted into the coordinates the API speaks. Imported rather than
-// written out: when the map grew, forty hardcoded coordinates here quietly started naming generated
-// ground, and half these checks passed against tiles that were no longer what they claimed.
-import { LAYOUT_OFFSET, START } from '../src/lib/features/world/worldgen.ts';
-const core = (x: number, y: number) => [x + LAYOUT_OFFSET, y + LAYOUT_OFFSET] as const;
-// And back again, for the few checks that name a tile the *game* chose rather than one the map
-// author did — the hamlet's own tile is derived from the terrain now, not written down.
-const fromWorld = (x: number, y: number) => [x - LAYOUT_OFFSET, y - LAYOUT_OFFSET] as const;
+// The map used to carry a hand-authored core (LAYOUT in worldgen.ts) that put the lake, the
+// stone outcrop and the rest at coordinates this file could just write down. It's gone — the
+// whole map is generated now — so every terrain feature below is *found* in the payload
+// instead: `findMany` (and `find`, its one-tile case) walk the world's own `terrain` array for
+// the first tile, or tiles, of a named type. A coordinate written down here would have named
+// whatever the generator drew on the day this was written, and silently started testing the
+// wrong thing the next time WORLD_SEED changed — which is exactly what happened to the forty-odd
+// hardcoded coordinates this file used to carry.
+import { START } from '../src/lib/features/world/worldgen.ts';
 
 // Every request carries the same cookie, so all cases play in one player's sandbox — the
 // occupancy checks are player-scoped and would read a different world otherwise.
@@ -35,14 +33,13 @@ async function api(path: string, init?: RequestInit) {
 	return { status: res.status, body: await res.json() };
 }
 
-// x, y are core coordinates (see `core` above); the wire gets world ones.
-const order = (cx: number, cy: number, buildingTypeId: number, crewSize?: number) => {
-	const [x, y] = core(cx, cy);
-	return api('/api/orders', {
+// Orders and assignments take world coordinates straight through now — there's no authored
+// frame to convert out of.
+const order = (x: number, y: number, buildingTypeId: number, crewSize?: number) =>
+	api('/api/orders', {
 		method: 'POST',
 		body: JSON.stringify({ x, y, buildingTypeId, crewSize })
 	});
-};
 
 let failures = 0;
 function check(name: string, actual: unknown, expected: unknown) {
@@ -67,9 +64,19 @@ type Held = {
 // How much of one named resource a payload says you hold. Named rather than whole-stock, because
 // `resolveWorld` runs inside every writer and drains Food as it goes — a before/after comparison of
 // the *whole* of stock would be flaky rather than strict.
+//
+// Rounded to a tenth, and that is the same problem one step further on. Production is continuous:
+// gatherers credit their tile inside every writer, so a refund read a few seconds after the value
+// it is compared against comes back a few ten-thousandths high — 100.00034775 where 100 was meant.
+// That drift is the economy working, not the refund being wrong, and it grew visible only when the
+// world got big enough for a round trip to take seconds instead of milliseconds. Every price and
+// every refund in this game is a whole number, so a tenth is far coarser than any real error
+// (which is at least 1) and far finer than a minute of gathering — strict about the thing being
+// asserted, deaf to the clock.
 const heldOf = (w: Held, name: string) => {
 	const id = w.resources.find((r) => r.displayName === name)!.id;
-	return w.stock.find((s) => s.resourceId === id)?.quantity ?? 0;
+	const held = w.stock.find((s) => s.resourceId === id)?.quantity ?? 0;
+	return Math.round(held * 10) / 10;
 };
 const woodHeld = (w: Held) => heldOf(w, 'Wood');
 
@@ -85,38 +92,83 @@ const free = world.body.buildingTypes.find((t: { id: number }) => !costed.has(t.
 if (free === undefined)
 	throw new Error('every building type costs something — no free type to test terrain with');
 
-const assign = (cx: number, cy: number) => {
-	const [x, y] = core(cx, cy);
-	return api('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
-};
+const assign = (x: number, y: number) =>
+	api('/api/assignments', { method: 'POST', body: JSON.stringify({ x, y }) });
+
+// Tiles of a named terrain type from the payload's own `terrain` array — the `n` **closest to the
+// hamlet**, not the first `n` row-major. Pure given the initial `world` fetch above: terrain never
+// changes between players, only what's built on it does, so every call below asking for the same
+// name gets the same ground.
+//
+// Nearest, and it is load-bearing rather than tidy. Row-major order means "the first Forest" is
+// somewhere along the map's top edge, and the hamlet is wherever `findStart` put it — on a 128×128
+// world those are ~100 tiles apart, so every case that actually *builds* on found ground paid for a
+// worker to walk the entire map first. That is real game time this script then has to sleep
+// through: one build measured 426 seconds, and with ten of them the run went from minutes to over
+// an hour. Distance is not what any of these cases is testing, so it is bought back to nearly zero
+// here. Chebyshev, matching the 8-directional step `route` actually walks.
+//
+// Ground the realm already stands on is skipped, or "nearest" would hand back the hamlet's own
+// tile — every realm opens with buildings on Meadow, so the closest Meadow to the hamlet *is* the
+// hamlet — and a case meaning to assert "plain ground accepts a building" would be refused for
+// occupancy instead. Read off the opening payload, which every fresh sandbox below starts from
+// identically: START is the same for every player (VISION #4 interim override).
+const startBuildings = new Set(
+	world.body.buildings.map((b: { x: number; y: number }) => b.y * world.body.gridSize + b.x)
+);
+function findMany(name: string, n: number): { x: number; y: number }[] {
+	const t = world.body.terrainTypes.find((tt: { displayName: string }) => tt.displayName === name);
+	if (!t) throw new Error(`no '${name}' terrain type — seed the database`);
+	const out: { x: number; y: number }[] = [];
+	for (let i = 0; i < world.body.terrain.length; i++) {
+		if (world.body.terrain[i] !== t.id || startBuildings.has(i)) continue;
+		out.push({ x: i % world.body.gridSize, y: Math.floor(i / world.body.gridSize) });
+	}
+	if (out.length < n)
+		throw new Error(`only ${out.length} ${name} tile(s) on the map, need ${n} — reroll the seed`);
+	const from = (p: { x: number; y: number }) =>
+		Math.max(Math.abs(p.x - START.hamletX), Math.abs(p.y - START.hamletY));
+	return out.sort((a, b) => from(a) - from(b)).slice(0, n);
+}
+const find = (name: string) => findMany(name, 1)[0];
+
+// Found once, reused everywhere below that needs "a tile of this kind" — every one of these is a
+// fresh-sandbox check (a new player, cookie reset), so the same physical tile being asked about
+// twice is never the same *build* twice.
+const meadow = find('Meadow');
+const forest = find('Forest');
+const mountain = find('Mountain');
+const ironVein = find('Iron vein');
+const stoneOutcrop = find('Stone outcrop');
+const clayPit = find('Clay pit');
 
 // Terrain rules. `free` is the uncosted type (Barn), so these isolate the ground rule from cost.
 // Unbuildable ground and every *deposit* refuse a plain building: a deposit offers only its own
 // extractor (a Quarry on an outcrop), and Clay/Iron have no extractor yet — so nothing at all.
-for (const [x, y, label] of [
-	[7, 5, 'lake'],
-	[0, 0, 'mountain'],
-	[2, 1, 'iron vein'],
-	[14, 3, 'stone outcrop'],
-	[12, 5, 'clay pit']
-] as const) {
-	const r = await order(x, y, free);
+for (const [name, tile] of [
+	['Water', find('Water')],
+	['Mountain', mountain],
+	['Iron vein', ironVein],
+	['Stone outcrop', stoneOutcrop],
+	['Clay pit', clayPit]
+] as [string, { x: number; y: number }][]) {
+	const r = await order(tile.x, tile.y, free);
 	check(
-		`(${x},${y}) ${label} refuses a plain building`,
+		`(${tile.x},${tile.y}) ${name.toLowerCase()} refuses a plain building`,
 		[r.status, r.body.reason],
 		[400, 'TILE_NOT_BUILDABLE']
 	);
 }
 // Plain buildable ground takes the uncosted type. One order at a time — a fresh sandbox per case
 // keeps NO_IDLE_CHARACTER out of what is meant to be a terrain assertion.
-for (const [x, y, label] of [
-	[14, 9, 'meadow'],
-	[11, 1, 'forest']
-] as const) {
+for (const [name, tile] of [
+	['Meadow', meadow],
+	['Forest', forest]
+] as [string, { x: number; y: number }][]) {
 	cookie = '';
 	await api('/api/world');
-	const r = await order(x, y, free);
-	check(`(${x},${y}) ${label} is accepted`, r.status, 200);
+	const r = await order(tile.x, tile.y, free);
+	check(`(${tile.x},${tile.y}) ${name.toLowerCase()} is accepted`, r.status, 200);
 }
 
 // The deposit rule cuts both ways, and terrain is judged before cost — so even a costed type shows
@@ -126,76 +178,122 @@ cookie = '';
 await api('/api/world');
 check(
 	'a Quarry is refused on a meadow — an extractor may not squat on plain ground',
-	[(await order(14, 9, quarry)).body.reason],
+	[(await order(meadow.x, meadow.y, quarry)).body.reason],
 	['TILE_NOT_BUILDABLE']
 );
 cookie = '';
 await api('/api/world');
 check(
 	'a House is refused on an iron vein — a plain building may not squat on a deposit',
-	[(await order(2, 1, house)).body.reason],
+	[(await order(ironVein.x, ironVein.y, house)).body.reason],
 	['TILE_NOT_BUILDABLE']
 );
 cookie = '';
 await api('/api/world');
 check(
 	'a Quarry is accepted on a Stone outcrop — the deposit offers exactly its extractor',
-	(await order(14, 3, quarry)).status,
+	(await order(stoneOutcrop.x, stoneOutcrop.y, quarry)).status,
 	200
 );
 
 // Unregressed: the rules that existed before terrain did.
 cookie = '';
 await api('/api/world');
-const oob = await order(99, 0, free);
-check('(99,0) is off the map', [oob.status, oob.body.reason], [400, 'OUT_OF_BOUNDS']);
-const occupied = await order(...fromWorld(START.hamletX, START.hamletY), free);
+const oob = await order(world.body.gridSize, 0, free);
+check(
+	`(${world.body.gridSize},0) is off the map`,
+	[oob.status, oob.body.reason],
+	[400, 'OUT_OF_BOUNDS']
+);
+const occupied = await order(START.hamletX, START.hamletY, free);
 check(
 	`(${START.hamletX},${START.hamletY}) holds the hamlet`,
 	[occupied.status, occupied.body.reason],
 	[400, 'TILE_OCCUPIED']
 );
 
-// Terrain has to change the route, not just cost time. Both legs are the same distance from the
-// settlers' start row — 4 across and 9 up, mirrored either side of it — so distance is held
-// constant and only the ground differs: the authored lake lies between the start and the western
-// one, and the eastern one is open ground. Both the durations and the routes come off the public
-// payload — asserting through psql what the wire already exposes would be testing round the back.
-const legs: Record<string, { seconds: number; wet: number; steps: number }> = {};
-for (const [x, y, label] of [
-	[13, 2, 'dry'],
-	[5, 2, 'wet']
-] as const) {
-	// A fresh sandbox per leg: the same body has to depart from the same tile both times.
-	cookie = '';
-	const fresh = await api('/api/world');
-	const r = await order(x, y, free);
-	const op = r.body.operations?.[0];
-	if (!op) throw new Error(`order (${x},${y}) was refused: ${JSON.stringify(r.body)}`);
-	// The route as walked, off the payload — the same array the client draws the body along.
-	const w = op.workers[0];
-	const g = fresh.body.gridSize;
-	const water = fresh.body.terrainTypes.find(
-		(t: { displayName: string }) => t.displayName === 'Water'
-	).id;
-	legs[label] = {
-		seconds: (Date.parse(w.arrivesAt) - Date.parse(op.startedAt)) / 1000,
-		wet: w.path.filter((i: number) => fresh.body.terrain[i] === water).length,
-		steps: w.path.length
-	};
+// Terrain has to change the route, not just cost time. This used to be a hand-placed lake between
+// the hamlet and a chosen tile; now it's found — scan the map for a destination whose straight
+// line from the hamlet crosses at least three tiles of water, order a build there, and read the
+// route the server actually chose off the public payload, same as the client draws it. Same claim
+// as before — terrain reroutes travel and costs time — proved about whatever ground the seed
+// produced rather than about a lake somebody drew, and stronger: the old pair of legs only showed
+// the wet one was *slower*; this shows the wet one is *dry*.
+cookie = '';
+const travelWorld = await api('/api/world');
+const gridSize = travelWorld.body.gridSize;
+const waterId = travelWorld.body.terrainTypes.find(
+	(t: { displayName: string }) => t.displayName === 'Water'
+).id;
+const occupiedTiles = new Set(
+	travelWorld.body.buildings.map((b: { x: number; y: number }) => b.y * gridSize + b.x)
+);
+const buildableTypesByTerrain = new Map<number, number[]>(
+	travelWorld.body.terrainTypes.map(
+		(t: { id: number; buildableTypeIds: number[] }) =>
+			[t.id, t.buildableTypeIds] as [number, number[]]
+	)
+);
+// A straight line's tiles, Bresenham — the same "how many tiles would this cross" question
+// `route` answers by actually walking, asked here only to pick a destination worth walking to.
+function lineTiles(x0: number, y0: number, x1: number, y1: number): { x: number; y: number }[] {
+	const pts: { x: number; y: number }[] = [];
+	const dx = Math.abs(x1 - x0);
+	const dy = -Math.abs(y1 - y0);
+	const sx = x0 < x1 ? 1 : -1;
+	const sy = y0 < y1 ? 1 : -1;
+	let err = dx + dy;
+	let x = x0;
+	let y = y0;
+	for (;;) {
+		pts.push({ x, y });
+		if (x === x1 && y === y1) break;
+		const e2 = 2 * err;
+		if (e2 >= dy) {
+			err += dy;
+			x += sx;
+		}
+		if (e2 <= dx) {
+			err += dx;
+			y += sy;
+		}
+	}
+	return pts;
 }
-// Nobody swims. This is what routing bought, and it is the assertion that would have been
-// impossible to write before: the destination beyond the lake is reached without a single tile of
-// water under anyone's feet. It used to be measured the other way round — a body ploughing straight
-// through five tiles of lake, three times slower for it.
-check('the route to the far shore crosses no water at all', legs.wet.wet, 0);
-check('the dry leg crosses no water either, and never did', legs.dry.wet, 0);
-// The detour is still a real cost: going round takes more steps and more time than the same
-// distance over open ground. A ratio would be wrong here — walking around a lake is not three
-// times anything, it is just longer.
+let dest: { x: number; y: number } | null = null;
+for (let i = 0; i < travelWorld.body.terrain.length; i++) {
+	if (occupiedTiles.has(i)) continue;
+	if (!buildableTypesByTerrain.get(travelWorld.body.terrain[i])?.includes(free)) continue;
+	const x = i % gridSize;
+	const y = Math.floor(i / gridSize);
+	const crossed = lineTiles(START.hamletX, START.hamletY, x, y).filter(
+		(p) => travelWorld.body.terrain[p.y * gridSize + p.x] === waterId
+	).length;
+	if (crossed >= 3) {
+		dest = { x, y };
+		break;
+	}
+}
+if (!dest)
+	throw new Error('no destination has a straight line from the hamlet crossing 3+ water tiles');
+const routed = await order(dest.x, dest.y, free);
+const routedOp = routed.body.operations?.[0];
+if (!routedOp)
+	throw new Error(`order to (${dest.x},${dest.y}) was refused: ${JSON.stringify(routed.body)}`);
+const walked = routedOp.workers[0];
+const path: number[] = walked.path;
+const wet = path.filter((i: number) => travelWorld.body.terrain[i] === waterId).length;
+// The lower bound on how few steps *any* route could take, measured from where this worker
+// actually started (their own tile, not the hamlet) — so "more steps than the straight line"
+// is a mathematical fact about the path returned, not an approximation.
+const originIdx = path[0];
+const originX = originIdx % gridSize;
+const originY = Math.floor(originIdx / gridSize);
+const straightSteps = Math.max(Math.abs(dest.x - originX), Math.abs(dest.y - originY));
+check(`the route to (${dest.x},${dest.y}) crosses no water at all`, wet, 0);
 check(
-	`going round the lake (${legs.wet.seconds}s, ${legs.wet.steps} steps) costs more than open ground (${legs.dry.seconds}s, ${legs.dry.steps} steps)`,
-	legs.wet.seconds > legs.dry.seconds && legs.wet.steps > legs.dry.steps,
+	`the detour (${path.length - 1} steps) costs more than the straight line it avoided (${straightSteps} steps)`,
+	path.length - 1 > straightSteps,
 	true
 );
 
@@ -209,7 +307,7 @@ check('a new realm arrives with a Wood runway', woodStart > 0, true);
 
 // Cancel a build: the operation vanishes and the FULL cost returns — never prorated, never
 // double-credited. This is the epic's refund path, and its arithmetic is the thing to pin.
-const built = await order(9, 9, house);
+const built = await order(meadow.x, meadow.y, house);
 const site = built.body.operations?.find((o: { type: string }) => o.type === 'build');
 check(
 	'ordering a House deducts its cost up front',
@@ -237,7 +335,11 @@ check(
 	woodStart
 );
 // The cancelled op left nothing behind: the tile is buildable again and a worker is free to take it.
-check('the cancelled tile is buildable again', (await order(9, 9, house)).status, 200);
+check(
+	'the cancelled tile is buildable again',
+	(await order(meadow.x, meadow.y, house)).status,
+	200
+);
 
 // The realm-wide build prerequisite: a Stone wall needs a Quarry standing *anywhere* first. With
 // none owned it is refused before terrain or cost matter — a distinct reason from the tile-local
@@ -247,7 +349,7 @@ await api('/api/world');
 const stoneWall = typeId('Stone wall');
 check(
 	'a Stone wall with no Quarry owned is refused as a missing prerequisite',
-	[(await order(9, 9, stoneWall)).body.reason],
+	[(await order(meadow.x, meadow.y, stoneWall)).body.reason],
 	['MISSING_PREREQUISITE']
 );
 
@@ -255,18 +357,22 @@ check(
 // turned away at the writer, or a worker stands there forever earning nothing with no feedback.
 // The clay pit is the sharp case — it *does* name a resource, it just has no rate yet, so a
 // null-check alone would wave it through.
-for (const [x, y, label] of [
-	[0, 0, 'mountain — yields nothing'],
-	[12, 5, 'clay pit — yields a resource with no rate']
-] as const) {
-	const r = await assign(x, y);
-	check(`(${x},${y}) ${label} is refused`, [r.status, r.body.reason], [400, 'TILE_YIELDS_NOTHING']);
+for (const [label, tile] of [
+	['mountain — yields nothing', mountain],
+	['clay pit — yields a resource with no rate', clayPit]
+] as [string, { x: number; y: number }][]) {
+	const r = await assign(tile.x, tile.y);
+	check(
+		`(${tile.x},${tile.y}) ${label} is refused`,
+		[r.status, r.body.reason],
+		[400, 'TILE_YIELDS_NOTHING']
+	);
 }
 
-const gathering = await assign(11, 1);
+const gathering = await assign(forest.x, forest.y);
 const gather = gathering.body.operations?.find((o: { type: string }) => o.type === 'gather');
 check(
-	'(11,1) forest accepts a worker, on an operation that never completes by itself',
+	`(${forest.x},${forest.y}) forest accepts a worker, on an operation that never completes by itself`,
 	[gathering.status, gather?.type, gather?.completeAt, gather?.buildingTypeId],
 	[200, 'gather', null, null]
 );
@@ -293,23 +399,22 @@ check(
 // manual pass — at 3 Wood an hour it takes eight hours, which is the mechanic working.
 cookie = '';
 const map = await api('/api/world');
-const at = (cx: number, cy: number) => {
-	const [x, y] = core(cx, cy);
-	return y * map.body.gridSize + x;
-};
+const at = (x: number, y: number) => y * map.body.gridSize + x;
+const terrainCapacity = (name: string) =>
+	map.body.terrainTypes.find((t: { displayName: string }) => t.displayName === name).capacity;
 check(
 	'an untouched forest tile reports full',
-	[map.body.tileQuantity[at(11, 1)], map.body.tileCapacity[at(11, 1)]],
-	[25, 25]
+	[map.body.tileQuantity[at(forest.x, forest.y)], terrainCapacity('Forest')],
+	[terrainCapacity('Forest'), terrainCapacity('Forest')]
 );
 check(
 	'a stone outcrop never runs down, so it counts nothing',
-	[map.body.tileQuantity[at(14, 3)], map.body.tileCapacity[at(14, 3)]],
+	[map.body.tileQuantity[at(stoneOutcrop.x, stoneOutcrop.y)], terrainCapacity('Stone outcrop')],
 	[null, null]
 );
 check(
 	'ground that yields nothing counts nothing',
-	[map.body.tileQuantity[at(0, 0)], map.body.tileCapacity[at(0, 0)]],
+	[map.body.tileQuantity[at(mountain.x, mountain.y)], terrainCapacity('Mountain')],
 	[null, null]
 );
 
@@ -317,13 +422,17 @@ check(
 // structure has to be on the tile being worked — not merely somewhere in the realm.
 cookie = '';
 await api('/api/world');
-const bare = await assign(15, 11);
+const bare = await assign(stoneOutcrop.x, stoneOutcrop.y);
 check(
-	'(15,11) a stone outcrop with no quarry on it is refused',
+	`(${stoneOutcrop.x},${stoneOutcrop.y}) a stone outcrop with no quarry on it is refused`,
 	[bare.status, bare.body.reason],
 	[400, 'MISSING_REQUIRED_BUILDING']
 );
-check('(11,1) forest still needs no building at all', (await assign(11, 1)).status, 200);
+check(
+	`(${forest.x},${forest.y}) forest still needs no building at all`,
+	(await assign(forest.x, forest.y)).status,
+	200
+);
 
 // Crews. A build takes more than one body now, and more bodies must actually finish it sooner.
 // Asserted off the payload's own clock rather than by waiting a build out — a fresh sandbox for
@@ -333,7 +442,7 @@ const crewed: Record<number, { workers: number; seconds: number }> = {};
 for (const size of [1, 3]) {
 	cookie = '';
 	await api('/api/world');
-	const r = await order(14, 9, free, size);
+	const r = await order(meadow.x, meadow.y, free, size);
 	const op = r.body.operations?.[0];
 	if (!op) throw new Error(`crew-of-${size} order was refused: ${JSON.stringify(r.body)}`);
 	crewed[size] = {
@@ -352,7 +461,7 @@ check(
 // everyone rather than refusing. Without this, a hopeful number would be a dead end.
 cookie = '';
 const small = await api('/api/world');
-const everyone = await order(14, 9, free, 99);
+const everyone = await order(meadow.x, meadow.y, free, 99);
 check(
 	'asking for more hands than you have sends everyone, rather than refusing',
 	everyone.body.operations?.[0]?.workers.length,
@@ -362,19 +471,17 @@ check(
 // Preview = outcome. This is a stated failure condition of the epic — "the numbers shown before
 // you commit aren't the ones you get" — and it can only be closed by asserting the quote against
 // the thing actually written. Both go through `planBuild`, so this is what proves that.
-const estimateOf = (cx: number, cy: number, buildingTypeId: number, crewSize: number) => {
-	const [x, y] = core(cx, cy);
-	return api('/api/orders/estimate', {
+const estimateOf = (x: number, y: number, buildingTypeId: number, crewSize: number) =>
+	api('/api/orders/estimate', {
 		method: 'POST',
 		body: JSON.stringify({ x, y, buildingTypeId, crewSize })
 	});
-};
 
 for (const size of [1, 3]) {
 	cookie = '';
 	await api('/api/world');
-	const quote = await estimateOf(14, 9, free, size);
-	const placed = await order(14, 9, free, size);
+	const quote = await estimateOf(meadow.x, meadow.y, free, size);
+	const placed = await order(meadow.x, meadow.y, free, size);
 	const op = placed.body.operations?.[0];
 	if (!op) throw new Error(`estimate-then-order (crew ${size}) was refused`);
 	const actual = (Date.parse(op.completeAt) - Date.parse(op.startedAt)) / 1000;
@@ -391,12 +498,15 @@ cookie = '';
 await api('/api/world');
 check(
 	'estimating an unbuildable tile refuses with the reason the order would give',
-	[(await estimateOf(0, 0, free, 1)).status, (await estimateOf(0, 0, free, 1)).body.reason],
+	[
+		(await estimateOf(mountain.x, mountain.y, free, 1)).status,
+		(await estimateOf(mountain.x, mountain.y, free, 1)).body.reason
+	],
 	[400, 'TILE_NOT_BUILDABLE']
 );
 // And it spends nothing: quoting is not ordering.
 const beforeQuote = woodHeld((await api('/api/world')).body);
-await estimateOf(9, 9, house, 3);
+await estimateOf(meadow.x, meadow.y, house, 3);
 check(
 	'an estimate costs nothing — quoting is not ordering',
 	woodHeld((await api('/api/world')).body),
@@ -409,8 +519,8 @@ check(
 // would have no check at all.
 cookie = '';
 await api('/api/world');
-const promised = await estimateOf(14, 9, free, 3);
-const raised = await order(14, 9, free, 3);
+const promised = await estimateOf(meadow.x, meadow.y, free, 3);
+const raised = await order(meadow.x, meadow.y, free, 3);
 const rising = raised.body.operations?.[0];
 if (!rising) throw new Error('the build-for-quality order was refused');
 const dueAt = Date.parse(rising.completeAt);
@@ -420,8 +530,9 @@ let finished: { quality: number } | undefined;
 while (Date.now() < dueAt + 15_000) {
 	await new Promise((r) => setTimeout(r, 3000));
 	const w = await api('/api/world');
-	const [bx, by] = core(14, 9);
-	finished = w.body.buildings.find((b: { x: number; y: number }) => b.x === bx && b.y === by);
+	finished = w.body.buildings.find(
+		(b: { x: number; y: number }) => b.x === meadow.x && b.y === meadow.y
+	);
 	if (finished) break;
 }
 check(
@@ -445,13 +556,11 @@ check(
 // Restrict-by-specialty. The filter is the entry point to the whole worker-selection UX, and its
 // two ends are what matter: naming a trade the realm has none of turns the order away, and naming
 // one it has narrows the crew to exactly those bodies.
-const restricted = (cx: number, cy: number, ids: number[] | null, crewSize = 3) => {
-	const [x, y] = core(cx, cy);
-	return api('/api/orders', {
+const restricted = (x: number, y: number, ids: number[] | null, crewSize = 3) =>
+	api('/api/orders', {
 		method: 'POST',
 		body: JSON.stringify({ x, y, buildingTypeId: free, crewSize, allowedProfessionIds: ids })
 	});
-};
 const professionId = (name: string) => {
 	const p = world.body.professions.find((q: { displayName: string }) => q.displayName === name);
 	if (!p) throw new Error(`no '${name}' profession — seed the database`);
@@ -463,7 +572,7 @@ await api('/api/world');
 // A fresh realm is three settlers, so it has no Mason at all. This *queues* rather than refusing —
 // an unsatisfiable filter and a realm where everyone is busy are the same situation, and both
 // resolve themselves the moment a qualifying worker exists.
-const noMason = await restricted(14, 9, [professionId('Mason')]);
+const noMason = await restricted(meadow.x, meadow.y, [professionId('Mason')]);
 const waiting = noMason.body.operations?.find((o: { type: string }) => o.type === 'build');
 check(
 	'an order restricted to a trade nobody has waits instead of bouncing',
@@ -473,7 +582,7 @@ check(
 // An id no profession carries must fail loudly at order time — Postgres cannot foreign-key an
 // array element, so this refusal *is* the referential integrity for that column. Silently it
 // would match nobody and read as "everyone is busy".
-const bogus = await restricted(14, 9, [999999]);
+const bogus = await restricted(meadow.x, meadow.y, [999999]);
 check(
 	'a filter naming a profession that does not exist is refused as unknown, not as "everyone is busy"',
 	[bogus.status, bogus.body.reason],
@@ -482,25 +591,24 @@ check(
 // Unchecking everything is not "nobody may build this".
 cookie = '';
 await api('/api/world');
-check('an empty filter means anyone, not nobody', (await restricted(14, 9, [])).status, 200);
+check(
+	'an empty filter means anyone, not nobody',
+	(await restricted(meadow.x, meadow.y, [])).status,
+	200
+);
 
 // The queue. Placing a build with everyone busy no longer bounces: it holds the tile and the cost
 // it has already paid, and starts itself when a worker frees. Reserving at queue time is the whole
 // point — deducting at start would reintroduce the silent-failure-while-away this model avoids.
 const occupyEveryone = async () => {
-	for (const [gx, gy] of [
-		[11, 1],
-		[12, 1],
-		[11, 2]
-	] as const)
-		await assign(gx, gy);
+	for (const { x, y } of findMany('Forest', 3)) await assign(x, y);
 };
 
 cookie = '';
 const busyRealm = await api('/api/world');
 const woodBefore = woodHeld(busyRealm.body);
 await occupyEveryone();
-const heldUp = await order(9, 9, house);
+const heldUp = await order(meadow.x, meadow.y, house);
 const parked = heldUp.body.operations?.find((o: { type: string }) => o.type === 'build');
 check(
 	'with everyone busy the build queues rather than refusing',
@@ -514,7 +622,7 @@ check(
 );
 check(
 	'a queued build holds its tile — a second order cannot stack on it',
-	(await order(9, 9, house)).body.reason,
+	(await order(meadow.x, meadow.y, house)).body.reason,
 	'TILE_OCCUPIED'
 );
 // Free one gatherer, and the waiting build takes them on the very next read.
@@ -540,7 +648,7 @@ cookie = '';
 const q2 = await api('/api/world');
 const woodQ2 = woodHeld(q2.body);
 await occupyEveryone();
-const toCancel = (await order(9, 9, house)).body.operations?.find(
+const toCancel = (await order(meadow.x, meadow.y, house)).body.operations?.find(
 	(o: { type: string }) => o.type === 'build'
 );
 const refunded = await api(`/api/orders/${toCancel.id}`, { method: 'DELETE' });
@@ -565,29 +673,22 @@ const schoolType = typeId('School');
 const carpenter = professionId('Carpenter');
 // The clear grass the hamlet is guaranteed (see START_MARGIN in worldgen.ts): one tile below the
 // settlers' own row, so the crew yardly walks, and one further along for the empty-tile case.
-const mill = fromWorld(START.characterX, START.characterY + 1);
-const yard = fromWorld(START.characterX + 2, START.characterY + 1);
+const mill = [START.characterX, START.characterY + 1] as const;
+const yard = [START.characterX + 2, START.characterY + 1] as const;
 
-const craft = (cx: number, cy: number, crewSize?: number, allowedProfessionIds?: number[]) => {
-	const [x, y] = core(cx, cy);
-	return api('/api/craft', {
+const craft = (x: number, y: number, crewSize?: number, allowedProfessionIds?: number[]) =>
+	api('/api/craft', {
 		method: 'POST',
 		body: JSON.stringify({ x, y, crewSize, allowedProfessionIds })
 	});
-};
 /** Sleeps until an operation is genuinely due, then reads **once**. Nothing looks in between. */
 async function waitOut(op: { completeAt: string }, slackMs = 2000) {
 	const wait = Date.parse(op.completeAt) - Date.now() + slackMs;
 	if (wait > 0) await new Promise((r) => setTimeout(r, wait));
 	return (await api('/api/world')).body;
 }
-const stands = (
-	w: { buildings: { x: number; y: number }[] },
-	[cx, cy]: readonly [number, number]
-) => {
-	const [x, y] = core(cx, cy);
-	return w.buildings.some((b) => b.x === x && b.y === y);
-};
+const stands = (w: { buildings: { x: number; y: number }[] }, [x, y]: readonly [number, number]) =>
+	w.buildings.some((b) => b.x === x && b.y === y);
 type WireOp = {
 	id: number;
 	type: string;
@@ -613,7 +714,7 @@ check(
 	[(await craft(...yard)).status, (await craft(...yard)).body.reason],
 	[400, 'NOT_A_WORKSHOP']
 );
-const atHamlet = fromWorld(START.hamletX, START.hamletY);
+const atHamlet = [START.hamletX, START.hamletY] as const;
 check(
 	'crafting at a House is refused too — a workshop is a type that carries a recipe',
 	(await craft(...atHamlet)).body.reason,
@@ -623,7 +724,7 @@ check(
 // A gather is recalled, not cancelled. The cancel path widened to crafts, not to everything: left
 // as "anything unfinished", this would delete a working gather, refund nothing, and free the body
 // with none of recallWorker's semantics.
-const working = (await assign(11, 1)).body.operations.find(
+const working = (await assign(forest.x, forest.y)).body.operations.find(
 	(o: { type: string }) => o.type === 'gather'
 );
 check(
@@ -723,10 +824,9 @@ const schooling = await order(...yard, schoolType, 3);
 const schoolSite = schooling.body.operations?.find((o: { type: string }) => o.type === 'build');
 if (!schoolSite) throw new Error(`the School order was refused: ${JSON.stringify(schooling.body)}`);
 await waitOut(schoolSite);
-const [bx, by] = core(...yard);
 const training = await api('/api/training', {
 	method: 'POST',
-	body: JSON.stringify({ x: bx, y: by, professionId: carpenter })
+	body: JSON.stringify({ x: yard[0], y: yard[1], professionId: carpenter })
 });
 const lesson = training.body.operations?.find((o: { type: string }) => o.type === 'train');
 if (!lesson) throw new Error(`training was refused: ${JSON.stringify(training.body)}`);
@@ -755,17 +855,10 @@ await api(`/api/orders/${byCarpenter.id}`, { method: 'DELETE' });
 // paid — and starts itself on the next read after somebody frees, with no one looking.
 const busyEveryone = async () => {
 	const idle = (await api('/api/world')).body.characters.length;
-	for (const [gx, gy] of [
-		[11, 1],
-		[12, 1],
-		[11, 2],
-		[12, 2],
-		[13, 1],
-		[13, 2]
-	] as const) {
+	for (const { x, y } of findMany('Forest', 6)) {
 		const w = (await api('/api/world')).body;
 		if (w.operations.filter((o: { type: string }) => o.type === 'gather').length >= idle) break;
-		await assign(gx, gy);
+		await assign(x, y);
 	}
 };
 await busyEveryone();
@@ -800,7 +893,7 @@ check(
 // measurable. Queue one of each, free two *settlers* (the Carpenter stays out gathering, so both
 // are worked at the same untrained pace), and the batch has to come out the quicker of the two.
 const waitingBatch = craftOp((await craft(...mill, 1)).body);
-const spare = fromWorld(START.characterX - 2, START.characterY + 1);
+const spare = [START.characterX - 2, START.characterY + 1] as const;
 const waitingBuild = (await order(...spare, sawmill, 1)).body.operations?.find(
 	(o: { type: string; startedAt: string | null }) => o.type === 'build' && o.startedAt === null
 );

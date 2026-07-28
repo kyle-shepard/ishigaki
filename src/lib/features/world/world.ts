@@ -1,8 +1,8 @@
 // Client-safe: shared constants, wire types, and the position math. No db imports.
 
-// 48×48. Past hand-authoring, which is why the ground outside the authored core comes from
-// worldgen.ts now — see the note on `LAYOUT` in scripts/seed.ts.
-export const GRID_SIZE = 48;
+// 128×128 — the first clean cut (see WORLD_SEED in worldgen.ts). Past hand-authoring, so the
+// whole grid comes from worldgen.ts's generator now; nothing here still names an authored core.
+export const GRID_SIZE = 128;
 
 // START used to live here. It is derived from the terrain now — see `findStart` in worldgen.ts —
 // because a written-down coordinate cannot notice that the ground under it has become a lake.
@@ -127,11 +127,15 @@ export function qualityBand(quality: number): string {
 	return BANDS.find(([ceiling]) => quality < ceiling)?.[1] ?? 'Masterwork';
 }
 
-// ponytail: the whole world, every read. Terrain dominates the payload, and at 48×48 that is
-// 2304 small ints row-major (~7 KB) plus two dense same-length arrays for the deposits, most of
-// whose entries are `null` — call it ~30 KB a read, gzipped to a few. Fine at this size and over
-// this cadence (once on load, then a 30 s heartbeat); it is the thing that stops scaling first,
-// and viewport culling still belongs to the map-client epic.
+// ponytail: the whole world, every read. Terrain dominates the payload, and at 128×128 that is
+// 16,384 small ints row-major, plus one dense same-length array for the live deposit levels
+// (`tileQuantity`), most of whose entries are `null` — call it a few hundred KB a read, gzipped
+// to a fraction. `tileCapacity` used to be a second dense array here; it shipped the same fact
+// 16,384 times (capacity is a pure function of terrain type, per terrainType.capacity below), so
+// it moved into the catalog instead. `tileQuantity` stays dense — going sparse trades bytes for
+// client code, and that trade wants a measurement before it's made, not a guess. Fine at this
+// cadence (once on load, then a 30 s heartbeat) until that measurement says otherwise; viewport
+// culling still belongs to the map-client epic.
 export type WorldPayload = {
 	now: string;
 	gridSize: number;
@@ -151,6 +155,12 @@ export type WorldPayload = {
 		// same rule the server gate enforces, so the menu can only ever offer what the writer allows.
 		// Empty on unbuildable ground and on a deposit whose extractor doesn't exist yet.
 		buildableTypeIds: number[];
+		// How much a tile of this terrain holds when full; null where the deposit is infinite (never
+		// runs out) or the ground yields nothing. One value per *type*, not per tile — the seed writes
+		// the same capacity to every tile of a given terrain, so a per-tile array on the wire would be
+		// the identical fact repeated once per tile. `tileQuantity` below is still per-tile: the live
+		// level genuinely differs tile to tile as players draw it down.
+		capacity: number | null;
 	}[];
 	// icon names a symbol in Sprites.svelte, minus the `i-` prefix — what the resource bar draws
 	// in place of the word. Unknown or empty ⇒ nothing drawn.
@@ -175,13 +185,12 @@ export type WorldPayload = {
 	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
 	// client estimates travel.
 	terrain: number[];
-	// Row-major like `terrain`. How much this tile still holds, and how much it holds when
-	// full; null on both where the deposit is infinite or the ground yields nothing. Dense
-	// rather than a sparse list of the tiles you have touched — a sparse one would have made
-	// the client learn capacity in order to fill in the gaps, which is the same ~700 B of
-	// information arranged so that it can be got wrong.
+	// Row-major like `terrain`. How much this tile still holds right now; null where the deposit
+	// is infinite or the ground yields nothing — pair it with the terrain type's own `capacity`
+	// above to know "how full". Dense rather than a sparse list of the tiles you have touched —
+	// a sparse one would have made the client learn capacity in order to fill in the gaps, which
+	// is the same information arranged so that it can be got wrong.
 	tileQuantity: (number | null)[];
-	tileCapacity: (number | null)[];
 	buildingTypes: {
 		id: number;
 		displayName: string;

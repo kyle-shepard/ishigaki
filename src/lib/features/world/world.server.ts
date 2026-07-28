@@ -1880,14 +1880,21 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			return [r.y * GRID_SIZE + r.x, quantity!];
 		})
 	);
-	const tileCapacity: (number | null)[] = new Array(GRID_SIZE * GRID_SIZE).fill(null);
 	const tileQuantity: (number | null)[] = new Array(GRID_SIZE * GRID_SIZE).fill(null);
 	for (const [i, d] of deposits) {
 		// Only finite deposits get a number. An infinite one has nothing to count down.
 		if (d.capacity === null || d.regrowSeconds === null) continue;
-		tileCapacity[i] = d.capacity;
 		tileQuantity[i] = live.get(i) ?? d.capacity;
 	}
+	// Capacity is a pure function of terrain type — the seed writes the same quantity to every
+	// tile of a given type — so it rides the catalog below (one value per type) rather than a
+	// second dense per-tile array shipping the identical fact 16,384 times. Read straight off the
+	// already-loaded tile grid rather than `deposits`, which only carries terrain that yields a
+	// resource: a hole here would just mean an unbuildable type reports capacity null, same as
+	// today.
+	const capacityByType = new Map<number, number | null>();
+	for (const t of tiles)
+		if (!capacityByType.has(t.terrainTypeId)) capacityByType.set(t.terrainTypeId, t.quantity);
 
 	// Which way each stock is moving. Every input is already in hand except the per-capita food
 	// rate, and it is read from the same singleton row the drain in resolveWorld charges from.
@@ -1924,7 +1931,6 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		now: new Date(now).toISOString(),
 		gridSize: GRID_SIZE,
 		tileQuantity,
-		tileCapacity,
 		terrainTypes: terrainTypes.map((t) => ({
 			id: t.id,
 			displayName: t.displayName,
@@ -1934,7 +1940,8 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			yieldsResourceId: t.yieldsResourceId,
 			// The same rule the server gate runs, shipped per terrain so the menu offers only what
 			// the writer would accept — a menu that lists what the server refuses is the bug this epic exists to kill.
-			buildableTypeIds: eligibleTypeIds(t, types, resources)
+			buildableTypeIds: eligibleTypeIds(t, types, resources),
+			capacity: capacityByType.get(t.id) ?? null
 		})),
 		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName, icon: r.icon })),
 		professions: professions.map((p) => ({ id: p.id, displayName: p.displayName })),

@@ -503,7 +503,7 @@
 		// Floored, so a tile reading "1 of 25" always has a whole unit in it and one reading
 		// "0 of 25" really is stripped.
 		const left = world!.tileQuantity[i];
-		const full = world!.tileCapacity[i];
+		const full = t.capacity;
 		const yield_ = t.yieldsResourceId
 			? ` — yields ${resourceName.get(t.yieldsResourceId)}` +
 				(left !== null && full !== null ? ` (${Math.floor(left)} of ${full} left)` : '')
@@ -1150,8 +1150,8 @@
 				{selTerrain?.displayName ?? 'Unknown ground'}
 				{#if selYields !== null}
 					— yields {resourceName.get(selYields)}
-					{#if world.tileQuantity[selIndex] !== null && world.tileCapacity[selIndex] !== null}
-						({Math.floor(world.tileQuantity[selIndex]!)} of {world.tileCapacity[selIndex]} left)
+					{#if selTerrain && world.tileQuantity[selIndex] !== null && selTerrain.capacity !== null}
+						({Math.floor(world.tileQuantity[selIndex]!)} of {selTerrain.capacity} left)
 					{/if}
 				{/if}
 			</p>

@@ -1,10 +1,12 @@
 // What terrain sits on every tile of the world, as one char per tile. The seed turns these into
 // rows; this decides what they are.
 //
-// Two sources, and the split is deliberate: the middle of the map is hand-authored (`LAYOUT`,
-// below) because the start tiles and the travel demo have to be exactly what they are, and the
-// rest is generated because 48×48 is 2304 tiles and hand-authoring that is not a thing anybody
-// does twice.
+// Fully generated, one source. There used to be a hand-authored core (`LAYOUT`) sitting in the
+// middle of the map, because the start tiles and the travel demo needed to be exactly what they
+// were — but that stopped being a fair trade once the world grew past what hand-authoring can
+// cover: `findStart` searches the generated ground for a legal opening instead of one being drawn
+// for it (see below), and scripts/rules-check.ts finds its terrain features in the payload rather
+// than naming a coordinate. One alphabet, one code path, no second frame to keep in sync.
 //
 // Deterministic on purpose. `vercel-build` re-runs the seed on every deploy, and the tile grid is
 // upserted rather than rebuilt: a generator that rolled fresh each time would rearrange the ground
@@ -13,7 +15,7 @@
 //
 // ponytail: three value-noise fields and five thresholds, tuned by eye against the printed map
 // (`npm run map`). No rivers, no coastlines, no biome adjacency, no resource balancing — a
-// backdrop for 2304 tiles, not the world-gen epic. That epic wants coherent regions and a
+// backdrop for the world, not the world-gen epic. That epic wants coherent regions and a
 // guaranteed resource budget per starting area; this only promises "not hand-authored, not noise
 // soup, and the same every time".
 
@@ -21,48 +23,11 @@
 // which does not resolve extensionless paths. Same reason world.test.ts writes it that way.
 import { GRID_SIZE } from './world.ts';
 
+// Bumped for the 128×128 cut (decision 3): a clean break rather than 7× the old world regenerated
+// under standing buildings. `npm run seed -- --wipe` is the deliberate step that actually clears
+// the ground for it — this constant alone changes nothing for anybody already playing.
 /** Change this and the world changes. Nothing else does. */
-export const WORLD_SEED = 8613;
-
-// Hand-authored, one char per terrain — diffable in a PR and editable in place. It sits in the
-// middle of the generated world, centred by LAYOUT_OFFSET below, and the hamlet opens inside it
-// because `findStart` prefers the middle of the map and this is what is drawn there.
-//
-// Load-bearing in two ways. It holds the lake that demonstrates terrain slowing travel (the pair of
-// equal-distance legs in scripts/rules-check.ts is measured across it), and its open middle is the
-// only stretch of grass wide enough for a hamlet with two clear tiles on every side — narrow that
-// and the start moves, or the map rerolls.
-const LAYOUT = [
-	'mmmmmm....fff..m',
-	'mmimm....ffff..m',
-	'mmmm.....fff....',
-	'.mm..www...f..s.',
-	'....wwwww.......',
-	'...wwwwwww..c...',
-	'...wwwwww.......',
-	'....wwww........',
-	'................',
-	'................',
-	'..ff............',
-	'.ffff..........s',
-	'.fffff..........',
-	'..fff..........m',
-	'c..f........mmm.',
-	'..........immmmm'
-];
-
-// Centred, so a new realm opens with room to expand in every direction rather than against a
-// corner. A typo must fail here, not quietly produce a lopsided world.
-//
-// Exported because it is the bridge between two coordinate systems: LAYOUT is authored in its own
-// 16×16 frame, and everything that refers to an authored tile by name — the start tiles, the lake
-// in the travel demo, the outcrop in scripts/rules-check.ts — has to add this to reach world space.
-export const LAYOUT_OFFSET = (GRID_SIZE - LAYOUT.length) / 2;
-if (!Number.isInteger(LAYOUT_OFFSET) || LAYOUT_OFFSET < 0)
-	throw new Error(`LAYOUT (${LAYOUT.length} rows) does not centre in a ${GRID_SIZE}-tile world`);
-for (const [y, row] of LAYOUT.entries())
-	if (row.length !== LAYOUT.length)
-		throw new Error(`LAYOUT row ${y} is ${row.length} chars, expected ${LAYOUT.length}`);
+export const WORLD_SEED = 90210;
 
 /** mulberry32 — a small, well-behaved PRNG. Seeded, so every field below is reproducible. */
 function mulberry32(seed: number): () => number {
@@ -134,16 +99,6 @@ function generator(seed: number): (x: number, y: number) => string {
 	};
 }
 
-/**
- * One whole map: the authored core where it covers, generated ground everywhere else. One alphabet
- * either way, so the seed's per-char handling (capacity, regrowth, the unknown-char guard) covers
- * the whole map with no second code path.
- */
-function mapFor(seed: number): (x: number, y: number) => string {
-	const generated = generator(seed);
-	return (x, y) => LAYOUT[y - LAYOUT_OFFSET]?.[x - LAYOUT_OFFSET] ?? generated(x, y);
-}
-
 // The meadow char. Named because the start rule is written in terms of it and 'nothing but "."'
 // reads like a typo.
 const GRASS = '.';
@@ -190,13 +145,14 @@ function findStart(charAt: (x: number, y: number) => string) {
 // seed that wins is the one the world is made of — so this is still one fixed world per WORLD_SEED,
 // just chosen rather than assumed.
 //
-// ponytail: the authored core contains a legal block, so this has never had to reroll and the loop
-// runs once. It is here for the day the core is edited or dropped and the whole map is generated —
-// at which point "no hamlet fits" stops being hypothetical. Bounded rather than `while (true)`: a
-// deploy that hangs looking for a world is worse than one that fails saying so.
+// This used to be theoretical: a hand-authored core guaranteed a legal block, so the loop ran once
+// and never found a second candidate. Now that the whole map is generated it is load-bearing —
+// "no hamlet fits" is a real outcome for some seeds, not a hypothetical one — which is why it is
+// bounded rather than `while (true)`: a deploy that hangs looking for a world is worse than one
+// that fails saying so.
 const rolled = (() => {
 	for (let seed = WORLD_SEED; seed < WORLD_SEED + 50; seed++) {
-		const charAt = mapFor(seed);
+		const charAt = generator(seed);
 		const start = findStart(charAt);
 		if (start) return { seed, charAt, start };
 	}
