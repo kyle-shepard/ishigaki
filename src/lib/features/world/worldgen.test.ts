@@ -2,16 +2,20 @@
 //
 // The generator is tuned by eye against `npm run map`, and eyes are not in CI. This is the thing a
 // threshold edit can quietly break that looking at a map you already believe in will not catch: a
-// world that is mostly sea or mountain, or one with nowhere left for a fresh hamlet to open.
+// world that is mostly sea or mountain, or one with nowhere left for a fresh hamlet to open — and,
+// since the Phase 3 rewrite, the geography tests below: a river that pools in a basin, a coastline
+// that touches two edges, a mountain range that reads as speckle. All of it is pinned here because
+// none of it is visible from the numeric census alone.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GRID_SIZE } from './world.ts';
 import { START, terrainCharAt, terrainMap } from './worldgen.ts';
 
-const CHARS = new Set(['.', 'f', 'w', 'm', 's', 'c', 'i']);
+const CHARS = new Set(['.', 'f', 'w', 'h', 'm', 's', 'c', 'i']);
 const map = terrainMap();
 const census = (char: string) => [...map.join('')].filter((c) => c === char).length;
 const share = (char: string) => census(char) / (GRID_SIZE * GRID_SIZE);
+const idx = (x: number, y: number) => y * GRID_SIZE + x;
 
 test('the map is the right shape and speaks only the seed alphabet', () => {
 	assert.equal(map.length, GRID_SIZE);
@@ -49,4 +53,293 @@ test('a realm opens on grass, with two clear tiles on every side', () => {
 		[-1, 1, START.hamletY, START.hamletY]
 	);
 	assert.deepEqual([START.characterX, START.characterY], [START.hamletX, START.hamletY + 1]);
+});
+
+// Four-way and eight-way, and which terrain gets which is a deliberate call per terrain, not a
+// house style. Water is walked and routed on orthogonally (`route`'s eight-way movement still
+// prices a diagonal step, but between two *open* tiles — a strand of water one corner wide is not
+// a crossing, it's a gap two puddles happen to share a corner with) — a channel a body could
+// actually follow has to be 4-connected, so every water assertion below uses DIRS4. This is not
+// pedantry: an earlier version of this file used DIRS8 throughout, on the reasoning that D8
+// hydrology and `route`'s own eight-way movement made it the "consistent" choice, and it reported
+// zero orphaned Water tiles on a map where 682 of 3,123 were single-tile puddles joined to their
+// neighbours only diagonally — corner contact was enough to call the whole thing one component.
+// Mountain and forest are area/gradient claims, not walkability ones — nobody has to trace a
+// mountain range end to end — so DIRS8 stays deliberate there; see the tests below.
+const DIRS4: [number, number][] = [
+	[1, 0],
+	[-1, 0],
+	[0, 1],
+	[0, -1]
+];
+const DIRS8: [number, number][] = [...DIRS4, [1, 1], [1, -1], [-1, 1], [-1, -1]];
+
+/** Every tile `pred` accepts, grouped into its connected components under the given adjacency —
+ * size and which map edges (if any) each one touches. Shared by the sea, mountain and forest tests
+ * below: "how many blobs, how big, do they reach the border" is the same question asked of three
+ * different terrains, at whichever connectivity that terrain's own test decides matters. */
+function components(pred: (x: number, y: number) => boolean, dirs: [number, number][]) {
+	const seen = new Uint8Array(GRID_SIZE * GRID_SIZE);
+	const result: { size: number; edges: Set<string> }[] = [];
+	for (let y = 0; y < GRID_SIZE; y++)
+		for (let x = 0; x < GRID_SIZE; x++) {
+			const i = idx(x, y);
+			if (!pred(x, y) || seen[i]) continue;
+			let size = 0;
+			const edges = new Set<string>();
+			const queue = [i];
+			seen[i] = 1;
+			while (queue.length) {
+				const j = queue.pop()!;
+				size++;
+				const jx = j % GRID_SIZE;
+				const jy = (j / GRID_SIZE) | 0;
+				if (jx === 0) edges.add('west');
+				if (jy === 0) edges.add('north');
+				if (jx === GRID_SIZE - 1) edges.add('east');
+				if (jy === GRID_SIZE - 1) edges.add('south');
+				for (const [dx, dy] of dirs) {
+					const nx = jx + dx;
+					const ny = jy + dy;
+					if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
+					const k = idx(nx, ny);
+					if (!pred(nx, ny) || seen[k]) continue;
+					seen[k] = 1;
+					queue.push(k);
+				}
+			}
+			result.push({ size, edges });
+		}
+	return result;
+}
+
+/** Flood-fill from one tile under the given adjacency, for the "does every Water tile reach the
+ * sea" check. */
+function floodFill(
+	startX: number,
+	startY: number,
+	pred: (x: number, y: number) => boolean,
+	dirs: [number, number][]
+) {
+	const seen = new Set<number>([idx(startX, startY)]);
+	const queue = [idx(startX, startY)];
+	while (queue.length) {
+		const j = queue.pop()!;
+		const jx = j % GRID_SIZE;
+		const jy = (j / GRID_SIZE) | 0;
+		for (const [dx, dy] of dirs) {
+			const nx = jx + dx;
+			const ny = jy + dy;
+			if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
+			const k = idx(nx, ny);
+			if (seen.has(k) || !pred(nx, ny)) continue;
+			seen.add(k);
+			queue.push(k);
+		}
+	}
+	return seen;
+}
+
+const isWater = (x: number, y: number) => terrainCharAt(x, y) === 'w';
+
+// The sea, as a *shape* rather than a hardcoded column: erode the Water mask (a tile survives only
+// if it and all 4 orthogonal neighbours are Water — nothing narrower than about 3 tiles across
+// lives through that), then dilate the survivors back out by one tile to restore the coastline the
+// erosion ate. What's left is the sea's own solid mass; a river, however long, never has an
+// interior to survive erosion in the first place. Derived from the water this generator actually
+// drew, so it keeps working if the sea's width, edge or shape ever changes — the alternative,
+// picking an inland cutoff column by eye, is exactly the kind of number that quietly stops meaning
+// anything the day someone retunes SEA_BAND.
+const seaMask = new Uint8Array(GRID_SIZE * GRID_SIZE);
+{
+	const solid = (x: number, y: number) =>
+		isWater(x, y) &&
+		isWater(x + 1, y) &&
+		isWater(x - 1, y) &&
+		isWater(x, y + 1) &&
+		isWater(x, y - 1);
+	for (let y = 0; y < GRID_SIZE; y++)
+		for (let x = 0; x < GRID_SIZE; x++) {
+			if (!solid(x, y)) continue;
+			seaMask[idx(x, y)] = 1;
+			if (x + 1 < GRID_SIZE) seaMask[idx(x + 1, y)] = 1;
+			if (x - 1 >= 0) seaMask[idx(x - 1, y)] = 1;
+			if (y + 1 < GRID_SIZE) seaMask[idx(x, y + 1)] = 1;
+			if (y - 1 >= 0) seaMask[idx(x, y - 1)] = 1;
+		}
+}
+const isInlandWater = (x: number, y: number) => isWater(x, y) && !seaMask[idx(x, y)];
+
+// Horizontal/vertical run lengths through every *inland* Water tile, computed once and shared by
+// the width and straightness tests below — both are just different questions asked of the same two
+// arrays. Built from `isInlandWater`, not `isWater`: a run has to break at the sea's own boundary,
+// or a river tile sitting one step from the coast would inherit the sea's width or length along
+// whichever axis happens to run into it.
+const hrun = new Int32Array(GRID_SIZE * GRID_SIZE);
+const vrun = new Int32Array(GRID_SIZE * GRID_SIZE);
+for (let y = 0; y < GRID_SIZE; y++) {
+	let run = 0;
+	for (let x = 0; x < GRID_SIZE; x++) {
+		run = isInlandWater(x, y) ? run + 1 : 0;
+		hrun[idx(x, y)] = run;
+	}
+	run = 0;
+	for (let x = GRID_SIZE - 1; x >= 0; x--) {
+		run = isInlandWater(x, y) ? run + 1 : 0;
+		hrun[idx(x, y)] = Math.max(hrun[idx(x, y)], run);
+	}
+}
+for (let x = 0; x < GRID_SIZE; x++) {
+	let run = 0;
+	for (let y = 0; y < GRID_SIZE; y++) {
+		run = isInlandWater(x, y) ? run + 1 : 0;
+		vrun[idx(x, y)] = run;
+	}
+	run = 0;
+	for (let y = GRID_SIZE - 1; y >= 0; y--) {
+		run = isInlandWater(x, y) ? run + 1 : 0;
+		vrun[idx(x, y)] = Math.max(vrun[idx(x, y)], run);
+	}
+}
+
+test('the sea is one connected body of water, 4-connected, and touches exactly one edge', () => {
+	// worldgen.ts's `edgeLift` keeps the other three edges high and dry by construction, and
+	// `SEA_DEPTH` is derived, not tuned, to guarantee the sea edge itself is wet — so this isn't
+	// asserting a threshold so much as checking that guarantee actually held for this seed.
+	const water = components(isWater, DIRS4);
+	assert.equal(water.length, 1, `water forms ${water.length} disconnected bodies, not one sea`);
+	assert.equal(
+		water[0].edges.size,
+		1,
+		`water touches ${[...water[0].edges].join(', ') || 'no edge at all'}`
+	);
+});
+
+test('every Water tile connects to the sea by orthogonal steps', () => {
+	// Flood-fill outward from a Water tile on the sea edge, 4-connected — a diagonal-only touch
+	// doesn't count, because a river you can't walk the length of isn't a river (see the DIRS4/
+	// DIRS8 note above). If the reach is smaller than the total census, something — a river
+	// segment, a puddle — sits disconnected from it under any connectivity a body could use.
+	let seaTile: [number, number] | null = null;
+	for (let y = 0; y < GRID_SIZE && !seaTile; y++)
+		if (terrainCharAt(GRID_SIZE - 1, y) === 'w') seaTile = [GRID_SIZE - 1, y];
+	assert.ok(seaTile, 'no Water tile at all on the sea edge to flood-fill from');
+	const reached = floodFill(seaTile![0], seaTile![1], isWater, DIRS4);
+	assert.equal(
+		reached.size,
+		census('w'),
+		`${census('w') - reached.size} Water tile(s) don't orthogonally connect to the sea`
+	);
+});
+
+test('essentially no Water tile is an isolated singleton', () => {
+	// The specific shape of the corner-contact bug: 682 of 3,123 Water tiles were their own
+	// 4-connected component of size 1 — a puddle touching its neighbours only at a corner. The two
+	// tests above already imply zero once the sea is confirmed to be one 4-connected component, but
+	// that's exactly the reasoning that let the bug hide behind an 8-connected "1 component, 0
+	// orphans" reading before — so this checks the singleton count directly rather than trusting
+	// another test's math.
+	const singletons = components(isWater, DIRS4).filter((c) => c.size === 1).length;
+	assert.ok(singletons <= 1, `${singletons} Water tiles are isolated 4-connected singletons`);
+});
+
+test('rivers are thin — mostly one or two tiles wide, inland of the coast', () => {
+	// Local "width" at a Water tile: the shorter of the horizontal and vertical run of Water tiles
+	// running through it. A river is long in one axis and thin in the other, so this measurement
+	// stays small along its whole length; the sea is wide in both axes at once, which is exactly why
+	// the sample is restricted to `isInlandWater` — the sea's own shape, not a hardcoded column.
+	//
+	// Two numbers, not one, because they catch different failures. The 90th percentile catches the
+	// systemic one: a threshold too low reads as diffuse wet texture rather than a channel, and that
+	// pushes width *everywhere*, not just at a few tiles — this generator sits at 1-2 comfortably.
+	// The max catches the acute one this test is named after: a single wide flood-plain "lake" was
+	// once 21 tiles across at its worst while every percentile up to p95 still read 2-3, because a
+	// basin that wide is still a small fraction of the total Water census. A real confluence — two
+	// tributaries actually joining — does read as briefly wider than either one alone, which is why
+	// this isn't pinned at 2: the cap is generous enough to let a junction through and still catch a
+	// basin.
+	const widths: number[] = [];
+	for (let y = 0; y < GRID_SIZE; y++)
+		for (let x = 0; x < GRID_SIZE; x++)
+			if (isInlandWater(x, y)) widths.push(Math.min(hrun[idx(x, y)], vrun[idx(x, y)]));
+	assert.ok(widths.length > 0, 'no inland Water tiles to measure — is there a river at all?');
+	widths.sort((a, b) => a - b);
+	const p90 = widths[Math.floor(0.9 * widths.length)];
+	const max = widths[widths.length - 1];
+	assert.ok(p90 <= 2, `90th percentile inland river width is ${p90} tiles`);
+	assert.ok(max <= 10, `a spot on the river is ${max} tiles wide — that's a basin, not a channel`);
+});
+
+test('rivers meander — no long dead-straight inland run', () => {
+	// The third distinct way this has been wrong, and the first two were both invisible until
+	// measured: a fixed generator can still produce a hydrologically valid, properly thin, fully
+	// connected channel that runs arrow-straight for tens of tiles, because `priorityFlood` visiting
+	// cells in order of rising elevation degenerates to "shortest path to the coast" wherever the
+	// ground is flat — and a straight canal reads as infrastructure, not landscape. One seed of this
+	// generator, pre-fix, ran dead straight for 38 tiles (18% of every inland Water tile on the
+	// map) before `hydroNoise` in worldgen.ts went from a smooth field to a chaotic per-tile one;
+	// this pins the fix. 16 is headroom over what the fixed generator actually produces (9 and 14
+	// at the time this was written) while still well short of anything that would read as dug —
+	// pushing the amplitude higher shortens the vertical run further but widens the channel enough
+	// to fail the thinness test above, so this is the balance, not the ceiling.
+	const longestRun = (runs: Int32Array) => {
+		let longest = 0;
+		for (let y = 0; y < GRID_SIZE; y++)
+			for (let x = 0; x < GRID_SIZE; x++)
+				if (isInlandWater(x, y)) longest = Math.max(longest, runs[idx(x, y)]);
+		return longest;
+	};
+	const longestH = longestRun(hrun);
+	const longestV = longestRun(vrun);
+	assert.ok(longestH <= 16, `a straight inland horizontal run is ${longestH} tiles long`);
+	assert.ok(longestV <= 16, `a straight inland vertical run is ${longestV} tiles long`);
+});
+
+// Mountain and forest are read below with DIRS8, deliberately and unlike water: neither test is
+// asking "could a body walk this", it's asking "does this read as one connected *shape*" — a
+// range whose two peaks touch only at a corner is still legibly one range, the way two forest
+// stands touching at a corner still read as one wood from above. Water doesn't get that latitude
+// because a river is specifically a thing you walk along or route across (see the DIRS4 note up
+// top), and nothing here makes the same claim about a mountain or a tree.
+
+test('mountain forms a few connected ranges, not speckle', () => {
+	const ranges = components((x, y) => terrainCharAt(x, y) === 'm', DIRS8);
+	const total = ranges.reduce((sum, r) => sum + r.size, 0);
+	// Speckle is one component per tile or close to it; a set of chains is a handful of components
+	// no matter how many tiles they cover between them. 5% is generous headroom over what this
+	// generator actually produces (well under 1%) while still catching a regression toward
+	// per-tile noise.
+	assert.ok(
+		ranges.length < total * 0.05,
+		`${ranges.length} mountain components across ${total} tiles reads as speckle, not chains`
+	);
+});
+
+test('every mountain tile has a hills or mountain neighbour', () => {
+	// The elevation gradient made visible: nothing sits at the top band with lowland on every side.
+	let stray = 0;
+	for (let y = 0; y < GRID_SIZE; y++)
+		for (let x = 0; x < GRID_SIZE; x++) {
+			if (terrainCharAt(x, y) !== 'm') continue;
+			const gradient = DIRS8.some(([dx, dy]) => {
+				const nx = x + dx;
+				const ny = y + dy;
+				if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) return false;
+				const c = terrainCharAt(nx, ny);
+				return c === 'm' || c === 'h';
+			});
+			if (!gradient) stray++;
+		}
+	assert.equal(stray, 0, `${stray} mountain tile(s) have no hills or mountain neighbour`);
+});
+
+test('forest reads as regions, not per-tile dice', () => {
+	const clusters = components((x, y) => terrainCharAt(x, y) === 'f', DIRS8);
+	const total = clusters.reduce((sum, c) => sum + c.size, 0);
+	const mean = total / clusters.length;
+	// Per-tile dice (the old generator's `vegetation(x, y) > threshold`, independent of its
+	// neighbours) produces mostly 1-4 tile flecks. This generator's moisture field is coherent
+	// enough that the mean sits in the hundreds; 20 is comfortably above what dice would give and
+	// comfortably below what this generator actually produces.
+	assert.ok(mean > 20, `mean forest cluster size is only ${mean.toFixed(1)} tiles`);
 });

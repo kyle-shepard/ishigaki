@@ -613,6 +613,19 @@ const TERRAIN = [
 		yields: 'Iron ore'
 	},
 	{
+		char: 'h',
+		displayName: 'Hills',
+		// Roughly the midpoint of Meadow's green and Mountain's grey below — the row is the missing
+		// step between them, so its colour reads as one too.
+		color: '#93a15e',
+		icon: 'hills',
+		buildable: true,
+		// Slower than Meadow's 1.0 but nothing like Mountain's 5.0 — a climb, not a wall. No yields:
+		// worldgen.ts bands the deposits within the habitable elevation range below this, so Hills
+		// carries nothing to gather, same as Mountain.
+		movementCost: 1.5
+	},
+	{
 		char: 'm',
 		displayName: 'Mountain',
 		color: '#6b6259',

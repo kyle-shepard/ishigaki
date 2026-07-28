@@ -85,6 +85,19 @@
 			</g>
 		</symbol>
 
+		<!-- Two rounded mounds, same back-then-front overlap as the mountain below (so they read as
+		     humps rather than one ridge), a good deal lower and softer-edged than its peaks — the
+		     shape is the whole "step between lowland and mountain" argument, drawn. Grass tufts
+		     borrowed from meadow's, lighter than the mound fill so they still read on top of it. -->
+		<symbol id="i-hills" viewBox="0 0 32 32">
+			<path d="M2 29 Q3 15 15 15 Q27 15 27 29 Z" fill="#69753f" />
+			<path d="M13 29 Q14 9 26 9 Q31 9 31 15 L31 29 Z" fill="#586231" />
+			<g fill="none" stroke="#cdd79e" stroke-width="1.5" stroke-linecap="round">
+				<path d="M9 23v-3.4M7 23l1.4-2.8M11 23l-1.4-2.8" />
+				<path d="M21 19v-3.4M19 19l1.4-2.8M23 19l-1.4-2.8" />
+			</g>
+		</symbol>
+
 		<!-- Back peak first: the near peak has to overlap it, or they read as one flat ridge. -->
 		<symbol id="i-mountain" viewBox="0 0 32 32">
 			<path d="M15 29 L24 12 L32 29 Z" fill="#5f584f" />

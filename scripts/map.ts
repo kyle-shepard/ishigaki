@@ -8,6 +8,7 @@ const PAINT: Record<string, string> = {
 	'.': '\x1b[42;30m', // meadow — green
 	f: '\x1b[102;30m', // forest — bright green
 	w: '\x1b[44;97m', // water — blue
+	h: '\x1b[103;30m', // hills — bright yellow, between meadow green and mountain grey
 	m: '\x1b[100;97m', // mountain — grey
 	s: '\x1b[47;30m', // stone outcrop — white
 	c: '\x1b[43;30m', // clay pit — yellow
