@@ -8,7 +8,7 @@
 // none of it is visible from the numeric census alone.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GRID_SIZE, START_REACH_RADIUS, withinReach } from './world.ts';
+import { GRID_SIZE, route, START_REACH_RADIUS, withinReach } from './world.ts';
 import { START, terrainCharAt, terrainMap } from './worldgen.ts';
 
 const CHARS = new Set(['.', 'f', 'w', 'h', 'm', 's', 'c', 'i']);
@@ -371,4 +371,105 @@ test('forest reads as regions, not per-tile dice', () => {
 	// enough that the mean sits in the hundreds; 20 is comfortably above what dice would give and
 	// comfortably below what this generator actually produces.
 	assert.ok(mean > 20, `mean forest cluster size is only ${mean.toFixed(1)} tiles`);
+});
+
+test('a river is a detour, not a wall — the route bends around it', () => {
+	// Terrain has to change the route, not merely cost time. This lived in scripts/rules-check.ts as
+	// an HTTP case until the reach began gating movement work: proving it needs a destination on the
+	// far side of a river, and a fresh realm's circle is six tiles of meadow, forest, hills and
+	// outcrop with no water in it at all, so the order is now refused OUTSIDE_REACH for exactly the
+	// right reason. `route` is pure, so the claim tests better here anyway — it can ask about any two
+	// tiles on the map without a realm big enough to own them.
+	//
+	// Movement costs come from seed.ts's TERRAIN table. Water is expensive (8.0) and never
+	// impassable, which is the whole point: a river is something you walk around because it is dear,
+	// not something that makes a tile unreachable. If it were impassable `route` would throw instead
+	// of answering, which is one of the issue's named failure conditions.
+	const COST: Record<string, number> = {
+		'.': 1.0,
+		f: 2.0,
+		c: 1.5,
+		s: 2.5,
+		i: 2.5,
+		h: 1.5,
+		m: 5.0,
+		w: 8.0
+	};
+	const cost = (x: number, y: number) => COST[terrainCharAt(x, y)];
+
+	// Bresenham: which tiles a straight line would cross. Used only to pick a destination worth
+	// walking to — the question `route` answers by actually walking.
+	const lineTiles = (x0: number, y0: number, x1: number, y1: number) => {
+		const pts: [number, number][] = [];
+		const dx = Math.abs(x1 - x0);
+		const dy = -Math.abs(y1 - y0);
+		const sx = x0 < x1 ? 1 : -1;
+		const sy = y0 < y1 ? 1 : -1;
+		let err = dx + dy;
+		let x = x0;
+		let y = y0;
+		for (;;) {
+			pts.push([x, y]);
+			if (x === x1 && y === y1) break;
+			const e2 = 2 * err;
+			if (e2 >= dy) {
+				err += dy;
+				x += sx;
+			}
+			if (e2 <= dx) {
+				err += dx;
+				y += sy;
+			}
+		}
+		return pts;
+	};
+
+	// The nearest destination whose straight line from the hamlet crosses real water, so the detour
+	// is about a river rather than a puddle. Found, never written down — a coordinate here would name
+	// whatever the generator drew the day it was typed.
+	let dest: [number, number] | null = null;
+	let best = Infinity;
+	for (let y = 0; y < GRID_SIZE; y++)
+		for (let x = 0; x < GRID_SIZE; x++) {
+			if (terrainCharAt(x, y) === 'w') continue;
+			const d = Math.hypot(x - START.hamletX, y - START.hamletY);
+			if (d >= best) continue;
+			const wet = lineTiles(START.hamletX, START.hamletY, x, y).filter(
+				([lx, ly]) => terrainCharAt(lx, ly) === 'w'
+			).length;
+			if (wet >= 3) {
+				best = d;
+				dest = [x, y];
+			}
+		}
+	assert.ok(dest, 'no destination has a straight line from the hamlet crossing 3+ water tiles');
+
+	const [dx, dy] = dest!;
+	const walked = route(START.hamletX, START.hamletY, dx, dy, 1, cost, GRID_SIZE);
+	const wetRoute = walked.path.filter(
+		(i) => terrainCharAt(i % GRID_SIZE, Math.floor(i / GRID_SIZE)) === 'w'
+	).length;
+	const wetStraight = lineTiles(START.hamletX, START.hamletY, dx, dy).filter(
+		([lx, ly]) => terrainCharAt(lx, ly) === 'w'
+	).length;
+	// Fewer, not none. `route` minimises *cost*, and water is dear (8.0) rather than forbidden — so
+	// where going around would cost more than fording, fording is the right answer and the path takes
+	// it. An earlier version of this asserted the route came back completely dry; it passed only
+	// because the old hand-drawn lake was big enough that around was always cheaper, and a generated
+	// river one tile wide is not. What terrain actually promises is that it *changes* the route, and
+	// that is what this asks.
+	assert.ok(
+		wetRoute < wetStraight,
+		`the route to (${dx},${dy}) crosses ${wetRoute} water tiles, no better than the straight line's ${wetStraight}`
+	);
+	// And it costs time. Steps are the wrong measure — movement is 8-directional, so a path can
+	// sidestep a one-tile river and land on the same Chebyshev distance it started with, which is
+	// exactly what happened when this asserted step count. What terrain actually promises is that it
+	// *slows* travel, and `route` reports that directly: compare the real crossing against the same
+	// trip priced as though every tile were open meadow.
+	const overMeadow = route(START.hamletX, START.hamletY, dx, dy, 1, () => 1, GRID_SIZE);
+	assert.ok(
+		walked.seconds > overMeadow.seconds,
+		`the crossing to (${dx},${dy}) took ${walked.seconds.toFixed(1)}s, no worse than ${overMeadow.seconds.toFixed(1)}s over open meadow — terrain cost nothing`
+	);
 });

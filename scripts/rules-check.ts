@@ -18,7 +18,7 @@ const BASE = process.env.RULES_CHECK_URL ?? 'http://localhost:5173';
 // wrong thing the next time WORLD_SEED changed — which is exactly what happened to the forty-odd
 // hardcoded coordinates this file used to carry.
 import { START } from '../src/lib/features/world/worldgen.ts';
-import { START_REACH_RADIUS } from '../src/lib/features/world/world.ts';
+import { START_REACH_RADIUS, withinReach } from '../src/lib/features/world/world.ts';
 
 // Every request carries the same cookie, so all cases play in one player's sandbox — the
 // occupancy checks are player-scoped and would read a different world otherwise.
@@ -301,19 +301,21 @@ check(
 	true
 );
 
-// Terrain has to change the route, not just cost time. This used to be a hand-placed lake between
-// the hamlet and a chosen tile; now it's found — scan the map for a destination whose straight
-// line from the hamlet crosses at least three tiles of water, order a build there, and read the
-// route the server actually chose off the public payload, same as the client draws it. Same claim
-// as before — terrain reroutes travel and costs time — proved about whatever ground the seed
-// produced rather than about a lake somebody drew, and stronger: the old pair of legs only showed
-// the wet one was *slower*; this shows the wet one is *dry*.
+// Travel is routed by the server, and it walks rather than teleports. The *water-detour* half of
+// this claim — that a route around a river comes back dry, and costs more steps than the straight
+// line it avoided — moved to worldgen.test.ts when the reach began gating movement work. `route`
+// is pure, so it belongs in a unit test anyway; and it could not stay here regardless, because
+// proving it needs a destination on the far side of water and a fresh realm's circle is six tiles
+// of meadow, forest, hills and outcrop with no water in it at all. Ordering out there is refused
+// OUTSIDE_REACH now, for exactly the right reason, and reaching real water would mean waiting out
+// several population milestones inside a script that already runs for twenty minutes.
+//
+// What stays is the half only a running server can show: an order comes back with a walked path,
+// ending on the tile that was asked for.
 cookie = '';
 const travelWorld = await api('/api/world');
 const gridSize = travelWorld.body.gridSize;
-const waterId = travelWorld.body.terrainTypes.find(
-	(t: { displayName: string }) => t.displayName === 'Water'
-).id;
+const reach = travelWorld.body.reach;
 const occupiedTiles = new Set(
 	travelWorld.body.buildings.map((b: { x: number; y: number }) => b.y * gridSize + b.x)
 );
@@ -323,67 +325,31 @@ const buildableTypesByTerrain = new Map<number, number[]>(
 			[t.id, t.buildableTypeIds] as [number, number[]]
 	)
 );
-// A straight line's tiles, Bresenham — the same "how many tiles would this cross" question
-// `route` answers by actually walking, asked here only to pick a destination worth walking to.
-function lineTiles(x0: number, y0: number, x1: number, y1: number): { x: number; y: number }[] {
-	const pts: { x: number; y: number }[] = [];
-	const dx = Math.abs(x1 - x0);
-	const dy = -Math.abs(y1 - y0);
-	const sx = x0 < x1 ? 1 : -1;
-	const sy = y0 < y1 ? 1 : -1;
-	let err = dx + dy;
-	let x = x0;
-	let y = y0;
-	for (;;) {
-		pts.push({ x, y });
-		if (x === x1 && y === y1) break;
-		const e2 = 2 * err;
-		if (e2 >= dy) {
-			err += dy;
-			x += sx;
-		}
-		if (e2 <= dx) {
-			err += dx;
-			y += sy;
-		}
-	}
-	return pts;
-}
+// The furthest buildable tile still inside the circle, so the walk is as long as the reach allows.
 let dest: { x: number; y: number } | null = null;
+let farthest = -1;
 for (let i = 0; i < travelWorld.body.terrain.length; i++) {
 	if (occupiedTiles.has(i)) continue;
 	if (!buildableTypesByTerrain.get(travelWorld.body.terrain[i])?.includes(free)) continue;
 	const x = i % gridSize;
 	const y = Math.floor(i / gridSize);
-	const crossed = lineTiles(START.hamletX, START.hamletY, x, y).filter(
-		(p) => travelWorld.body.terrain[p.y * gridSize + p.x] === waterId
-	).length;
-	if (crossed >= 3) {
+	if (!withinReach(x, y, reach)) continue;
+	const d = Math.hypot(x - reach.x, y - reach.y);
+	if (d > farthest) {
+		farthest = d;
 		dest = { x, y };
-		break;
 	}
 }
-if (!dest)
-	throw new Error('no destination has a straight line from the hamlet crossing 3+ water tiles');
+if (!dest) throw new Error('no buildable tile inside the opening reach');
 const routed = await order(dest.x, dest.y, free);
 const routedOp = routed.body.operations?.[0];
 if (!routedOp)
 	throw new Error(`order to (${dest.x},${dest.y}) was refused: ${JSON.stringify(routed.body)}`);
-const walked = routedOp.workers[0];
-const path: number[] = walked.path;
-const wet = path.filter((i: number) => travelWorld.body.terrain[i] === waterId).length;
-// The lower bound on how few steps *any* route could take, measured from where this worker
-// actually started (their own tile, not the hamlet) — so "more steps than the straight line"
-// is a mathematical fact about the path returned, not an approximation.
-const originIdx = path[0];
-const originX = originIdx % gridSize;
-const originY = Math.floor(originIdx / gridSize);
-const straightSteps = Math.max(Math.abs(dest.x - originX), Math.abs(dest.y - originY));
-check(`the route to (${dest.x},${dest.y}) crosses no water at all`, wet, 0);
+const path: number[] = routedOp.workers[0].path;
 check(
-	`the detour (${path.length - 1} steps) costs more than the straight line it avoided (${straightSteps} steps)`,
-	path.length - 1 > straightSteps,
-	true
+	`the order to (${dest.x},${dest.y}) came back with a walked route, not a teleport`,
+	[path.length > 1, path[path.length - 1] === dest.y * gridSize + dest.x],
+	[true, true]
 );
 
 // The runway and the refund path. A fresh realm no longer starts empty — it arrives stocked
@@ -689,8 +655,28 @@ check(
 // The queue. Placing a build with everyone busy no longer bounces: it holds the tile and the cost
 // it has already paid, and starts itself when a worker frees. Reserving at queue time is the whole
 // point — deducting at start would reintroduce the silent-failure-while-away this model avoids.
+// Forest tiles a realm may actually work, nearest first. `findMany` sorts by Chebyshev distance
+// from the hamlet, while the reach is a Euclidean circle around the Marketplace one tile north — so
+// "nearest" and "in reach" are not the same list, and the gap is not a rounding error: a tile five
+// steps away diagonally sits 7.07 from the centre, outside a radius-6 circle. Anything below that
+// means to *occupy* workers wants this list rather than that one, because a refused assignment
+// quietly leaves somebody idle and the next case sees a build start when it expected one to queue.
+const reachable = (name: string, n: number) => {
+	// 200 nearest as the pool, which on any sane start comfortably covers the circle; the filter is
+	// what actually decides. Throws rather than returning short, because coming up empty here means
+	// the start guarantee in worldgen.ts has slipped and every case below would fail confusingly.
+	const inReach = findMany(name, 200)
+		.filter((t) => withinReach(t.x, t.y, world.body.reach))
+		.slice(0, n);
+	if (inReach.length < n)
+		throw new Error(
+			`only ${inReach.length} ${name} tile(s) inside the opening reach, need ${n} — the start guarantee in worldgen.ts has slipped`
+		);
+	return inReach;
+};
+
 const occupyEveryone = async () => {
-	for (const { x, y } of findMany('Forest', 3)) await assign(x, y);
+	for (const { x, y } of reachable('Forest', 3)) await assign(x, y);
 };
 
 cookie = '';
@@ -944,7 +930,7 @@ await api(`/api/orders/${byCarpenter.id}`, { method: 'DELETE' });
 // paid — and starts itself on the next read after somebody frees, with no one looking.
 const busyEveryone = async () => {
 	const idle = (await api('/api/world')).body.characters.length;
-	for (const { x, y } of findMany('Forest', 6)) {
+	for (const { x, y } of reachable('Forest', 6)) {
 		const w = (await api('/api/world')).body;
 		if (w.operations.filter((o: { type: string }) => o.type === 'gather').length >= idle) break;
 		await assign(x, y);
