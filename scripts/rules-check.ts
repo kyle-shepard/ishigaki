@@ -756,11 +756,26 @@ const craft = (x: number, y: number, crewSize?: number, allowedProfessionIds?: n
 		method: 'POST',
 		body: JSON.stringify({ x, y, crewSize, allowedProfessionIds })
 	});
-/** Sleeps until an operation is genuinely due, then reads **once**. Nothing looks in between. */
+/** Sleeps until an operation is genuinely due, then reads. Nothing looks in between.
+ *
+ * The sleep is timed off this machine's clock, but whether an operation has landed is decided by
+ * the server's — and those are not the same clock. The database is remote, a read costs seconds of
+ * round trip, and the two disagree by a second or two besides, so a fixed local sleep plus a couple
+ * of seconds' slack can easily arrive while the server still thinks the work has a moment left.
+ * That reads as "the building never went up" when what happened is that we looked too early: the
+ * failure landed on the Sawmill in the crafting ladder, and every later case that needed the mill
+ * failed behind it. So the local sleep gets us close, and then the payload's own `now` — the same
+ * clock `resolveWorld` compares against — is what says the moment has passed. */
 async function waitOut(op: { completeAt: string }, slackMs = 2000) {
-	const wait = Date.parse(op.completeAt) - Date.now() + slackMs;
+	const due = Date.parse(op.completeAt);
+	const wait = due - Date.now() + slackMs;
 	if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-	return (await api('/api/world')).body;
+	for (let i = 0; i < 10; i++) {
+		const w = (await api('/api/world')).body;
+		if (Date.parse(w.now) >= due) return w;
+		await new Promise((r) => setTimeout(r, 1000));
+	}
+	throw new Error(`waited well past ${op.completeAt} but the server's clock never reached it`);
 }
 const stands = (w: { buildings: { x: number; y: number }[] }, [x, y]: readonly [number, number]) =>
 	w.buildings.some((b) => b.x === x && b.y === y);
@@ -1038,6 +1053,7 @@ const spendable = (w: {
 	terrainTypes: { id: number; buildableTypeIds: number[] }[];
 	buildings: { x: number; y: number }[];
 	operations: { type: string; destX: number; destY: number }[];
+	reach: { x: number; y: number; radius: number };
 }) => {
 	const out: [number, number][] = [];
 	for (let i = 0; i < w.terrain.length; i++) {
@@ -1047,6 +1063,10 @@ const spendable = (w: {
 		const y = Math.floor(i / w.gridSize);
 		if (w.buildings.some((b) => b.x === x && b.y === y)) continue;
 		if (w.operations.some((o) => o.type === 'build' && o.destX === x && o.destY === y)) continue;
+		// Inside the circle, or the order is refused OUTSIDE_REACH and spends nothing. Draining Wood is
+		// the whole point of this loop, so a refused order does not just fail to help — it never lowers
+		// the number the loop is waiting on, and the walk runs the full map at a few seconds a request.
+		if (!withinReach(x, y, w.reach)) continue;
 		out.push([x, y]);
 	}
 	return out;
