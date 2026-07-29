@@ -1,5 +1,11 @@
 import { sql } from 'drizzle-orm';
-import { GRID_SIZE, type OperationType as WireOperationType } from '$lib/features/world/world';
+// Relative, with the extension, rather than `$lib/...`: this module is loaded by `scripts/` under
+// plain Node (the seed and the migration generator), which resolves neither Vite's `$lib` alias nor
+// an extensionless path. It got away with the alias for as long as everything it took from here was
+// a *type* — type stripping erases those before Node ever sees them — and broke the moment
+// `GRID_SIZE` became a value import for the start-position bounds. Same reason worldgen.ts writes
+// its own import this way, and the type-only re-export at the bottom of this file can stay as it is.
+import { GRID_SIZE, type OperationType as WireOperationType } from '../../features/world/world.ts';
 import {
 	type AnyPgColumn,
 	boolean,
