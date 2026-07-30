@@ -284,6 +284,24 @@ multiplayer-shaped, scale-shaped, or both.
   fork in the content model, and an open product question rather than an epic.
 - **Expansion & borders** — how a settlement claims more than the tile it started on.
 - **Shared-world reversal** — see locked decision #4.
+- **The scale ladder** — zooming out past the local view: county, region, state, country. The
+  intent is that pulling back keeps changing _what kind of place_ you are looking at, the way
+  [#10](https://github.com/kyle-shepard/ishigaki/issues/10) made it change what the map tells
+  you. Two things to know before planning it:
+
+  _A dense grid cannot get there._ A tile is about 20 m, so today's 128×128 is 2.56 km — a
+  village and its fields, not yet a city. A ~50 km county is 2,500 tiles a side (6.25M tiles);
+  a ~500 km region is 625M; a country is billions. 16,384 tiles already costs ~1.3 MB of
+  database egress per read. So the far tiers stop being tiles: close tiers read real ground
+  culled to the viewport, and distant ones read summaries **pre-aggregated at seed time**, one
+  cell standing for many — the pyramid every web map is built on. It also retires the property
+  that makes today's far tier work, that the whole world fits one screen.
+
+  _And it is gated on neighbours, not on rendering._ Past a certain distance the interesting
+  content is not terrain but settlements, borders, roads and rivers — and #10's Q step rejected
+  exactly that view on the grounds that with one player and expansion parked it draws a single
+  dot on an empty field. It was right. So this sequences behind the **shared-world reversal**
+  and **expansion & borders**; the rendering is the easier half.
 - **Logistics, trade, military, politics** — in that order, and all after the reversal.
 - **Premium currency & rush**, **time/progression hardening**, **character autonomy**.
 
