@@ -4,9 +4,10 @@
 // Fully generated, one source. There used to be a hand-authored core (`LAYOUT`) sitting in the
 // middle of the map, because the start tiles and the travel demo needed to be exactly what they
 // were — but that stopped being a fair trade once the world grew past what hand-authoring can
-// cover: `findStart` searches the generated ground for a legal opening instead of one being drawn
-// for it (see below), and scripts/rules-check.ts finds its terrain features in the payload rather
-// than naming a coordinate. One alphabet, one code path, no second frame to keep in sync.
+// cover: `findStarts` searches the generated ground for every legal, well-separated opening
+// instead of one being drawn for it (see below), and scripts/rules-check.ts finds its terrain
+// features in the payload rather than naming a coordinate. One alphabet, one code path, no second
+// frame to keep in sync.
 //
 // Deterministic on purpose. `vercel-build` re-runs the seed on every deploy, and the tile grid is
 // upserted rather than rebuilt: a generator that rolled fresh each time would rearrange the ground
@@ -28,7 +29,7 @@
 
 // The `.ts` extension is load-bearing: this module is imported by `scripts/` under plain Node,
 // which does not resolve extensionless paths. Same reason world.test.ts writes it that way.
-import { GRID_SIZE, START_REACH_RADIUS, withinReach } from './world.ts';
+import { GRID_SIZE, MATURE_REACH_RADIUS, START_REACH_RADIUS, withinReach } from './world.ts';
 // node:crypto rather than a dependency — this file is scripts/tests-only (nothing under
 // src/routes imports it), so a stdlib import here never reaches the browser bundle.
 import { createHash } from 'node:crypto';
@@ -403,20 +404,37 @@ function generator(seed: number): (x: number, y: number) => string {
 	// Thresholds. Picked by eye against `npm run map` (see the comment on each): water below
 	// WATER_T (declared above, next to the SEA_DEPTH that's derived from it), then habitable, then
 	// Hills, then Mountain at the top — the same "cut a height field into bands" idea the old
-	// generator used, just against a richer field. HILLS_T and MOUNTAIN_T sit high (most of
-	// `elevation`'s mass is mid-band; the ridge's long tail is what actually reaches them) so the
-	// habitable band — meadow, forest, and the deposits banded within it — stays the majority of
-	// the map, the way the pre-ridge generator's did.
-	const HILLS_T = 0.9;
-	const MOUNTAIN_T = 1.02;
+	// generator used, just against a richer field. Both sit high enough that the habitable band —
+	// meadow, forest, and the deposits banded within it — stays the majority of the map, the way the
+	// pre-ridge generator's did: most of `elevation`'s mass is mid-band, and the ridge's long tail is
+	// what actually reaches these.
+	//
+	// **These are tuned per grid size and do not carry over.** The noise lattices are sized in
+	// *tiles* (`fbm(seed, 4, 40)`), so changing GRID_SIZE does not scale the world — it builds a
+	// lattice with a different number of points, draws different random values into it, and hands
+	// back a genuinely different field whose elevation histogram sits somewhere else. Going 128→256
+	// with the old cuts (0.9 / 1.02) took mountain from 9% of the map to 2% and stone from 1% to
+	// 0.4%: the same seed, a flatter, blander world, and every automated bound still green because
+	// they were all upper bounds. The lower bounds in worldgen.test.ts exist so the next size change
+	// fails loudly instead of quietly flattening the map. Re-tune against `npm run map`'s census.
+	const HILLS_T = 0.7;
+	const MOUNTAIN_T = 0.8;
 	// A tile over this many upstream tiles' worth of flow is a river. There's no natural absolute
 	// scale for accumulation — it depends on how the drainage tree happens to branch — so this is
 	// tuned against the printed map rather than derived, and tuned high: at 40 (this constant's
 	// first value) almost a quarter of the map read as water, most of it a diffuse wet texture
-	// rather than anything you'd call a river. 1800 leaves a handful of trunk rivers with visible
-	// tributaries — inland water (the sea's own coastal band excluded) lands around 1% of the map,
-	// not the ~10% a low threshold gives.
-	const RIVER_T = 1800;
+	// rather than anything you'd call a river. 1800 (the value tuned at 128×128) leaves a handful
+	// of trunk rivers with visible tributaries — inland water (the sea's own coastal band excluded)
+	// lands around 1% of the map, not the ~10% a low threshold gives.
+	//
+	// Retuned to 4500 for the move to 256×256 (decision 4's shared-world reversal): the same
+	// spacing-based noise fields produce roughly the same *size* of individual terrain feature at
+	// any GRID_SIZE (`field`'s wavelength is in absolute tiles, not a fraction of the grid), but a
+	// bigger canvas gives real drainage basins more room to actually grow before they hit the
+	// map's edge or another basin — 1800 carried over unchanged left the 90th-percentile river
+	// width at 3 tiles (worldgen.test.ts's own budget is 2). Re-tune by eye against `npm run map`
+	// again the next time GRID_SIZE moves.
+	const RIVER_T = 4500;
 
 	// The ridge only piles onto land that already reads as high ground — gated smoothly between
 	// RIDGE_GATE_LOW and RIDGE_GATE_HIGH — rather than scaling every tile by however "tall" it is.
@@ -618,21 +636,64 @@ function hasStartingResources(hx: number, hy: number, charAt: (x: number, y: num
 	return false;
 }
 
+// Two mature reaches (MATURE_REACH_RADIUS each) just touching — the separation `findStarts`
+// enforces between the openings it accepts, so two realms can each grow their reach all the way to
+// the ladder's top rung without their spheres of influence ever overlapping. Derived rather than a
+// second magic number, so a retuned milestone ladder (seed.ts) can't quietly leave this stale.
+const MIN_START_SEPARATION = MATURE_REACH_RADIUS * 2;
+
+/** The hamlet, its two flanking buildings, the Marketplace, and the settlers' row — everything a
+ * fresh realm needs placed, derived from the one tile that anchors all of it. */
+export type StartBlock = {
+	hamletX: number;
+	hamletY: number;
+	house2X: number;
+	house2Y: number;
+	barnX: number;
+	barnY: number;
+	marketX: number;
+	marketY: number;
+	characterX: number;
+	characterY: number;
+};
+
+function startBlockFor(hx: number, hy: number): StartBlock {
+	return {
+		hamletX: hx,
+		hamletY: hy,
+		// Its own tile so the two Houses don't stack into one pawn.
+		house2X: hx - 1,
+		house2Y: hy,
+		barnX: hx + 1,
+		barnY: hy,
+		// The Marketplace, and so the centre of the realm's reach — one tile north of the hamlet.
+		// Inside `findStarts`'s cleared block and standing on nothing, so no other building has to
+		// move for it.
+		marketX: hx,
+		marketY: hy - 1,
+		// The settlers stand shoulder to shoulder on the row below, from characterX - 1.
+		characterX: hx,
+		characterY: hy + 1
+	};
+}
+
 /**
- * Where a new realm opens: the hamlet tile, with its two flanking buildings, the settlers on the
- * row below, and `START_MARGIN` tiles of clear grass around the lot — plus, now that the reach gates
- * gathering too, wood and stone inside the *starting* reach around the Marketplace tile just north
- * of it.
+ * Every opening the generated map holds: legal by the same rule `findStart` used to search for
+ * once (a `START_MARGIN`-clear block, `START_FOREST` Forest and `START_STONE` Stone inside its own
+ * `START_REACH_RADIUS` circle) — plus one new rule, that no two accepted openings may sit closer
+ * than `MIN_START_SEPARATION`, so two realms grown to the ladder's top rung never fight over reach.
  *
- * Searched rather than declared. A hand-placed constant was quietly wrong — the authored core put a
- * lake two tiles north of it — and a constant cannot notice when the ground under it moves, which
- * is what happened when the map grew and the core slid to the middle.
+ * Searched rather than declared, same reasoning as the old single `findStart`: a hand-placed
+ * constant cannot notice when the ground under it moves.
  *
- * Closest to the middle of the map wins, so a realm opens with room in every direction rather than
- * against an edge; the scan order breaks ties. Null when the map has nowhere at all, which is what
- * the reroll below is for.
+ * Deterministic, and reproducible for the same map: every legal tile is found, ordered
+ * closest-to-the-map's-centre first (ties broken by row-major scan order — the same tie-break the
+ * old single-start search used), then accepted greedily, a candidate joining only if it is far
+ * enough from every start already accepted. That is a real trade against a perfect packing (which
+ * could seat a few more), bought for the property that actually matters here: the count and the
+ * placement come out the same way every time this runs against the same map.
  */
-function findStart(charAt: (x: number, y: number) => string) {
+function findStarts(charAt: (x: number, y: number) => string): { x: number; y: number }[] {
 	// Buildings on `y`, settlers on `y + 1`, three wide and centred on the hamlet — then the margin
 	// around all of it. The Marketplace tile (hx, hy - 1) already sits inside this block, so a
 	// candidate that clears it needs no separate check to know the Marketplace's own tile is grass.
@@ -645,14 +706,22 @@ function findStart(charAt: (x: number, y: number) => string) {
 		return true;
 	};
 	const mid = (GRID_SIZE - 1) / 2;
-	let best: { x: number; y: number; d: number } | null = null;
+	const candidates: { x: number; y: number; d: number }[] = [];
 	for (let y = 0; y < GRID_SIZE; y++)
 		for (let x = 0; x < GRID_SIZE; x++) {
-			const d = Math.hypot(x - mid, y - mid);
-			if ((best && d >= best.d) || !clear(x, y) || !hasStartingResources(x, y, charAt)) continue;
-			best = { x, y, d };
+			if (!clear(x, y) || !hasStartingResources(x, y, charAt)) continue;
+			candidates.push({ x, y, d: Math.hypot(x - mid, y - mid) });
 		}
-	return best && { x: best.x, y: best.y };
+	// A stable sort (guaranteed since ES2019) keeps same-distance candidates in the row-major scan
+	// order above, matching the old findStart's own tie-break.
+	candidates.sort((a, b) => a.d - b.d);
+
+	const accepted: { x: number; y: number }[] = [];
+	for (const c of candidates) {
+		if (accepted.every((a) => Math.hypot(a.x - c.x, a.y - c.y) >= MIN_START_SEPARATION))
+			accepted.push({ x: c.x, y: c.y });
+	}
+	return accepted;
 }
 
 // Roll until the world has somewhere to live. Every candidate is a *whole* different map, and the
@@ -667,8 +736,8 @@ function findStart(charAt: (x: number, y: number) => string) {
 const rolled = (() => {
 	for (let seed = WORLD_SEED; seed < WORLD_SEED + 50; seed++) {
 		const charAt = generator(seed);
-		const start = findStart(charAt);
-		if (start) return { seed, charAt, start };
+		const starts = findStarts(charAt);
+		if (starts.length > 0) return { seed, charAt, starts };
 	}
 	throw new Error(
 		`no map in 50 rolls from seed ${WORLD_SEED} has ${START_MARGIN} tiles of clear grass around a ` +
@@ -683,29 +752,19 @@ export const MAP_SEED = rolled.seed;
 export const terrainCharAt = rolled.charAt;
 
 /**
- * Where every new sandbox opens. Every player gets the same coordinates because they never see
- * each other (VISION #4 interim override) — the hamlet, a second House beside it, the barn, and
- * the settlers on the row below.
- *
- * Derived from the map, not written down: see `findStart`. The seed re-asserts through the terrain
- * rows that these tiles really are Meadow, which is the one thing this cannot check for itself.
+ * Every realm-sized opening the map actually holds, closest-to-centre first and mutually
+ * `MIN_START_SEPARATION` apart — see `findStarts`. `ensurePlayer` (world.server.ts) claims the
+ * first unclaimed one from the `start_position` table the seed writes this into; once every row is
+ * claimed the world is full, and it says so rather than stacking a second realm on one opening.
  */
-export const START = {
-	hamletX: rolled.start.x,
-	hamletY: rolled.start.y,
-	// Its own tile so the two Houses don't stack into one pawn.
-	house2X: rolled.start.x - 1,
-	house2Y: rolled.start.y,
-	barnX: rolled.start.x + 1,
-	barnY: rolled.start.y,
-	// The Marketplace, and so the centre of the realm's reach — one tile north of the hamlet. Inside
-	// `findStart`'s cleared block and standing on nothing, so no other building has to move for it.
-	marketX: rolled.start.x,
-	marketY: rolled.start.y - 1,
-	// The settlers stand shoulder to shoulder on the row below, from characterX - 1.
-	characterX: rolled.start.x,
-	characterY: rolled.start.y + 1
-};
+export const STARTS: StartBlock[] = rolled.starts.map((s) => startBlockFor(s.x, s.y));
+
+/**
+ * The first opening — kept so every caller that only ever needed *a* legal start (the seed's own
+ * sanity checks, `scripts/map.ts`, `scripts/rules-check.ts`, the tests) keeps working unchanged.
+ * Not "where every realm opens" any more — see `STARTS` for that.
+ */
+export const START = STARTS[0];
 
 /** The whole map, row-major, one string per row — for `npm run map` and the distribution test. */
 export function terrainMap(): string[] {

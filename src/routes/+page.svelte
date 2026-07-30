@@ -251,10 +251,14 @@
 	}
 
 	let world = $state<WorldPayload | null>(null);
-	// Where the keyboard cursor starts if nothing is selected yet, and where the far tier's one pin
-	// sits — "the hamlet, or wherever the first body happens to be", the same fallback the centring
-	// effect above uses to open the map on load.
-	const home = $derived(world?.buildings[0] ?? world?.characters[0] ?? null);
+	// Where the keyboard cursor starts if nothing is selected yet, and where the far tier's own pin
+	// sits — "your own first building, or wherever your first body happens to be", the same fallback
+	// the centring effect above uses to open the map on load. `world.buildings` now carries every
+	// realm's, not just yours (VISION #4's reversal), so this has to filter to your own — otherwise
+	// the map could open centred on a stranger's hamlet.
+	const home = $derived(
+		world?.buildings.find((b) => b.playerId === world!.playerId) ?? world?.characters[0] ?? null
+	);
 	let message = $state('');
 	// Sticky: the server reports a lost realm on one response only, and a heartbeat refresh
 	// half a minute later must not quietly erase the notice before it has been read.
@@ -635,6 +639,11 @@
 	const selBuilt = $derived(
 		selected ? world?.buildings.find((b) => b.x === selected!.x && b.y === selected!.y) : undefined
 	);
+	// Whether the building on the selected tile is yours — `world.buildings` now carries every
+	// realm's (VISION #4's reversal), so every verb below that only makes sense on your own
+	// building (restyling a road, training, crafting) gates on this rather than on `selBuilt`
+	// merely existing.
+	const selMine = $derived(!!selBuilt && !!world && selBuilt.playerId === world.playerId);
 	const selSite = $derived(
 		selected
 			? world?.operations.find(
@@ -660,7 +669,14 @@
 	// offering, per the reach's own refusal (OUTSIDE_REACH).
 	const outsideReachToBuild = $derived(buildableHere && !selWithinReach);
 	// The building types the player owns, for greying a type whose realm-wide prerequisite isn't met.
-	const ownedTypeIds = $derived(new Set(world?.buildings.map((b) => b.buildingTypeId) ?? []));
+	// Filtered to your own — `world.buildings` now carries every realm's (VISION #4's reversal), and
+	// a prerequisite is "you own one", not "one exists anywhere on the map".
+	const ownedTypeIds = $derived(
+		new Set(
+			world?.buildings.filter((b) => b.playerId === world!.playerId).map((b) => b.buildingTypeId) ??
+				[]
+		)
+	);
 	// The menu for the selected tile: only types this terrain allows, each flagged if its
 	// prerequisite building isn't owned yet (greyed, "Requires a {name}").
 	const buildOptions = $derived.by(() => {
@@ -677,12 +693,18 @@
 	// The Build button is live only when the chosen type is actually placeable here — `chosen`
 	// persists across tiles, so a Quarry picked on an outcrop mustn't fire a doomed order on a meadow.
 	const chosenOk = $derived(buildOptions.some((o) => o.id === chosen && !o.blocked));
-	// Training is offered where a finished School stands on the selected tile.
-	const selIsSchool = $derived(!!selBuilt && typeName(selBuilt.buildingTypeId) === 'School');
+	// Training is offered where a finished School stands on the selected tile — yours: the inspector
+	// must not offer a verb on a building you don't own (the server would refuse it as MISSING_SCHOOL
+	// anyway, since that check is also ownership-scoped, but the button shouldn't be there to click).
+	const selIsSchool = $derived(
+		selMine && !!selBuilt && typeName(selBuilt.buildingTypeId) === 'School'
+	);
 	// A workshop is a *type* that carries a recipe — keyed on that rather than on the name 'Sawmill',
 	// which is the reskin column (VISION #10), so a Joinery needs no client change to offer its verb.
+	// Yours only, same reasoning as `selIsSchool`.
 	const selWorkshop = $derived.by(() => {
-		const t = selBuilt ? buildingTypeById.get(selBuilt.buildingTypeId) : undefined;
+		if (!selMine || !selBuilt) return undefined;
+		const t = buildingTypeById.get(selBuilt.buildingTypeId);
 		return t && t.producesResourceId !== null ? t : undefined;
 	});
 	// The batch in flight at the selected tile, if there is one. One at a time, so `find` is the
@@ -739,6 +761,9 @@
 	const roadTypeIds = $derived(
 		new Set(world?.buildingTypes.filter((t) => t.movementCost !== null).map((t) => t.id) ?? [])
 	);
+	// Every realm's roads, deliberately not just yours: a road is physically on the ground (VISION
+	// #4's reversal), so a network built by two neighbours still has to draw as one continuous road
+	// rather than stopping dead at whichever tile changed hands.
 	const roadTiles = $derived(
 		new Set(
 			world?.buildings
@@ -757,8 +782,9 @@
 	};
 	// The styles on offer for the selected road, from its *neighbours* rather than its current
 	// override — the choice is a property of the junction, not of what it is drawn as right now.
+	// Yours only: restyling is a verb, and the inspector must not offer one on a road you don't own.
 	const selRoadStyles = $derived(
-		selBuilt && roadTypeIds.has(selBuilt.buildingTypeId)
+		selMine && selBuilt && roadTypeIds.has(selBuilt.buildingTypeId)
 			? roadStyles(roadArms(selBuilt.x, selBuilt.y, isRoad, null))
 			: []
 	);
@@ -797,14 +823,18 @@
 	};
 	const allBuildingRows = $derived.by<Row[]>(() => {
 		if (!world) return [];
-		const rows: Row[] = world.buildings.map((b) => ({
-			key: `b${b.id}`,
-			x: b.x,
-			y: b.y,
-			typeId: b.buildingTypeId,
-			quality: b.quality,
-			state: 'built'
-		}));
+		// Yours only — `world.buildings` now carries every realm's (VISION #4's reversal), and a
+		// roster lists what you manage, not what everyone happens to have built.
+		const rows: Row[] = world.buildings
+			.filter((b) => b.playerId === world!.playerId)
+			.map((b) => ({
+				key: `b${b.id}`,
+				x: b.x,
+				y: b.y,
+				typeId: b.buildingTypeId,
+				quality: b.quality,
+				state: 'built' as const
+			}));
 		for (const o of world.operations) {
 			if (o.type !== 'build') continue;
 			rows.push({
@@ -1023,10 +1053,14 @@
 		>
 			{#if tier === 'close'}
 				<!-- Roads first, so anything standing beside one is painted over its arms rather than
-				     under them — and because a road is the ground, not a thing on it. -->
+				     under them — and because a road is the ground, not a thing on it. `foreign` (a
+				     player who isn't you) reads as muted art rather than a colour or an outline, so it
+				     survives being drawn at any size and never gets confused with the selection ring
+				     (blue outline) or a site under construction (dashed, see .site below). -->
 				{#each world.buildings.filter((b) => roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
 					<svg
 						class="over road"
+						class:foreign={b.playerId !== world.playerId}
 						viewBox="0 0 32 32"
 						style="transform: translate({b.x * cell}px, {b.y * cell}px)"
 					>
@@ -1041,6 +1075,7 @@
 				{#each world.buildings.filter((b) => !roadTypeIds.has(b.buildingTypeId)) as b (b.id)}
 					<svg
 						class="over"
+						class:foreign={b.playerId !== world.playerId}
 						viewBox="0 0 32 32"
 						style="transform: translate({b.x * cell}px, {b.y * cell}px)"
 					>
@@ -1082,15 +1117,21 @@
 						<use href="#i-pawn" />
 					</svg>
 				{/each}
-			{:else if tier === 'far' && home}
-				<!-- Pulled back far enough that individual tiles stop being the point — one mark for
-				     where the realm actually is, same fallback the map opens centred on. -->
-				<div
-					class="pin"
-					style="transform: translate({home.x * cell + cell / 2 - 5}px, {home.y * cell +
-						cell / 2 -
-						5}px)"
-				></div>
+			{:else if tier === 'far'}
+				<!-- Pulled back far enough that individual tiles stop being the point — one mark per
+				     realm, public now like `buildings` (VISION #4's reversal): yours reads as the same
+				     accent blue everything else on the map already uses for "this is yours" (the
+				     selection ring, the reach circle); everyone else's is muted grey — the far tier's
+				     own version of the `.foreign` treatment the close tier's buildings use. -->
+				{#each world.settlements as s (s.playerId)}
+					<div
+						class="pin"
+						class:foreign={s.playerId !== world.playerId}
+						style="transform: translate({s.x * cell + cell / 2 - 5}px, {s.y * cell +
+							cell / 2 -
+							5}px)"
+					></div>
+				{/each}
 			{/if}
 			<!-- The selection ring: a div rather than an outline on a button, now that a tile is a
 			     patch of canvas and not an element of its own to put an outline on. Drawn at every
@@ -1211,9 +1252,12 @@
 			{#if selBuilt}
 				<!-- The same band the estimate quoted, from the same function — so what you were
 					     promised and what stands there can never read differently. A building raised
-					     before quality was recorded says nothing, rather than "unknown". -->
+					     before quality was recorded says nothing, rather than "unknown" — and so does
+					     one that isn't yours, since quality is private (see WorldLive's own comment). -->
 				<p>
-					<b>{typeName(selBuilt.buildingTypeId)}</b> stands here.{#if selBuilt.quality !== null}{' '}<span
+					<b>{typeName(selBuilt.buildingTypeId)}</b> stands here.{#if !selMine}
+						<span class="price">Not yours.</span>
+					{:else if selBuilt.quality !== null}{' '}<span
 							class="price"
 							title="quality {selBuilt.quality.toFixed(2)}"
 							>{qualityBand(selBuilt.quality)} work.</span
@@ -1581,6 +1625,15 @@
 		opacity: 0.22;
 		outline-style: dotted;
 	}
+	/* Someone else's building (VISION #4's reversal made every realm's visible, not just yours) —
+	   desaturated and dimmed rather than recoloured, so the same treatment reads at whatever size
+	   the art is drawn: full detail up close, a flat coloured square further out, an icon-shaped
+	   silhouette either way. Filter, not opacity alone, is what keeps it legibly *muted* rather than
+	   merely faint — a faint building is easy to misread as your own site fading in. */
+	.foreign {
+		filter: grayscale(0.85) brightness(0.85);
+		opacity: 0.75;
+	}
 	/* The selected tile's ring, now a div rather than an outline on a button — the canvas underneath
 	   has no element of its own to put one on. Same trick as .site (outline, not border, so it sits
 	   over the art without shrinking it) and the same z-index .tile.selected used to carry, below
@@ -1594,8 +1647,10 @@
 		z-index: 1;
 		pointer-events: none;
 	}
-	/* The far tier's one mark: the settlement, not the selection. A filled dot rather than an
-	   outline — at a cell size this small an outline would be a hairline nobody could see. */
+	/* The far tier's marks: one per realm, not the selection. A filled dot rather than an outline —
+	   at a cell size this small an outline would be a hairline nobody could see. Blue is yours, the
+	   same accent colour the reach circle and the selection ring already use for "this is yours";
+	   .foreign is everyone else's, muted grey so your own realm still stands out at a glance. */
 	.pin {
 		position: absolute;
 		top: 0;
@@ -1607,6 +1662,9 @@
 		box-shadow: 0 0 0 2px #f5f2ea;
 		z-index: 2;
 		pointer-events: none;
+	}
+	.pin.foreign {
+		background: #8a8a8a;
 	}
 	/* Pinned to the window's right edge rather than laid out beside the map.
 

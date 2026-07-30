@@ -16,6 +16,7 @@ import {
 	resource,
 	settlement,
 	skill,
+	startPosition,
 	stock,
 	terrainType,
 	tile,
@@ -78,12 +79,12 @@ export type PlayerSession = {
 };
 
 /**
- * The rest of the start block, derived from the hamlet tile alone. `game_config` stores only
- * `start_x`/`start_y`, not six columns — worldgen.ts's `findStart` clears the same shape (a
- * second House to the hamlet's west, the Barn to its east, the settlers on the row below) when it
- * searches the generated ground, so re-deriving it here rather than storing it again is the same
- * fact read once instead of kept twice. Named once so a placement rule only has to be right in
- * one place, not repeated at every call site in `ensurePlayer`.
+ * The rest of the start block, derived from the hamlet tile alone. `start_position` stores only
+ * `x`/`y`, not six columns — worldgen.ts's `findStarts` clears the same shape (a second House to
+ * the hamlet's west, the Barn to its east, the settlers on the row below) for every opening it
+ * finds, so re-deriving it here rather than storing it again is the same fact read once instead of
+ * kept twice, for every start rather than just one. Named once so a placement rule only has to be
+ * right in one place, not repeated at every call site in `ensurePlayer`.
  */
 function startBlockFrom(hamletX: number, hamletY: number) {
 	return {
@@ -94,7 +95,7 @@ function startBlockFrom(hamletX: number, hamletY: number) {
 		barnX: hamletX + 1,
 		barnY: hamletY,
 		// The Marketplace, and so the centre of the realm's reach — one tile north of the hamlet,
-		// the exact tile worldgen.ts's START.marketX/marketY names.
+		// the exact tile worldgen.ts's startBlockFor's marketX/marketY names.
 		marketX: hamletX,
 		marketY: hamletY - 1,
 		characterX: hamletX,
@@ -154,18 +155,40 @@ export async function ensurePlayer(id: number | null): Promise<PlayerSession> {
 		if (resources.length === 0)
 			throw new Error('no resource rows — run `npm run seed` against this database');
 
-		// Where a realm opens is a fact about the terrain, generated once at seed time rather than
-		// on every cold start (see worldgen.ts's own header). A row with no start position is a
-		// database seeded before this column existed — the same "run npm run seed" throw every
-		// other missing-catalog-row case in this file already gives, never a guessed coordinate.
-		const [cfg] = await tx.select().from(gameConfig);
-		if (!cfg || cfg.startX === null || cfg.startY === null)
-			throw new Error(
-				'no start position in game_config — run `npm run seed` against this database'
-			);
-		const start = startBlockFrom(cfg.startX, cfg.startY);
-
 		const [p] = await tx.insert(player).values({}).returning();
+
+		// Claims the first unclaimed opening the seed found (worldgen.ts's `findStarts`), atomically:
+		// the subquery's `FOR UPDATE SKIP LOCKED` is what lets two realms created at the same moment
+		// each win a *different* row instead of both reading the same "first unclaimed" one and
+		// racing to update it — the loser would either overwrite the winner's claim or, under a
+		// naive read-then-write, land on the very same tile the winner just took. `ORDER BY id` is
+		// what makes "first" mean anything: start_position rows are seeded closest-to-the-map's-
+		// centre first, so realms fill in from the middle outward the same deterministic way every
+		// time.
+		const [claimed] = await tx.execute<{ x: number; y: number }>(sql`
+			UPDATE start_position
+			SET claimed_by_player_id = ${p.id}
+			WHERE id = (
+				SELECT id FROM start_position
+				WHERE claimed_by_player_id IS NULL
+				ORDER BY id
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
+			RETURNING x, y
+		`);
+		// Every unsatisfiable precondition in this function throws rather than degrading — a world
+		// with nowhere left to put a realm is exactly that, not a case to paper over with a guessed
+		// coordinate. Counted fresh rather than cached, since it only ever runs on the one read that
+		// is about to fail.
+		if (!claimed) {
+			const [{ total }] = await tx
+				.select({ total: sql<number>`count(*)::int` })
+				.from(startPosition);
+			throw new Error(`the world is full — all ${total} start position(s) are claimed`);
+		}
+		const start = startBlockFrom(claimed.x, claimed.y);
+
 		const [s] = await tx
 			.insert(settlement)
 			.values({ playerId: p.id, x: start.hamletX, y: start.hamletY })
@@ -1014,11 +1037,19 @@ export type EstimateResult =
  * which way it is going until it has looked.
  *
  * **Per player, because roads are.** A tile's cost is what is *built* on it if that changes the
- * ground, else the terrain's own — and buildings are player-scoped under VISION #4's interim
- * override, so your roads speed your people up and nobody else's. That used to mean one query
- * joining the whole grid against this player's buildings every call, which was the second full-grid
- * read this write path paid (see `loadStaticWorld`'s own note) — now the whole-grid part comes from
- * the shared memo and only this player's own roads are read fresh: a handful of rows, not 16,384.
+ * ground, else the terrain's own — and only this player's own roads are read fresh here, so your
+ * roads speed your people up and nobody else's. That used to mean one query joining the whole grid
+ * against this player's buildings every call, which was the second full-grid read this write path
+ * paid (see `loadStaticWorld`'s own note) — now the whole-grid part comes from the shared memo and
+ * only this player's own roads are read fresh: a handful of rows, not the whole grid.
+ *
+ * ponytail: still per-player even though building *occupancy* (which this comment used to justify
+ * that with, under VISION #4's interim override) is world-shared now — a road is physically on the
+ * ground the same way a building is, so the honest end state is every player's road speeding every
+ * walker across it. Left alone here because it is out of this pass's requested scope (occupancy and
+ * the read path, not routing), and it touches `route`'s cost function on every order and estimate —
+ * a bigger, more careful change than dropping a WHERE clause. Un-scope the buildings read in this
+ * function (and its "own roads only" framing above) the day shared roads matter.
  */
 async function loadGrid(
 	tx: Tx,
@@ -1216,16 +1247,24 @@ async function planBuild(
 	// a sphere of influence, not a building permit — gates a gather assignment too (`assignWorker`),
 	// same reason, same `OUTSIDE_REACH`. Crafting and training get no matching check: both happen at
 	// a building, and a building is necessarily inside the reach that let it be built.
+	//
+	// Reaches may overlap — two realms opened close enough (or grown wide enough) can each have this
+	// tile inside their own circle, and both are entitled to try. Nothing here arbitrates that: no
+	// territory contest, no priority by whose reach is bigger or older (VISION's "expansion &
+	// borders" is deliberately parked). The occupancy check right below is what actually decides an
+	// overlap — first come, first served, the same as anywhere else on the map.
 	if (!withinReach(x, y, await reachOf(tx, playerId)))
 		return { ok: false, reason: 'OUTSIDE_REACH' };
 
-	// ponytail: occupancy is scoped to the player, so each visitor plays an isolated
-	// sandbox on the shared map (VISION #4 interim override). Un-scope both of these —
-	// and building_tile_idx — to restore world-global tile ownership.
+	// VISION #4's reversal: a tile is a physical place again, world-wide — these two checks used to
+	// be scoped to `playerId` (each visitor's own isolated sandbox on the shared map, an interim
+	// testing override) and are not any more, so `TILE_OCCUPIED` now fires across realms: someone
+	// else's building, or someone else's build already under way, blocks yours exactly as your own
+	// would. `building_tile_idx` carries the same change at the DB level.
 	const [existing] = await tx
 		.select()
 		.from(building)
-		.where(and(eq(building.playerId, playerId), eq(building.x, x), eq(building.y, y)));
+		.where(and(eq(building.x, x), eq(building.y, y)));
 	if (existing) return { ok: false, reason: 'TILE_OCCUPIED' };
 
 	// Unfinished builds count as occupancy too, or two orders stack on one tile — *including*
@@ -1237,7 +1276,6 @@ async function planBuild(
 		.from(operation)
 		.where(
 			and(
-				eq(operation.playerId, playerId),
 				ne(operation.status, 'completed'),
 				eq(operation.type, 'build'),
 				eq(operation.destX, x),
@@ -2095,7 +2133,15 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 	// needs isSustenance for the food-rate calculation below, which never goes on the wire itself.
 	const resources = await tx.select().from(resource);
 	const drawn = await tx.select().from(tileStock).where(eq(tileStock.playerId, playerId));
-	const buildings = await tx.select().from(building).where(eq(building.playerId, playerId));
+	// PUBLIC now (VISION #4's reversal) — every realm's buildings, not just this player's, because
+	// what stands on the map is a fact about the map. Cheap at today's scale (~680 rows across 167
+	// realms — see the type's own comment); ponytail: a full read, not a viewport-scoped one — cull
+	// to the client's visible tiles the day the building count actually makes this read heavy.
+	const buildings = await tx.select().from(building);
+	// PUBLIC, same reasoning: every realm's anchor and whose it is.
+	const settlements = await tx
+		.select({ x: settlement.x, y: settlement.y, playerId: settlement.playerId })
+		.from(settlement);
 	const characters = await tx.select().from(character).where(eq(character.playerId, playerId));
 	const operations = await tx
 		.select()
@@ -2177,6 +2223,7 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 	return {
 		now: new Date(now).toISOString(),
 		worldVersion: cfg.worldVersion,
+		playerId,
 		reach,
 		tileQuantity,
 		stock: held.map((s) => ({ ...s, ratePerHour: rates.get(s.resourceId) ?? 0 })),
@@ -2185,9 +2232,13 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 			x: b.x,
 			y: b.y,
 			buildingTypeId: b.buildingTypeId,
-			quality: b.quality,
+			playerId: b.playerId,
+			// Workmanship is your ledger, not the ground — null it out on a building you don't own,
+			// the same "public position, private detail" split the type's own comment describes.
+			quality: b.playerId === playerId ? b.quality : null,
 			roadMask: b.roadMask
 		})),
+		settlements,
 		characters: characters.map((c) => ({
 			id: c.id,
 			x: c.x,

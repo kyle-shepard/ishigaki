@@ -77,9 +77,13 @@ Still worth your attention:
 
 - **`npm run egress`** reports rows sent and what they cost. Run it after any work that touches the
   database, and report the number. It exists because nothing warned us the first time.
-- The memo is **per lambda instance** — each spin-up re-pays one ~1.3 MB grid read. Fine at two
-  orders of magnitude under the old per-hour cost; the upgrade path is a blob/CDN artifact (#21
-  architecture C), which also takes distant terrain out of the database entirely.
+- The memo is **per lambda instance** — each spin-up re-pays one grid read, ~1.3 MB at the
+  128×128 grid this was measured against. The grid moved to 256×256 (65,536 tiles) for the
+  shared-world reversal (VISION #4), which roughly quadruples that to ~5 MB — still two orders of
+  magnitude under the old per-hour cost, and most cold instances should never reach it at all once
+  the edge is serving `/api/world/static/[version]`. Re-measure with `npm run egress` the next
+  time this number matters; the upgrade path is a blob/CDN artifact (#21 architecture C), which
+  also takes distant terrain out of the database entirely.
 - **`route()` and `loadGrid` still scale with world area**, so the ceiling is ~1024²–2048² tiles.
   Past that the terrain artifact must go chunked and routing viewport-scoped.
 - Beware anything that loops HTTP requests (`npm run check:rules` is ~110 calls a run) and beware

@@ -1,7 +1,7 @@
 // Run: npm run map — prints the world the seed would write, coloured, with a tile census.
 // No database, no arguments. This is how the generator's thresholds get tuned: change them in
 // worldgen.ts, run this, look at it.
-import { MAP_SEED, START, terrainMap } from '../src/lib/features/world/worldgen.ts';
+import { MAP_SEED, STARTS, terrainMap, WORLD_SEED } from '../src/lib/features/world/worldgen.ts';
 
 // Rough ANSI stand-ins for each terrain's tile colour, so a lake reads as a lake at a glance.
 const PAINT: Record<string, string> = {
@@ -18,13 +18,12 @@ const PAINT: Record<string, string> = {
 // Plain when piped or when NO_COLOR is set — 2304 escape sequences are unreadable in a file.
 const colour = !!process.stdout.isTTY && !process.env.NO_COLOR;
 const rows = terrainMap();
-// The starting buildings, overlaid on the terrain rather than counted as it — the census below is
-// about the ground. Seeing where the hamlet landed is half the reason to print the map.
-const marks = new Map([
-	[`${START.house2X},${START.house2Y}`, 'H'],
-	[`${START.hamletX},${START.hamletY}`, 'H'],
-	[`${START.barnX},${START.barnY}`, 'B']
-]);
+// One mark per opening `findStarts` found — base-36 so a two-digit start count still fits one
+// character (0-9 then a-z), closest-to-the-map's-centre first, so the numbering itself shows the
+// search order. Only the hamlet tile is marked, not its whole block (house2/barn/market): with
+// potentially dozens of openings on a big map, marking every tile of every start would bury the
+// terrain the census is about under its own overlay.
+const marks = new Map(STARTS.map((s, i) => [`${s.hamletX},${s.hamletY}`, i.toString(36)]));
 rows.forEach((row, y) =>
 	console.log(
 		[...row]
@@ -42,8 +41,9 @@ const census = [...rows.join('')].reduce<Record<string, number>>(
 	{}
 );
 console.log(
-	`\nseed ${MAP_SEED} · hamlet at ${START.hamletX}, ${START.hamletY} · ` +
-		`${rows.length}×${rows.length} = ${total} tiles · ` +
+	`\nseed ${MAP_SEED} (${MAP_SEED - WORLD_SEED} reroll(s) from ${WORLD_SEED}) · ` +
+		`${rows.length}×${rows.length} = ${total} tiles · ${STARTS.length} start(s), closest at ` +
+		`${STARTS[0].hamletX}, ${STARTS[0].hamletY} · ` +
 		Object.entries(census)
 			.sort((a, b) => b[1] - a[1])
 			.map(([c, n]) => `${c} ${n} (${Math.round((n / total) * 100)}%)`)

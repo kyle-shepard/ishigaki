@@ -17,11 +17,9 @@ const BASE = process.env.RULES_CHECK_URL ?? 'http://localhost:5173';
 // whatever the generator drew on the day this was written, and silently started testing the
 // wrong thing the next time WORLD_SEED changed — which is exactly what happened to the forty-odd
 // hardcoded coordinates this file used to carry.
-import { START } from '../src/lib/features/world/worldgen.ts';
 import { START_REACH_RADIUS, withinReach } from '../src/lib/features/world/world.ts';
 
-// Every request carries the same cookie, so all cases play in one player's sandbox — the
-// occupancy checks are player-scoped and would read a different world otherwise.
+// Every request carries the same cookie, so all cases in one group play in one player's sandbox.
 let cookie = '';
 
 async function api(path: string, init?: RequestInit) {
@@ -31,7 +29,13 @@ async function api(path: string, init?: RequestInit) {
 	});
 	const set = res.headers.getSetCookie?.()[0];
 	if (set) cookie = set.split(';')[0];
-	return { status: res.status, body: await res.json() };
+	// Not every endpoint answers with a document. `/api/new-game` returns 204 and no body at all,
+	// and `/api/world/static/<version>` 404s bodyless on a stale version — an unconditional
+	// `res.json()` throws "Unexpected end of JSON input" on both, which reads like a broken server
+	// rather than a response that was never meant to have content. The status is the answer in those
+	// cases; `body` is `null` and the caller checks `status`.
+	const text = await res.text();
+	return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
 // GET /api/world returns only the *live* half now (issue #21 architecture A): the terrain grid and
@@ -57,6 +61,37 @@ async function readWorld() {
 		staticsVersion = version;
 	}
 	return { status: live.status, body: { ...statics, ...live.body } };
+}
+
+// Occupancy is world-shared now (VISION #4's reversal), so a bare `cookie = ''` no longer buys a
+// case a fresh, unoccupied map the way it did when every sandbox was invisible to every other —
+// the ground a case built on yesterday's realm is still built on today's. It also runs up against
+// a finite resource: start_position holds one row per opening `findStarts` found on the map
+// (eleven on the seeded 256×256 world at the time of writing), and this file resets its sandbox
+// roughly twenty times a run.
+//
+// `deletePlayer` (the "New game" verb, `/api/new-game`) is what solves both problems at once, for
+// free: it deletes the outgoing realm's buildings — so the ground it stood on is unoccupied again —
+// and frees the start_position row it held (`ON DELETE SET NULL`) rather than leaving it claimed
+// forever. Freeing before minting means at most one of this script's own realms is ever alive, so a
+// twenty-reset run never draws the pool down however small it is.
+//
+// What it does **not** buy is a fixed address. `ensurePlayer` claims the lowest-id *unclaimed* row,
+// and "unclaimed" depends on every other realm in the world — including one left behind by a run
+// that crashed before it could free its own. So a new realm may well open somewhere else, and every
+// coordinate below is resolved from `START`, which `openingOf` re-reads from the wire on each reset.
+// An earlier version of this comment claimed the opening was always the same one and imported
+// worldgen's `START` on the strength of it; the result was a run that opened at a different hamlet
+// and reported every case as OUTSIDE_REACH.
+async function newRealm() {
+	if (cookie) await api('/api/new-game', { method: 'POST' });
+	cookie = '';
+	const w = await readWorld();
+	// The new realm may hold a different opening than the outgoing one did, so everything derived
+	// from where "here" is has to be re-resolved rather than captured once at startup.
+	START = openingOf(w.body);
+	currentReach = w.body.reach;
+	return w;
 }
 
 // Orders and assignments take world coordinates straight through now — there's no authored
@@ -106,6 +141,39 @@ const heldOf = (w: Held, name: string) => {
 };
 const woodHeld = (w: Held) => heldOf(w, 'Wood');
 
+// Where *this* realm actually opened, read off the wire rather than imported from worldgen.
+//
+// It used to be `import { START }` — worldgen's first opening — and that was true for as long as
+// every realm in existence opened on the same tile. It is not true now: `findStarts` offers fifteen
+// openings on the seeded 256×256 world and `ensurePlayer` claims the lowest-id *unclaimed* one, so
+// which opening this script gets depends on what else is alive. A run that crashed before freeing its
+// realm leaves its claim behind, the next run opens somewhere else entirely, and every coordinate
+// derived from `START` then names ground on the far side of the map — which reads as a pile of
+// OUTSIDE_REACH failures rather than as a stale claim, and is exactly how this was found.
+//
+// So the script asks its own realm where it is. Same shape as the old START (the start block is
+// always laid out identically around whichever hamlet tile it got), just resolved at run time, and
+// robust to which of the fifteen openings this run happens to hold.
+function openingOf(w: {
+	playerId: number;
+	settlements: { playerId: number; x: number; y: number }[];
+}) {
+	const mine = w.settlements.find((s) => s.playerId === w.playerId);
+	if (!mine) throw new Error('this realm has no settlement — did ensurePlayer run?');
+	return {
+		hamletX: mine.x,
+		hamletY: mine.y,
+		marketX: mine.x,
+		marketY: mine.y - 1,
+		characterX: mine.x,
+		characterY: mine.y + 1
+	};
+}
+let START = openingOf(world.body);
+// The circle this realm may work in. Re-read with START on every reset for the same reason: a new
+// realm can hold a different opening, so a tile that was in reach a moment ago need not be now.
+let currentReach = world.body.reach;
+
 // A realm now starts with nothing, so a costed building can't be used to assert anything
 // about *terrain* — every such order would be refused for want of Wood, and the check would
 // pass or fail for the wrong reason. The uncosted type is the one that isolates ground rules
@@ -127,18 +195,20 @@ const assign = (x: number, y: number) =>
 // name gets the same ground.
 //
 // Nearest, and it is load-bearing rather than tidy. Row-major order means "the first Forest" is
-// somewhere along the map's top edge, and the hamlet is wherever `findStart` put it — on a 128×128
-// world those are ~100 tiles apart, so every case that actually *builds* on found ground paid for a
-// worker to walk the entire map first. That is real game time this script then has to sleep
-// through: one build measured 426 seconds, and with ten of them the run went from minutes to over
-// an hour. Distance is not what any of these cases is testing, so it is bought back to nearly zero
-// here. Chebyshev, matching the 8-directional step `route` actually walks.
+// somewhere along the map's top edge, and the hamlet is wherever `findStarts` put it — on the
+// 128×128 world this was first measured against, those were ~100 tiles apart, so every case that
+// actually *builds* on found ground paid for a worker to walk the entire map first. That is real
+// game time this script then has to sleep through: one build measured 426 seconds, and with ten of
+// them the run went from minutes to over an hour. Distance is not what any of these cases is
+// testing, so it is bought back to nearly zero here. Chebyshev, matching the 8-directional step
+// `route` actually walks.
 //
 // Ground the realm already stands on is skipped, or "nearest" would hand back the hamlet's own
 // tile — every realm opens with buildings on Meadow, so the closest Meadow to the hamlet *is* the
 // hamlet — and a case meaning to assert "plain ground accepts a building" would be refused for
-// occupancy instead. Read off the opening payload, which every fresh sandbox below starts from
-// identically: START is the same for every player (VISION #4 interim override).
+// occupancy instead. Read off the opening payload — every fresh sandbox `newRealm()` mints below
+// still opens at this same physical spot (see its own comment for why), so this set never goes
+// stale mid-run.
 const startBuildings = new Set(
 	world.body.buildings.map((b: { x: number; y: number }) => b.y * world.body.gridSize + b.x)
 );
@@ -158,13 +228,35 @@ function findMany(name: string, n: number): { x: number; y: number }[] {
 }
 const find = (name: string) => findMany(name, 1)[0];
 
-// Found once, reused everywhere below that needs "a tile of this kind" — every one of these is a
-// fresh-sandbox check (a new player, cookie reset), so the same physical tile being asked about
-// twice is never the same *build* twice.
+// Found once, reused everywhere below that needs "a tile of this kind" — every case that actually
+// builds on one of these calls `newRealm()` first (a fresh player, fresh ground at the same spot),
+// so the same physical tile being asked about twice is never the same *build* twice.
 const meadow = find('Meadow');
 const forest = find('Forest');
 const mountain = find('Mountain');
 const ironVein = find('Iron vein');
+const reachable = (name: string, n: number) => {
+	// 200 nearest as the pool, which on any sane start comfortably covers the circle; the filter is
+	// what actually decides. Throws rather than returning short, because coming up empty here means
+	// the start guarantee in worldgen.ts has slipped and every case below would fail confusingly.
+	const inReach = findMany(name, 200)
+		.filter((t) => withinReach(t.x, t.y, currentReach))
+		.slice(0, n);
+	if (inReach.length < n)
+		throw new Error(
+			`only ${inReach.length} ${name} tile(s) inside the opening reach, need ${n} — the start guarantee in worldgen.ts has slipped`
+		);
+	return inReach;
+};
+
+// Stone, resolved per realm rather than once. It is ~2% of the map, so the nearest outcrop by
+// `findMany`'s Chebyshev-from-the-hamlet ordering is very often outside the Euclidean radius-6
+// circle around the Marketplace — the same units mismatch that bit `occupyEveryone`. A case that
+// expects an outcrop to *accept* a Quarry needs one this realm may actually reach, and which realm
+// that is changes on every reset, so this is a call and not a constant. The terrain-refusal cases
+// below keep using `find`: they assert TILE_NOT_BUILDABLE, which the server decides before it ever
+// consults the reach, so any outcrop on the map does for them.
+const stoneInReach = () => reachable('Stone outcrop', 1)[0];
 const stoneOutcrop = find('Stone outcrop');
 const clayPit = find('Clay pit');
 
@@ -191,8 +283,7 @@ for (const [name, tile] of [
 	['Meadow', meadow],
 	['Forest', forest]
 ] as [string, { x: number; y: number }][]) {
-	cookie = '';
-	await readWorld();
+	await newRealm();
 	const r = await order(tile.x, tile.y, free);
 	check(`(${tile.x},${tile.y}) ${name.toLowerCase()} is accepted`, r.status, 200);
 }
@@ -200,31 +291,32 @@ for (const [name, tile] of [
 // The deposit rule cuts both ways, and terrain is judged before cost — so even a costed type shows
 // the ground rule cleanly. An extractor belongs only on its deposit; a plain building never does.
 const quarry = typeId('Quarry');
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	'a Quarry is refused on a meadow — an extractor may not squat on plain ground',
 	[(await order(meadow.x, meadow.y, quarry)).body.reason],
 	['TILE_NOT_BUILDABLE']
 );
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	'a House is refused on an iron vein — a plain building may not squat on a deposit',
 	[(await order(ironVein.x, ironVein.y, house)).body.reason],
 	['TILE_NOT_BUILDABLE']
 );
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	'a Quarry is accepted on a Stone outcrop — the deposit offers exactly its extractor',
-	(await order(stoneOutcrop.x, stoneOutcrop.y, quarry)).status,
+	(
+		await (async () => {
+			const s = stoneInReach();
+			return order(s.x, s.y, quarry);
+		})()
+	).status,
 	200
 );
 
 // Unregressed: the rules that existed before terrain did.
-cookie = '';
-await readWorld();
+await newRealm();
 const oob = await order(world.body.gridSize, 0, free);
 check(
 	`(${world.body.gridSize},0) is off the map`,
@@ -270,24 +362,21 @@ function reachEdge(dist: number): { x: number; y: number } {
 const insideEdge = reachEdge(world.body.reach.radius);
 const outsideEdge = reachEdge(world.body.reach.radius + 1);
 
-cookie = '';
-await readWorld();
+await newRealm();
 const buildOutside = await order(outsideEdge.x, outsideEdge.y, free);
 check(
 	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a build`,
 	[buildOutside.status, buildOutside.body.reason],
 	[400, 'OUTSIDE_REACH']
 );
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same build`,
 	(await order(insideEdge.x, insideEdge.y, free)).status,
 	200
 );
 
-cookie = '';
-await readWorld();
+await newRealm();
 const gatherOutside = await assign(outsideEdge.x, outsideEdge.y);
 check(
 	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a gather too — it's a` +
@@ -295,8 +384,7 @@ check(
 	[gatherOutside.status, gatherOutside.body.reason],
 	[400, 'OUTSIDE_REACH']
 );
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same gather`,
 	(await assign(insideEdge.x, insideEdge.y)).status,
@@ -310,8 +398,7 @@ check(
 // after a build and a real wait — as much population movement as a bounded script can afford (real
 // growth takes on the order of 30 real minutes at the seeded rate) — to prove what ran was the
 // ratchet and not a plain assignment that would have (correctly, here) produced the same number.
-cookie = '';
-const ratchetStart = await readWorld();
+const ratchetStart = await newRealm();
 check(
 	'a fresh realm opens at exactly the first reach milestone',
 	ratchetStart.body.reach.radius,
@@ -337,8 +424,7 @@ check(
 //
 // What stays is the half only a running server can show: an order comes back with a walked path,
 // ending on the tile that was asked for.
-cookie = '';
-const travelWorld = await readWorld();
+const travelWorld = await newRealm();
 const gridSize = travelWorld.body.gridSize;
 const reach = travelWorld.body.reach;
 const occupiedTiles = new Set(
@@ -380,8 +466,7 @@ check(
 // The runway and the refund path. A fresh realm no longer starts empty — it arrives stocked
 // (VISION #10) so it can build before it has to gather. Stock is asserted off the payload's own
 // numbers, same rule as the travel legs.
-cookie = '';
-const fresh = await readWorld();
+const fresh = await newRealm();
 const woodStart = woodHeld(fresh.body);
 check('a new realm arrives with a Wood runway', woodStart > 0, true);
 
@@ -424,8 +509,7 @@ check(
 // The realm-wide build prerequisite: a Stone wall needs a Quarry standing *anywhere* first. With
 // none owned it is refused before terrain or cost matter — a distinct reason from the tile-local
 // MISSING_REQUIRED_BUILDING that gates gathering.
-cookie = '';
-await readWorld();
+await newRealm();
 const stoneWall = typeId('Stone wall');
 check(
 	'a Stone wall with no Quarry owned is refused as a missing prerequisite',
@@ -477,8 +561,7 @@ check(
 // deposit must report both numbers, and an infinite one must report neither, or the client
 // would render "0 of null" on a quarry. Watching a forest actually thin is the rate-cranked
 // manual pass — at 3 Wood an hour it takes eight hours, which is the mechanic working.
-cookie = '';
-const map = await readWorld();
+const map = await newRealm();
 const at = (x: number, y: number) => y * map.body.gridSize + x;
 const terrainCapacity = (name: string) =>
 	map.body.terrainTypes.find((t: { displayName: string }) => t.displayName === name).capacity;
@@ -500,11 +583,14 @@ check(
 
 // The quarry gate. Wood and forage need a person; stone needs the structure first, and the
 // structure has to be on the tile being worked — not merely somewhere in the realm.
-cookie = '';
-await readWorld();
-const bare = await assign(stoneOutcrop.x, stoneOutcrop.y);
+await newRealm();
+// In reach, not merely on the map: the reach gate runs before the requires-a-Quarry rule, so a
+// distant outcrop would be refused OUTSIDE_REACH and this case would pass for the wrong reason —
+// or, as it did, fail while looking like the quarry gate had broken.
+const bareStone = stoneInReach();
+const bare = await assign(bareStone.x, bareStone.y);
 check(
-	`(${stoneOutcrop.x},${stoneOutcrop.y}) a stone outcrop with no quarry on it is refused`,
+	`(${bareStone.x},${bareStone.y}) a stone outcrop with no quarry on it is refused`,
 	[bare.status, bare.body.reason],
 	[400, 'MISSING_REQUIRED_BUILDING']
 );
@@ -520,8 +606,7 @@ check(
 // three, which is why 3 is the crowd here.)
 const crewed: Record<number, { workers: number; seconds: number }> = {};
 for (const size of [1, 3]) {
-	cookie = '';
-	await readWorld();
+	await newRealm();
 	const r = await order(meadow.x, meadow.y, free, size);
 	const op = r.body.operations?.[0];
 	if (!op) throw new Error(`crew-of-${size} order was refused: ${JSON.stringify(r.body)}`);
@@ -539,8 +624,7 @@ check(
 );
 // crewSize is a maximum, not a demand: asking for more bodies than the realm holds takes
 // everyone rather than refusing. Without this, a hopeful number would be a dead end.
-cookie = '';
-const small = await readWorld();
+const small = await newRealm();
 const everyone = await order(meadow.x, meadow.y, free, 99);
 check(
 	'asking for more hands than you have sends everyone, rather than refusing',
@@ -558,8 +642,7 @@ const estimateOf = (x: number, y: number, buildingTypeId: number, crewSize: numb
 	});
 
 for (const size of [1, 3]) {
-	cookie = '';
-	await readWorld();
+	await newRealm();
 	const quote = await estimateOf(meadow.x, meadow.y, free, size);
 	const placed = await order(meadow.x, meadow.y, free, size);
 	const op = placed.body.operations?.[0];
@@ -574,8 +657,7 @@ for (const size of [1, 3]) {
 }
 
 // A refusal previews as the same refusal, rather than as a number nobody can act on.
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	'estimating an unbuildable tile refuses with the reason the order would give',
 	[
@@ -597,8 +679,7 @@ check(
 // Deliberately the slow case — it waits out a real build — because without it "preview = outcome"
 // is only ever proved as far as the operation, and the durable output this epic exists to capture
 // would have no check at all.
-cookie = '';
-await readWorld();
+await newRealm();
 const promised = await estimateOf(meadow.x, meadow.y, free, 3);
 const raised = await order(meadow.x, meadow.y, free, 3);
 const rising = raised.body.operations?.[0];
@@ -647,8 +728,7 @@ const professionId = (name: string) => {
 	return p.id;
 };
 
-cookie = '';
-await readWorld();
+await newRealm();
 // A fresh realm is three settlers, so it has no Mason at all. This *queues* rather than refusing —
 // an unsatisfiable filter and a realm where everyone is busy are the same situation, and both
 // resolve themselves the moment a qualifying worker exists.
@@ -669,8 +749,7 @@ check(
 	[400, 'UNKNOWN_PROFESSION']
 );
 // Unchecking everything is not "nobody may build this".
-cookie = '';
-await readWorld();
+await newRealm();
 check(
 	'an empty filter means anyone, not nobody',
 	(await restricted(meadow.x, meadow.y, [])).status,
@@ -686,26 +765,12 @@ check(
 // steps away diagonally sits 7.07 from the centre, outside a radius-6 circle. Anything below that
 // means to *occupy* workers wants this list rather than that one, because a refused assignment
 // quietly leaves somebody idle and the next case sees a build start when it expected one to queue.
-const reachable = (name: string, n: number) => {
-	// 200 nearest as the pool, which on any sane start comfortably covers the circle; the filter is
-	// what actually decides. Throws rather than returning short, because coming up empty here means
-	// the start guarantee in worldgen.ts has slipped and every case below would fail confusingly.
-	const inReach = findMany(name, 200)
-		.filter((t) => withinReach(t.x, t.y, world.body.reach))
-		.slice(0, n);
-	if (inReach.length < n)
-		throw new Error(
-			`only ${inReach.length} ${name} tile(s) inside the opening reach, need ${n} — the start guarantee in worldgen.ts has slipped`
-		);
-	return inReach;
-};
 
 const occupyEveryone = async () => {
 	for (const { x, y } of reachable('Forest', 3)) await assign(x, y);
 };
 
-cookie = '';
-const busyRealm = await readWorld();
+const busyRealm = await newRealm();
 const woodBefore = woodHeld(busyRealm.body);
 await occupyEveryone();
 const heldUp = await order(meadow.x, meadow.y, house);
@@ -744,8 +809,7 @@ check(
 );
 
 // Cancelling a queued build is the same delete-and-refund path, and just as un-duplicable.
-cookie = '';
-const q2 = await readWorld();
+const q2 = await newRealm();
 const woodQ2 = woodHeld(q2.body);
 await occupyEveryone();
 const toCancel = (await order(meadow.x, meadow.y, house)).body.operations?.find(
@@ -813,8 +877,7 @@ type WireOp = {
 };
 const craftOp = (w: { operations: WireOp[] }) => w.operations.find((o) => o.type === 'craft');
 
-cookie = '';
-const shopStart = await readWorld();
+const shopStart = await newRealm();
 const woodAtStart = woodHeld(shopStart.body);
 const raising = await order(...mill, sawmill, 3);
 const millSite = raising.body.operations?.find((o: { type: string }) => o.type === 'build');
@@ -917,7 +980,14 @@ check(
 	'the finished batch is gone from the wire, and left no building behind',
 	[
 		craftOp(realm) === undefined,
-		realm.buildings.filter((b: { buildingTypeId: number }) => b.buildingTypeId === sawmill).length
+		// Yours only: `buildings` is world-shared now (VISION #4's reversal), so counting every
+		// Sawmill on the map would be thrown off by whatever else the dev database happens to
+		// hold — this asserts about *this* realm's own building, which is what "left no building
+		// behind" actually means.
+		realm.buildings.filter(
+			(b: { playerId: number; buildingTypeId: number }) =>
+				b.playerId === realm.playerId && b.buildingTypeId === sawmill
+		).length
 	],
 	[true, 1]
 );
@@ -1140,8 +1210,7 @@ check(
 	false
 );
 
-cookie = '';
-const ladder = await readWorld();
+const ladder = await newRealm();
 check(
 	'a fresh realm is rich in Wood and still cannot buy a Longhouse',
 	[woodHeld(ladder.body) >= 100, (await order(...spare, longhouse, 3)).body.reason],
@@ -1192,6 +1261,12 @@ check(
 	(await order(...spare, longhouse, 3)).body.reason,
 	'INSUFFICIENT_RESOURCES'
 );
+
+// Frees the one start position this run still holds — every earlier realm was already freed by
+// the `newRealm()` that replaced it, but the last one never got a successor. Without this a run
+// leaves exactly one opening claimed behind, and repeated runs would slowly run the finite pool
+// down instead of returning it to what they found.
+if (cookie) await api('/api/new-game', { method: 'POST' });
 
 console.log(failures ? `\n${failures} failed` : '\nall rules enforced server-side');
 process.exit(failures ? 1 : 0);

@@ -204,6 +204,13 @@
       "when": 1785378699350,
       "tag": "0028_fast_hardball",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1785383653935,
+      "tag": "0029_open_sumo",
+      "breakpoints": true
     }
   ]
 }

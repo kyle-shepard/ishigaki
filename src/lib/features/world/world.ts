@@ -1,10 +1,12 @@
 // Client-safe: shared constants, wire types, and the position math. No db imports.
 
-// 128×128 — the first clean cut (see WORLD_SEED in worldgen.ts). Past hand-authoring, so the
-// whole grid comes from worldgen.ts's generator now; nothing here still names an authored core.
-export const GRID_SIZE = 128;
+// 256×256 — widened from the first clean cut (128) so more than a handful of realms can open
+// without claiming nearly all the usable land between them (measured on the 128 map: six mature
+// reaches claimed 94% of it). See WORLD_SEED in worldgen.ts. The whole grid comes from
+// worldgen.ts's generator; nothing here still names an authored core.
+export const GRID_SIZE = 256;
 
-// START used to live here. It is derived from the terrain now — see `findStart` in worldgen.ts —
+// START used to live here. It is derived from the terrain now — see `findStarts` in worldgen.ts —
 // because a written-down coordinate cannot notice that the ground under it has become a lake.
 
 // Zoom is continuous, but what the client draws is not — three named tiers, and these two numbers
@@ -30,12 +32,19 @@ export const TIER_CLOSE_MIN = 24; // at or above this: full art, and buildings/p
 export const TIER_DETAIL_MIN = 18;
 
 // The opening reach radius — one number, two jobs. It is the first rung of the seeded
-// reach_milestone table, and it is the circle `findStart` (worldgen.ts) must guarantee holds a
+// reach_milestone table, and it is the circle `findStarts` (worldgen.ts) must guarantee holds a
 // Forest and a Stone outcrop before it will settle on a hamlet: the sphere of influence gates
 // gathering as well as building, so "reachable" now means "in reach" from the very first tile.
 // Authored once here, in the `eligibleTypeIds` shape this codebase already prefers, so the search
 // and the seeded table it is searching for can never quietly disagree about where the ladder starts.
 export const START_REACH_RADIUS = 6;
+
+// The top rung of the seeded reach_milestone table — the largest a settlement's sphere of
+// influence ever grows (seed.ts's own MILESTONES asserts its last radius matches this, the same
+// way it asserts the first matches START_REACH_RADIUS). Named here so `findStarts` (worldgen.ts)
+// can derive its minimum separation from it rather than restating "24" as a second, unrelated
+// magic number: two mature reaches just touching is twice this — see MIN_START_SEPARATION there.
+export const MATURE_REACH_RADIUS = 24;
 
 /**
  * The world coordinate (in cell units, fractional) under a pane-relative pixel — read the pane's
@@ -247,6 +256,11 @@ export type WorldLive = {
 	// (the realm you asked for was gone), not about the world. True on exactly one response,
 	// so the client makes it sticky rather than re-reading it.
 	worldReset?: boolean;
+	// This reader's own player id — the "is this mine" key for `buildings`/`settlements` below,
+	// now that both carry every realm's, not just yours (VISION #4's reversal: a tile is a
+	// physical place again, so what's built on it is public). Nothing else on the wire needs it:
+	// `characters`, `stock`, `operations` and `reach` stay filtered to you alone.
+	playerId: number;
 	// The realm's sphere of influence — a circle of `radius` tiles around its Marketplace, in the
 	// same (x, y) the rest of the wire uses. Drawn by the client (MapCanvas's `arc()`) and enforced
 	// by the server (world.server.ts's `withinReach` gate) from these same three numbers, so the
@@ -265,21 +279,33 @@ export type WorldLive = {
 	// Row-major like `terrain`, on `WorldStatic`. How much this tile still holds right now; null
 	// where the deposit is infinite or the ground yields nothing — pair it with the terrain type's
 	// own `capacity` to know "how full". Stays live, deliberately: it draws down per player against
-	// the same shared terrain, and a sparse-plus-client-reconstruction alternative was rejected
-	// (see the note this type used to carry) — dense is the same information arranged so it can't
-	// be got wrong.
+	// the same shared terrain (tile_stock scarcity is still per-player — see the schema's own note
+	// on that table — which is a separate, later question from who may build where), and a
+	// sparse-plus-client-reconstruction alternative was rejected (see the note this type used to
+	// carry) — dense is the same information arranged so it can't be got wrong.
 	tileQuantity: (number | null)[];
-	// quality is how well it was built — null on anything raised before it was recorded, which
-	// reads as nothing at all rather than as "unknown". roadMask is the player's override of a
-	// road's shape; null means derive it from the neighbours (see `roadArms`).
+	// PUBLIC — every realm's, not just yours. "What is physically on the map is public; what is in
+	// your ledger is private" (VISION #4's reversal): position, building type and playerId (the
+	// owner) are things standing on the ground, so anyone can see them. quality is workmanship —
+	// part of your ledger, not the ground — so the server nulls it out on a building you don't own;
+	// roadMask stays public on every owner's roads, because a shared network has to draw as one
+	// continuous road regardless of who paved which tile of it.
 	buildings: {
 		id: number;
 		x: number;
 		y: number;
 		buildingTypeId: number;
+		playerId: number;
+		/** Null if this isn't yours — see the type's own comment. */
 		quality: number | null;
 		roadMask: number | null;
 	}[];
+	// PUBLIC, same reasoning as `buildings`: every realm's anchor and whose it is, so a pulled-back
+	// view can mark more than just your own hamlet. Cheap — one row per realm, not per building.
+	settlements: { x: number; y: number; playerId: number }[];
+	// PRIVATE — yours only. Unlike buildings, a body is not a fact standing on the ground; it is
+	// what you are doing with your own people, which stays in your ledger.
+	//
 	// professionId null ⇒ settler (a dot); set ⇒ a named specialist (drawn distinct). name is
 	// the specialist's, null for a settler.
 	//
@@ -298,6 +324,10 @@ export type WorldLive = {
 		constitution: number | null;
 		intelligence: number | null;
 	}[];
+	// PRIVATE — yours only, same reasoning as `characters`: what you are doing, not what is
+	// standing there. A build genuinely in progress on someone else's tile is real, but it doesn't
+	// appear here for you — the tile simply refuses TILE_OCCUPIED until it resolves into a public
+	// `building` row, the same way a queued order of your own does before it starts.
 	operations: {
 		id: number;
 		type: OperationType;
@@ -748,10 +778,12 @@ function heapPop(heap: [number, number][]): [number, number] {
  * exactly.
  *
  * No heuristic, deliberately: A* would want a lower bound on any tile's cost, and the day a road or
- * a bridge undercuts that bound the routes go quietly suboptimal. 2304 tiles is small enough that
- * the exact answer is cheap — measured at 0.06 ms for a trip near the hamlet and 0.44 ms corner to
- * corner, against an estimate that re-quotes per keystroke — and it early-exits the moment the
- * destination is settled. Add the heuristic when the map is big enough for that to stop being true.
+ * a bridge undercuts that bound the routes go quietly suboptimal. The grid is small enough that the
+ * exact answer stays cheap against an estimate that re-quotes per keystroke — corner-to-corner
+ * (the worst case; any real order is nearer than that) measured 0.44 ms at 48×48, 8 ms at 128×128,
+ * and ~15 ms at the current 256×256 — and it early-exits the moment the destination is settled.
+ * Superlinear in tile count (Dijkstra over a grid graph), so this stops being true well before the
+ * top of the scale ladder's own ceiling note (~1024²–2048²) — add the heuristic there, not before.
  *
  * `cost` takes *integer tile coordinates* and returns that tile's movement cost. Required rather than
  * defaulted, because a default of 1 would hand terrain-free timings back to a caller that forgot to

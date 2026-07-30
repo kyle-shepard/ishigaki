@@ -17,13 +17,18 @@ import {
 	recipeInput,
 	resource,
 	skill,
+	startPosition,
 	terrainType,
 	tile
 } from '../src/lib/server/db/schema.ts';
-import { GRID_SIZE, START_REACH_RADIUS } from '../src/lib/features/world/world.ts';
+import {
+	GRID_SIZE,
+	MATURE_REACH_RADIUS,
+	START_REACH_RADIUS
+} from '../src/lib/features/world/world.ts';
 import {
 	contentVersion,
-	START,
+	STARTS,
 	terrainCharAt,
 	WORLD_SEED
 } from '../src/lib/features/world/worldgen.ts';
@@ -52,8 +57,12 @@ const WIPE = process.argv.includes('--wipe');
 const [{ players }] = await db.select({ players: sql<number>`count(*)::int` }).from(player);
 
 if (WIPE) {
+	// start_position named explicitly rather than left to CASCADE: it references player, so
+	// truncating player would empty it either way, but naming it is what makes "every opening goes
+	// back into the pool, unclaimed" a decision on the page rather than a side effect of CASCADE.
+	// It is re-populated, unclaimed, by the ordinary upsert below regardless of WIPE.
 	await db.execute(
-		sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, tile, terrain_type, resource RESTART IDENTITY CASCADE`
+		sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, start_position, tile, terrain_type, resource RESTART IDENTITY CASCADE`
 	);
 }
 
@@ -158,9 +167,6 @@ const worldVersion = contentVersion(WORLD_SEED, GRID_SIZE, readFileSync(worldgen
 // settlerBaseline 0.15 and skillCurve 0.3 set the quality band: a settler works at 0.15 of the
 // reference rate, a matched specialist at ~0.6–0.85 (their ~0.7 bundle swung by rolled stats) —
 // the ~4–5× the Q asks for. Both tunable live (VISION #10).
-// startX/startY ride the same upsert as the rest of this row: the terrain's own answer
-// (worldgen.ts's findStart, via START), written here rather than recomputed at every cold
-// start — see world.server.ts, which reads these instead of importing worldgen at all.
 await db
 	.insert(gameConfig)
 	.values([
@@ -171,8 +177,6 @@ await db
 			starvePerHour: 1,
 			settlerBaseline: 0.15,
 			skillCurve: 0.3,
-			startX: START.hamletX,
-			startY: START.hamletY,
 			worldVersion
 		}
 	])
@@ -184,11 +188,29 @@ await db
 			starvePerHour: sql`excluded.starve_per_hour`,
 			settlerBaseline: sql`excluded.settler_baseline`,
 			skillCurve: sql`excluded.skill_curve`,
-			startX: sql`excluded.start_x`,
-			startY: sql`excluded.start_y`,
 			worldVersion: sql`excluded.world_version`
 		}
 	});
+
+// Every legal opening the map holds (worldgen.ts's STARTS — closest-to-centre first, mutually
+// well separated), upserted by physical tile so a reseed that changes nothing about the map
+// touches nothing here either. Claims ride along untouched (claimed_by_player_id isn't in any SET
+// list below) — an opening a realm already stands on keeps standing on it across a reseed.
+await db
+	.insert(startPosition)
+	.values(STARTS.map((s) => ({ x: s.hamletX, y: s.hamletY })))
+	.onConflictDoNothing({ target: [startPosition.x, startPosition.y] });
+// An opening dropped from the map (a retuned generator moved or removed one) has to actually stop
+// being offered — same argument as building_cost and the other tuning tables in this file. Only
+// unclaimed rows: a start a realm is already standing on cannot be deleted out from under it, and
+// worldgen.ts's own separation guarantee means a still-legal opening never moves under a stable
+// WORLD_SEED anyway, so this only ever fires on a genuine map change.
+await db.execute(
+	sql`DELETE FROM start_position WHERE claimed_by_player_id IS NULL AND (x, y) NOT IN (${sql.join(
+		STARTS.map((s) => sql`(${s.hamletX}, ${s.hamletY})`),
+		sql`, `
+	)})`
+);
 
 // The tuning data behind the reach's growth (decision 8: LoL-style discrete steps, not a tile per
 // head). Content, not code (VISION #10): retuning a threshold or its radius is an UPDATE against a
@@ -200,14 +222,24 @@ const MILESTONES = [
 	{ population: 25, radius: 18 },
 	{ population: 40, radius: 24 }
 ];
-// The first rung has to be the same circle `findStart` already searched the generated map for
+// The first rung has to be the same circle `findStarts` already searched the generated map for
 // (world.ts's START_REACH_RADIUS, consumed there and here) — a mismatch would mean the map's own
 // guarantee of reachable wood and stone and the seeded table describing the reach disagree about
 // the shape of the opening circle.
 if (MILESTONES[0].radius !== START_REACH_RADIUS)
 	throw new Error(
-		`the first reach milestone is radius ${MILESTONES[0].radius}, but findStart searched the map ` +
+		`the first reach milestone is radius ${MILESTONES[0].radius}, but findStarts searched the map ` +
 			`for a starting reach of ${START_REACH_RADIUS} — the two must agree`
+	);
+// The last rung has to be the same "mature" radius `findStarts` spaced every opening around
+// (world.ts's MATURE_REACH_RADIUS) — a mismatch would mean two realms grown to what this table
+// calls the top of the ladder could still end up with overlapping reach, which is exactly the
+// separation the start search exists to guarantee against.
+const matureRadius = Math.max(...MILESTONES.map((m) => m.radius));
+if (matureRadius !== MATURE_REACH_RADIUS)
+	throw new Error(
+		`the highest reach milestone is radius ${matureRadius}, but findStarts spaced every opening ` +
+			`assuming a mature reach of ${MATURE_REACH_RADIUS} — the two must agree`
 	);
 // A fresh realm opens at STARTING_CHARACTERS (world.server.ts) settlers — mirrored here as a plain
 // number rather than an import, because world.server.ts pulls in `$lib/server/db` and is
@@ -429,16 +461,22 @@ await db.execute(
 
 // Same idea, one column over: every existing settlement gets the Marketplace it predates.
 // `ensurePlayer` places one for every *new* realm; this is what catches every realm made before
-// this building type existed. (x, y - 1) is the exact tile worldgen.ts's START.marketX/marketY
-// names and findStart's clear margin already guarantees empty — so nothing moves and no realm
-// resets, which is what makes this backfill an INSERT rather than the wipe-and-reroll every other
-// schema change in this epic needed. ON CONFLICT on the tile itself (building_tile_idx) rather than
-// a check-then-insert: idempotent the same way the stock backfill above is, and harmless to re-run.
+// this building type existed. (x, y - 1) is the exact tile each start's own marketX/marketY names
+// (worldgen.ts's startBlockFor) and findStarts's clear margin already guarantees empty — so
+// nothing moves and no realm resets, which is what makes this backfill an INSERT rather than the
+// wipe-and-reroll every other schema change in this epic needed. ON CONFLICT on the tile itself
+// (building_tile_idx) rather than a check-then-insert: idempotent the same way the stock backfill
+// above is, and harmless to re-run.
+//
+// The conflict target is `(x, y)` and not `(player_id, x, y)`: that is the whole of VISION #4's
+// reversal showing up here. `building_tile_idx` dropped its player_id when a tile went back to being
+// one physical place, so the old three-column target matches no constraint at all and Postgres
+// refuses the statement outright — which is how this was found.
 await db.execute(
 	sql`INSERT INTO building (player_id, x, y, building_type_id)
 	    SELECT s.player_id, s.x, s.y - 1, ${bt['Marketplace']}
 	    FROM settlement s
-	    ON CONFLICT (player_id, x, y) DO NOTHING`
+	    ON CONFLICT (x, y) DO NOTHING`
 );
 
 // What a build costs. Rows, not constants: retuning this is an UPDATE against a live world,
@@ -795,25 +833,28 @@ const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => {
 	return { x, y, terrainTypeId: t.id, quantity: spec.capacity ?? null };
 });
 
-// Every new player's hamlet and characters land on these tiles, so this is the one check that
-// ties the generated map to the start it hands out: a retuned threshold, a one-character typo,
-// or a START edit that walks off the clear block all land here rather than putting somebody in a
-// lake. It reads the real terrain row, so it also catches '.' being retuned to something that
-// isn't Meadow.
+// Every new player's hamlet and characters land on one of these tiles, so this is the one check
+// that ties the generated map to the starts it hands out: a retuned threshold, a one-character
+// typo, or a startBlockFor edit that walks off the clear block all land here rather than putting
+// somebody in a lake. It reads the real terrain row, so it also catches '.' being retuned to
+// something that isn't Meadow. Checked for every entry in STARTS, not just the first — a realm can
+// land on any of them.
 const meadowAt = (x: number, y: number) => {
 	const at = tiles[y * GRID_SIZE + x];
 	const name = terrainRows.find((t) => t.id === at.terrainTypeId)!.displayName;
 	if (name !== 'Meadow') throw new Error(`start tile (${x}, ${y}) is ${name}, must be Meadow`);
 };
-meadowAt(START.hamletX, START.hamletY);
-meadowAt(START.house2X, START.house2Y);
-meadowAt(START.barnX, START.barnY);
-meadowAt(START.marketX, START.marketY);
-meadowAt(START.characterX, START.characterY);
-// The three starting characters stand shoulder to shoulder from characterX - 1 (see
-// STARTING_CHARACTERS in world.server.ts), so their tiles have to be open ground too.
-meadowAt(START.characterX - 1, START.characterY);
-meadowAt(START.characterX + 1, START.characterY);
+for (const s of STARTS) {
+	meadowAt(s.hamletX, s.hamletY);
+	meadowAt(s.house2X, s.house2Y);
+	meadowAt(s.barnX, s.barnY);
+	meadowAt(s.marketX, s.marketY);
+	meadowAt(s.characterX, s.characterY);
+	// The three starting characters stand shoulder to shoulder from characterX - 1 (see
+	// STARTING_CHARACTERS in world.server.ts), so their tiles have to be open ground too.
+	meadowAt(s.characterX - 1, s.characterY);
+	meadowAt(s.characterX + 1, s.characterY);
+}
 
 // An extracted resource needs somewhere to extract it from: a Quarry is placeable *only* on a
 // Stone outcrop, so a map with no outcrop strands Stone and seals the ladder the winnability
@@ -854,7 +895,8 @@ for (const batch of chunks(tiles, 4000)) {
 console.log(
 	(WIPE ? `WIPED ${players} player realm(s), then ` : 'content only, no realms touched: ') +
 		`${buildingTypes.length} building types, ${resources.length} resources, ` +
-		`${terrainRows.length} terrain types, ${tiles.length} tiles · world_version ${worldVersion}` +
+		`${terrainRows.length} terrain types, ${tiles.length} tiles, ${STARTS.length} start ` +
+		`position(s) · world_version ${worldVersion}` +
 		(WIPE ? '' : ` · ${players} existing realm(s) left alone`)
 );
 await client.end();

@@ -152,13 +152,15 @@ export const building = pgTable(
 		// itself instead of pointing at nothing.
 		roadMask: integer('road_mask')
 	},
-	// ponytail: scoped by player_id so each visitor gets an isolated sandbox on the shared
-	// map — see VISION #4's interim override. This REVERSES the original rule (a tile is a
-	// physical place; whoever builds there first holds it), which is still the intended end
-	// state. Drop player_id from this index and from the occupancy checks in world.server.ts
-	// to restore it, once players are meant to see each other.
+	// VISION #4's reversal: a tile is a physical place again — whoever builds there first holds
+	// it, world-wide, not per player. This index used to include player_id (each visitor's own
+	// isolated sandbox on the shared map, an interim testing override); dropping it back to just
+	// (x, y) is what makes a second player's build on an occupied tile a genuine uniqueness
+	// violation rather than a row keyed differently. world.server.ts's occupancy checks in
+	// `planBuild` were un-scoped to match — see the comment there for what that means for
+	// overlapping reaches.
 	(t) => [
-		uniqueIndex('building_tile_idx').on(t.playerId, t.x, t.y),
+		uniqueIndex('building_tile_idx').on(t.x, t.y),
 		// Four bits, so a mask outside 0–15 cannot be written. The client only ever sends a subset of
 		// a tile's real neighbours, but this is the wire's edge and the wire is not the client's.
 		check('building_road_mask_range', sql`${t.roadMask} IS NULL OR ${t.roadMask} BETWEEN 0 AND 15`)
@@ -374,43 +376,55 @@ export const gameConfig = pgTable(
 		settlerBaseline: real('settler_baseline').notNull().default(1),
 		// How much a specialist's governing stats swing their output around their trained value.
 		skillCurve: real('skill_curve').notNull().default(0),
-		// Where a fresh realm's hamlet opens — worldgen.ts's own answer, written once by the seed
-		// rather than recomputed at every cold start (world.server.ts reads these instead of
-		// importing worldgen). Nullable, unlike this table's other columns: a row seeded before this
-		// column existed has no start position, and that is exactly the state world.server.ts must
-		// tell apart from "seeded" and throw on, the same "run npm run seed" throw every other
-		// missing-catalog-row case in that file already gives — a default would hide the gap instead
-		// of reporting it.
-		startX: integer('start_x'),
-		startY: integer('start_y'),
 		// A content fingerprint of the generated world — worldgen.ts's own `contentVersion`: the same
 		// WORLD_SEED, the same GRID_SIZE and the same generator source hash to the same string,
 		// forever, never a function of *when* the seed happened to run (`vercel-build` runs it on
 		// every deploy, and a timestamp version would invalidate every cache on a deploy that changed
 		// nothing). world.server.ts's in-process memo of the tile grid and its resource join keys on
 		// this one small column instead of re-reading 28,583 rows a request — see readWorld's own
-		// note. Nullable like startX/startY: a row seeded before this column existed has none, and
-		// world.server.ts throws on that the same way it throws on a missing start position — `run
-		// npm run seed`, not a silent guess.
+		// note. Nullable: a row seeded before this column existed has none, and world.server.ts
+		// throws on that the same way it throws on every other missing-catalog-row case in that
+		// file — `run npm run seed`, not a silent guess.
 		worldVersion: text('world_version')
 	},
+	(t) => [check('game_config_singleton', sql`${t.id} = 1`)]
+);
+
+// Where a realm can open — one row per legal, mutually well-separated opening `findStarts`
+// (worldgen.ts) found on the generated map, seeded once and claimed as realms are created. This
+// used to be two columns on `game_config` (`start_x`/`start_y`) naming the single opening every
+// realm shared (VISION #4's interim override — every visitor got an isolated sandbox at the same
+// coordinates); now that occupancy is world-shared and starts are scattered, a realm needs its
+// *own* opening, so the single pair became a table. `x`/`y` name the hamlet tile alone —
+// world.server.ts's own `startBlockFrom` derives the rest (the two Houses, the Barn, the
+// Marketplace, the settlers' row) from just that, the same way it always has.
+export const startPosition = pgTable(
+	'start_position',
+	{
+		id: serial('id').primaryKey(),
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		// Null means unclaimed. `ensurePlayer` claims the first unclaimed row atomically
+		// (`UPDATE ... WHERE claimed_by_player_id IS NULL ... LIMIT 1 ... RETURNING`), so two
+		// realms created at the same moment can never land on the same opening. `ON DELETE SET
+		// NULL` rather than the schema's usual no-cascade: a start slot isn't something a player
+		// spent time on, it's infrastructure — when a realm is deleted (`deletePlayer`, the
+		// "New game" verb) the opening it held goes back into the pool for the next visitor,
+		// which is what keeps a finite map from running out of room for new realms as old ones
+		// come and go.
+		claimedByPlayerId: integer('claimed_by_player_id').references(() => player.id, {
+			onDelete: 'set null'
+		})
+	},
 	(t) => [
-		check('game_config_singleton', sql`${t.id} = 1`),
-		// Every quantity column in this schema carries its own bound; a coordinate's bound is the
-		// grid. Two checks, not one combined, matching the building_type_output_positive /
-		// building_type_craft_positive split above — each column's own constraint, independently.
-		// `sql.raw` rather than `${GRID_SIZE}`: a plain interpolation binds it as a query parameter
-		// ($1), which a CHECK constraint's DDL cannot reference — drizzle-kit generates the literal
-		// as `< $1`, invalid outside a prepared statement. Raw inlines the number as constant SQL
-		// text, still sourced from the one constant rather than typed twice.
-		check(
-			'game_config_start_x_range',
-			sql`${t.startX} IS NULL OR (${t.startX} >= 0 AND ${t.startX} < ${sql.raw(String(GRID_SIZE))})`
-		),
-		check(
-			'game_config_start_y_range',
-			sql`${t.startY} IS NULL OR (${t.startY} >= 0 AND ${t.startY} < ${sql.raw(String(GRID_SIZE))})`
-		)
+		// The natural key: the seed upserts on it, the same idiom as building_type/resource's own
+		// display_name, so a reseed against an unchanged map touches no row.
+		uniqueIndex('start_position_xy_idx').on(t.x, t.y),
+		// Same reasoning and the same `sql.raw` mechanics as every other coordinate bound in this
+		// schema (see building_road_mask_range for the general note) — a coordinate's bound is the
+		// grid, sourced from the one constant rather than typed twice.
+		check('start_position_x_range', sql`${t.x} >= 0 AND ${t.x} < ${sql.raw(String(GRID_SIZE))}`),
+		check('start_position_y_range', sql`${t.y} >= 0 AND ${t.y} < ${sql.raw(String(GRID_SIZE))}`)
 	]
 );
 
@@ -484,10 +498,12 @@ export const tile = pgTable(
 	(t) => [primaryKey({ columns: [t.x, t.y] })]
 );
 
-// How much of a finite deposit *this player* has left. Per-player and not a column on `tile`
-// for the same reason `building` is player-scoped: the grid is shared but the sandboxes are
-// not (VISION #4 interim override), and one player's clear-cut must not thin another's
-// forest. Scarcity here is against the map, not against a neighbour.
+// How much of a finite deposit *this player* has left. Per-player and not a column on `tile` —
+// unlike `building`, this stayed player-scoped through VISION #4's reversal: gathering is its own,
+// later question ("expansion & borders", parked), and one player's clear-cut still must not thin
+// another's forest, or reach overlap would turn every shared forest into a race for the same
+// numbers rather than each realm working its own copy of the ground. Scarcity here is against the
+// map, not against a neighbour.
 //
 // Rows are created lazily on first harvest — no row means the tile is untouched and therefore
 // full, so 256 rows per player never materialise.

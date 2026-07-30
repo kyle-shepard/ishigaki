@@ -66,26 +66,34 @@ These were argued out and are settled. Change them only with a deliberate revers
 
 4. **World model** — **One shared, finite, square-tile grid** with integer coordinates, and
    not a region graph. The terrain map itself is shared, read-only data: every player plays
-   the same geography.
+   the same geography. **A tile is a physical place: whoever builds there first holds it**,
+   world-wide, not per player — this is the current, live behaviour (reversed back from the
+   interim override below). Buildings and settlements are public — position, building type,
+   and owner are visible to everyone, because they are things standing on the ground; stock,
+   operations, characters, reach, and quality stay private to the realm that holds them.
+   Reaches may legitimately overlap between neighbouring realms; where they do, occupancy
+   settles it first-come-first-served, with no territory contest — that is "expansion &
+   borders" below, deliberately still parked. Every realm now opens at its own scattered start
+   (`findStarts` in `worldgen.ts`) rather than a single shared coordinate, spaced so two realms
+   grown to the reach ladder's top rung never overlap by construction.
 
-   **Interim override (testing stage):** occupancy is currently scoped **per player**, so each
-   visitor gets an isolated sandbox on that shared map — their own hamlet at the same starting
-   coordinates, nobody else's buildings visible or in the way. This deliberately reverses the
-   "a tile is a physical place, whoever builds there first holds it" rule, which was the
-   original decision here and remains the intended end state. It exists so testers can play
-   the single-player loop without fighting over one character, and it is the smallest change
-   that achieves that — no tenant column, just `player_id` on the occupancy checks and the
-   tile uniqueness index.
+   **History — the interim override this reverses.** For the testing stage, occupancy was
+   scoped **per player**: each visitor got an isolated sandbox on the shared map, their own
+   hamlet at one single shared starting coordinate, nobody else's buildings visible or in the
+   way. It existed so testers could play the single-player loop without fighting over one
+   character or one tile, and it was the smallest change that achieved that — no tenant
+   column, just `player_id` on the occupancy checks and the tile uniqueness index, plus every
+   realm sharing `game_config.start_x/start_y`. That override is now removed: the occupancy
+   checks in `world.server.ts`, `building_tile_idx`, and the single shared start coordinate are
+   gone, in favour of the world-global model this decision always intended.
 
-   **Reversal path:** drop `player_id` from the occupancy checks in `world.server.ts` and from
-   `building_tile_idx`, and the shared-world model is back. Until then, treat any code that
-   assumes world-global tile ownership as wrong.
-
-   **Timing — deliberately late.** Stitching the world back together comes _after_ economy,
-   people, expansion, and borders. Until then this is a set of parallel single-player instances
-   on one geography, and that is the intended state, not a debt being serviced. Every deepening
-   epic is designed against a world with no neighbours in it; contested tiles are a change we
-   make once there is something worth contesting.
+   **Timing.** The reversal landed once the world had somewhere to put more than a handful of
+   realms without them claiming nearly all the usable land between them (measured on the old
+   128×128 map: six mature reaches claimed 94% of it) — a wider map and scattered starts,
+   shipped together. What is still deliberately parked is everything _past_ "a tile is a
+   physical place": expansion, borders, and any contest over an overlapping reach. Every
+   deepening epic before this was designed against a world with no neighbours in it; the ones
+   after it can assume neighbours exist, but not yet that they compete for ground.
 
 5. **Multiplayer-readiness** — **Multi-tenant schema, zero multiplayer features.** Every
    ownable entity carries a `player_id` from day one. No auth, accounts, or politics yet —

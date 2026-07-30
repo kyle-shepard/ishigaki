@@ -8,8 +8,8 @@
 // none of it is visible from the numeric census alone.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GRID_SIZE, route, START_REACH_RADIUS, withinReach } from './world.ts';
-import { contentVersion, START, terrainCharAt, terrainMap } from './worldgen.ts';
+import { GRID_SIZE, MATURE_REACH_RADIUS, route, START_REACH_RADIUS, withinReach } from './world.ts';
+import { contentVersion, START, STARTS, terrainCharAt, terrainMap } from './worldgen.ts';
 
 const CHARS = new Set(['.', 'f', 'w', 'h', 'm', 's', 'c', 'i']);
 const map = terrainMap();
@@ -34,6 +34,23 @@ test('the world is somewhere to live, not an ocean or a mountain range', () => {
 	// Every deposit terrain is somewhere. The seed enforces the one that seals the ladder (Stone);
 	// this catches the ones that only make the world duller.
 	for (const c of ['s', 'c', 'i']) assert.ok(census(c) > 0, `no ${c} anywhere on the map`);
+
+	// And floors, not just ceilings — the bounds above are all upper, and a map can fail by being
+	// *bland* as easily as by being an ocean. This is not hypothetical: the 128→256 grid change kept
+	// the elevation cuts that suited the smaller lattice and took mountain from 9% of the map to 2%
+	// and stone from 1% to 0.4%, a flatter and duller world with every assertion in this file still
+	// green. The noise lattices are sized in tiles, so a grid-size change draws a different field
+	// rather than a scaled one; these floors are what turn "re-tune the thresholds" from something
+	// somebody has to remember into something the suite insists on.
+	assert.ok(
+		share('m') > 0.05,
+		`mountain is only ${(share('m') * 100).toFixed(1)}% — the map is flat`
+	);
+	assert.ok(share('h') > 0.02, `hills are only ${(share('h') * 100).toFixed(1)}% — no gradient`);
+	assert.ok(
+		share('s') > 0.005,
+		`stone is only ${(share('s') * 100).toFixed(2)}% — a realm may not find any in reach`
+	);
 });
 
 test('a realm opens on grass, with two clear tiles on every side', () => {
@@ -82,6 +99,68 @@ test('a realm opens with wood and stone inside its own reach, not merely on the 
 	);
 	// The Marketplace stands one north of the hamlet, on ground the start block already cleared.
 	assert.deepEqual([START.marketX, START.marketY], [START.hamletX, START.hamletY - 1]);
+});
+
+test('every start the map offers, not just the first, opens on grass with wood and stone in reach', () => {
+	// The same two guarantees the tests above pin for `START` alone, held for every entry in
+	// `STARTS` — a scattered start is only honest if *every* opening it hands out is actually
+	// playable, not just the one every other test happens to exercise.
+	assert.ok(STARTS.length > 0, 'findStarts found nowhere to open a realm at all');
+	for (const s of STARTS) {
+		for (let x = s.hamletX - 3; x <= s.hamletX + 3; x++)
+			for (let y = s.hamletY - 2; y <= s.hamletY + 3; y++) {
+				assert.ok(x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE, `(${x},${y}) is off the map`);
+				assert.equal(
+					terrainCharAt(x, y),
+					'.',
+					`(${x},${y}) beside start (${s.hamletX},${s.hamletY}) is not grass`
+				);
+			}
+		const reach = { x: s.marketX, y: s.marketY, radius: START_REACH_RADIUS };
+		let forest = 0;
+		let stone = 0;
+		for (let y = 0; y < GRID_SIZE; y++)
+			for (let x = 0; x < GRID_SIZE; x++) {
+				if (!withinReach(x, y, reach)) continue;
+				if (terrainCharAt(x, y) === 'f') forest++;
+				else if (terrainCharAt(x, y) === 's') stone++;
+			}
+		assert.ok(
+			forest >= 8,
+			`start (${s.hamletX},${s.hamletY}): only ${forest} Forest tile(s) in reach`
+		);
+		assert.ok(stone >= 1, `start (${s.hamletX},${s.hamletY}): no Stone outcrop in reach`);
+	}
+});
+
+test('every pair of starts is far enough apart that their mature reaches never touch', () => {
+	// Two mature reaches (MATURE_REACH_RADIUS each) just touching is twice that — the same
+	// derivation `findStarts` uses for MIN_START_SEPARATION, recomputed here rather than imported
+	// so this pins the *invariant* (no overlap at the ladder's top rung) and not merely whatever
+	// worldgen.ts's own private constant happens to hold.
+	const minSeparation = MATURE_REACH_RADIUS * 2;
+	for (let i = 0; i < STARTS.length; i++)
+		for (let j = i + 1; j < STARTS.length; j++) {
+			const a = STARTS[i];
+			const b = STARTS[j];
+			const d = Math.hypot(a.hamletX - b.hamletX, a.hamletY - b.hamletY);
+			assert.ok(
+				d >= minSeparation,
+				`starts (${a.hamletX},${a.hamletY}) and (${b.hamletX},${b.hamletY}) are only ${d.toFixed(1)} tiles apart, need ${minSeparation}`
+			);
+		}
+});
+
+test('STARTS is ordered closest to the map centre first, and START is simply its first entry', () => {
+	const mid = (GRID_SIZE - 1) / 2;
+	const dist = (s: { hamletX: number; hamletY: number }) =>
+		Math.hypot(s.hamletX - mid, s.hamletY - mid);
+	for (let i = 1; i < STARTS.length; i++)
+		assert.ok(
+			dist(STARTS[i]) >= dist(STARTS[i - 1]),
+			`start ${i} is closer to centre than start ${i - 1}`
+		);
+	assert.deepEqual(START, STARTS[0]);
 });
 
 // Four-way and eight-way, and which terrain gets which is a deliberate call per terrain, not a
