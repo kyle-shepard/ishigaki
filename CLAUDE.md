@@ -58,6 +58,24 @@ human checkpoint. Claude does the volume; the human owns the decisions. Artifact
 Close the loop: never ship code you haven't watched run. Build → run → look → fix until
 the real output proves it works, then report what was actually observed.
 
+## Known problem: database egress
+
+**Watch this; it has already bitten once.** The single binding resource on this project is
+Neon's **network transfer**, not compute or storage. Every `/api/world` read pulls 28,583 rows
+— the 16,384-tile grid plus its 12,199-row join to resources — which is **~1.3 MB of egress per
+request**, roughly 200× the ~6 KB the browser actually receives. With the 30-second heartbeat
+that is **~156 MB/hour per open tab, idle**. In July 2026 that plus a read-heavy test suite put
+**8.44 GB through a 5 GB allowance** and the project was suspended mid-work, while compute sat
+at 23 of 100 CU-hours.
+
+- **`npm run egress`** reports rows sent and what they cost. Run it after any work that touches
+  the database, and report the number.
+- Both expensive statements are **static between seeds**, so the fix is a cache keyed on a
+  version the seed bumps — see the notes on `readWorld` in `world.server.ts` and on
+  `WorldPayload` in `world.ts`. Deliberately not done yet.
+- Beware anything that loops HTTP requests (`npm run check:rules` is ~110 calls a run) and
+  beware leaving a dev server with a tab open.
+
 ## Open decisions (not yet made)
 
 These are deliberately unresolved. Don't assume an answer — raise them for the human.

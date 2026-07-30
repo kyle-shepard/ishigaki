@@ -1933,6 +1933,18 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		// Ordered, because the resource bar is rendered in payload order and an unordered join
 		// is free to hand back a different one on every read — a bar that reshuffles itself.
 		.orderBy(asc(stock.resourceId));
+	// ponytail: these two lines are where this project's only real scaling problem lives, measured
+	// rather than suspected. The grid select returns 16,384 rows and `tileYields` another 12,199 —
+	// ~1.3 MB of Neon egress on every single read, against a response the player receives as ~6 KB
+	// gzipped. With a 30-second heartbeat that is ~156 MB an hour per open tab, and in July 2026 it
+	// put 8.44 GB through a 5 GB monthly allowance and had the project suspended. Everything else
+	// read here is per-player and tiny: stock was 1,162 rows across 166 realms.
+	//
+	// Ceiling: neither of these changes while the game runs — terrain and the resource catalog are
+	// both seeded data — so the upgrade path is to hold them in process behind a version that
+	// `npm run seed` bumps, which takes a read to a few KB. Deliberately not done yet; `npm run
+	// egress` is how to tell whether it has started to matter. Do not add a third full-grid read
+	// here without reading that first.
 	const tiles = await tx.select().from(tile);
 	const deposits = await tileYields(tx);
 	const drawn = await tx.select().from(tileStock).where(eq(tileStock.playerId, playerId));

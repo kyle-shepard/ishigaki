@@ -143,13 +143,27 @@ export function qualityBand(quality: number): string {
 
 // ponytail: the whole world, every read. Terrain dominates the payload, and at 128×128 that is
 // 16,384 small ints row-major, plus one dense same-length array for the live deposit levels
-// (`tileQuantity`), most of whose entries are `null` — call it a few hundred KB a read, gzipped
-// to a fraction. `tileCapacity` used to be a second dense array here; it shipped the same fact
-// 16,384 times (capacity is a pure function of terrain type, per terrainType.capacity below), so
-// it moved into the catalog instead. `tileQuantity` stays dense — going sparse trades bytes for
-// client code, and that trade wants a measurement before it's made, not a guess. Fine at this
-// cadence (once on load, then a 30 s heartbeat) until that measurement says otherwise; viewport
-// culling still belongs to the map-client epic.
+// (`tileQuantity`), most of whose entries are `null`. `tileCapacity` used to be a second dense
+// array here; it shipped the same fact 16,384 times (capacity is a pure function of terrain type,
+// per terrainType.capacity below), so it moved into the catalog instead. `tileQuantity` stays
+// dense — going sparse trades bytes for client code, and that trade wants a measurement before
+// it's made, not a guess.
+//
+// **KNOWN PROBLEM, measured, not yet fixed — see readWorld in world.server.ts.** An earlier
+// version of this note weighed the response at "a few hundred KB, gzipped to a fraction" and
+// concluded it was fine at this cadence. That reasoning was about the wrong number. Gzipped it
+// really is ~6 KB to the browser, and it really is fine; what is not fine is what the *database*
+// sends to build it. Two statements behind this type return 28,583 rows a read — the tile grid
+// and its join to resources — which is ~1.3 MB of Neon egress per request, ~200x the response
+// the player receives. A 30-second heartbeat therefore costs ~156 MB an hour per open tab doing
+// nothing, and in July 2026 that plus a read-heavy test suite put 8.44 GB through a 5 GB monthly
+// allowance and got the project suspended mid-work.
+//
+// Both of those statements are static between seeds, so the ceiling is not inherent: cache them
+// in process, keyed on a version `npm run seed` bumps (the invalidation matters — seeding is a
+// supported live operation, so "terrain only changes on deploy" is false). That takes a read from
+// ~1.3 MB to a few KB. `npm run egress` is how to watch it. Viewport culling still belongs to the
+// map-client epic; this does not wait for it.
 export type WorldPayload = {
 	now: string;
 	gridSize: number;
