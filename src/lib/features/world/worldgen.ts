@@ -29,12 +29,33 @@
 // The `.ts` extension is load-bearing: this module is imported by `scripts/` under plain Node,
 // which does not resolve extensionless paths. Same reason world.test.ts writes it that way.
 import { GRID_SIZE, START_REACH_RADIUS, withinReach } from './world.ts';
+// node:crypto rather than a dependency — this file is scripts/tests-only (nothing under
+// src/routes imports it), so a stdlib import here never reaches the browser bundle.
+import { createHash } from 'node:crypto';
 
 // Bumped for the 128×128 cut (decision 3): a clean break rather than 7× the old world regenerated
 // under standing buildings. `npm run seed -- --wipe` is the deliberate step that actually clears
 // the ground for it — this constant alone changes nothing for anybody already playing.
 /** Change this and the world changes. Nothing else does. */
 export const WORLD_SEED = 90210;
+
+/**
+ * A content fingerprint for this generator: the same seed, the same grid size and the same source
+ * text of this file hash to the same sixteen hex characters, forever — never a function of when
+ * anything ran. `scripts/seed.ts` is the only caller; it reads this file's own text once (the
+ * generator's *code* is the content — a threshold tweak has to roll the version) and hands it in
+ * here rather than this module reading itself off disk, so the function stays pure over its three
+ * inputs and `npm test` can pin it without touching the filesystem.
+ *
+ * Sixteen hex characters of sha256, not the whole digest — this lands in a game_config column and
+ * a URL segment, where a collision would need someone to engineer one, not stumble into it.
+ */
+export function contentVersion(seed: number, gridSize: number, generatorSource: string): string {
+	return createHash('sha256')
+		.update(`${seed}:${gridSize}:${generatorSource}`)
+		.digest('hex')
+		.slice(0, 16);
+}
 
 /** mulberry32 — a small, well-behaved PRNG. Seeded, so every field below is reproducible. */
 function mulberry32(seed: number): () => number {

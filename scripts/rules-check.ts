@@ -34,6 +34,31 @@ async function api(path: string, init?: RequestInit) {
 	return { status: res.status, body: await res.json() };
 }
 
+// GET /api/world returns only the *live* half now (issue #21 architecture A): the terrain grid and
+// the catalogs moved to /api/world/static/<worldVersion>, immutably cached, so a heartbeat stops
+// dragging 28,583 rows out of Neon on every read. Every case below still wants to reason about one
+// whole world — heldOf needs `resources` (static) beside `stock` (live), `find` needs `terrain` and
+// `terrainTypes` — so this merges the two halves back together the same way +page.svelte does, and
+// every `readWorld()` call site reads exactly as it did when /api/world returned everything.
+//
+// Statics are cached by version rather than fetched per read, which is the point of the split; the
+// version is re-checked on every live read, so a reseed mid-run refetches instead of silently
+// merging a new world's quantities onto the old world's terrain.
+let staticsVersion: string | null = null;
+let statics: Record<string, unknown> = {};
+async function readWorld() {
+	const live = await api('/api/world');
+	const version = (live.body as { worldVersion?: string }).worldVersion;
+	if (version && version !== staticsVersion) {
+		const res = await api(`/api/world/static/${version}`);
+		if (res.status !== 200)
+			throw new Error(`world statics for ${version} returned ${res.status} — is the seed current?`);
+		statics = res.body;
+		staticsVersion = version;
+	}
+	return { status: live.status, body: { ...statics, ...live.body } };
+}
+
 // Orders and assignments take world coordinates straight through now — there's no authored
 // frame to convert out of.
 const order = (x: number, y: number, buildingTypeId: number, crewSize?: number) =>
@@ -50,7 +75,7 @@ function check(name: string, actual: unknown, expected: unknown) {
 }
 
 // The first call creates the sandbox, so the cookie exists before any order is placed.
-const world = await api('/api/world');
+const world = await readWorld();
 if (world.status !== 200) throw new Error(`GET /api/world returned ${world.status}`);
 const typeId = (name: string) => {
 	const t = world.body.buildingTypes.find((b: { displayName: string }) => b.displayName === name);
@@ -167,7 +192,7 @@ for (const [name, tile] of [
 	['Forest', forest]
 ] as [string, { x: number; y: number }][]) {
 	cookie = '';
-	await api('/api/world');
+	await readWorld();
 	const r = await order(tile.x, tile.y, free);
 	check(`(${tile.x},${tile.y}) ${name.toLowerCase()} is accepted`, r.status, 200);
 }
@@ -176,21 +201,21 @@ for (const [name, tile] of [
 // the ground rule cleanly. An extractor belongs only on its deposit; a plain building never does.
 const quarry = typeId('Quarry');
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	'a Quarry is refused on a meadow — an extractor may not squat on plain ground',
 	[(await order(meadow.x, meadow.y, quarry)).body.reason],
 	['TILE_NOT_BUILDABLE']
 );
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	'a House is refused on an iron vein — a plain building may not squat on a deposit',
 	[(await order(ironVein.x, ironVein.y, house)).body.reason],
 	['TILE_NOT_BUILDABLE']
 );
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	'a Quarry is accepted on a Stone outcrop — the deposit offers exactly its extractor',
 	(await order(stoneOutcrop.x, stoneOutcrop.y, quarry)).status,
@@ -199,7 +224,7 @@ check(
 
 // Unregressed: the rules that existed before terrain did.
 cookie = '';
-await api('/api/world');
+await readWorld();
 const oob = await order(world.body.gridSize, 0, free);
 check(
 	`(${world.body.gridSize},0) is off the map`,
@@ -246,7 +271,7 @@ const insideEdge = reachEdge(world.body.reach.radius);
 const outsideEdge = reachEdge(world.body.reach.radius + 1);
 
 cookie = '';
-await api('/api/world');
+await readWorld();
 const buildOutside = await order(outsideEdge.x, outsideEdge.y, free);
 check(
 	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a build`,
@@ -254,7 +279,7 @@ check(
 	[400, 'OUTSIDE_REACH']
 );
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same build`,
 	(await order(insideEdge.x, insideEdge.y, free)).status,
@@ -262,7 +287,7 @@ check(
 );
 
 cookie = '';
-await api('/api/world');
+await readWorld();
 const gatherOutside = await assign(outsideEdge.x, outsideEdge.y);
 check(
 	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a gather too — it's a` +
@@ -271,7 +296,7 @@ check(
 	[400, 'OUTSIDE_REACH']
 );
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same gather`,
 	(await assign(insideEdge.x, insideEdge.y)).status,
@@ -286,7 +311,7 @@ check(
 // growth takes on the order of 30 real minutes at the seeded rate) — to prove what ran was the
 // ratchet and not a plain assignment that would have (correctly, here) produced the same number.
 cookie = '';
-const ratchetStart = await api('/api/world');
+const ratchetStart = await readWorld();
 check(
 	'a fresh realm opens at exactly the first reach milestone',
 	ratchetStart.body.reach.radius,
@@ -294,7 +319,7 @@ check(
 );
 await order(meadow.x, meadow.y, house);
 await new Promise((r) => setTimeout(r, 2000));
-const ratchetEnd = await api('/api/world');
+const ratchetEnd = await readWorld();
 check(
 	'the reach radius never fell across those reads',
 	ratchetEnd.body.reach.radius >= ratchetStart.body.reach.radius,
@@ -313,7 +338,7 @@ check(
 // What stays is the half only a running server can show: an order comes back with a walked path,
 // ending on the tile that was asked for.
 cookie = '';
-const travelWorld = await api('/api/world');
+const travelWorld = await readWorld();
 const gridSize = travelWorld.body.gridSize;
 const reach = travelWorld.body.reach;
 const occupiedTiles = new Set(
@@ -356,7 +381,7 @@ check(
 // (VISION #10) so it can build before it has to gather. Stock is asserted off the payload's own
 // numbers, same rule as the travel legs.
 cookie = '';
-const fresh = await api('/api/world');
+const fresh = await readWorld();
 const woodStart = woodHeld(fresh.body);
 check('a new realm arrives with a Wood runway', woodStart > 0, true);
 
@@ -386,7 +411,7 @@ check(
 );
 check(
 	'stock holds exactly one refund after the double cancel',
-	woodHeld((await api('/api/world')).body),
+	woodHeld((await readWorld()).body),
 	woodStart
 );
 // The cancelled op left nothing behind: the tile is buildable again and a worker is free to take it.
@@ -400,7 +425,7 @@ check(
 // none owned it is refused before terrain or cost matter — a distinct reason from the tile-local
 // MISSING_REQUIRED_BUILDING that gates gathering.
 cookie = '';
-await api('/api/world');
+await readWorld();
 const stoneWall = typeId('Stone wall');
 check(
 	'a Stone wall with no Quarry owned is refused as a missing prerequisite',
@@ -453,7 +478,7 @@ check(
 // would render "0 of null" on a quarry. Watching a forest actually thin is the rate-cranked
 // manual pass — at 3 Wood an hour it takes eight hours, which is the mechanic working.
 cookie = '';
-const map = await api('/api/world');
+const map = await readWorld();
 const at = (x: number, y: number) => y * map.body.gridSize + x;
 const terrainCapacity = (name: string) =>
 	map.body.terrainTypes.find((t: { displayName: string }) => t.displayName === name).capacity;
@@ -476,7 +501,7 @@ check(
 // The quarry gate. Wood and forage need a person; stone needs the structure first, and the
 // structure has to be on the tile being worked — not merely somewhere in the realm.
 cookie = '';
-await api('/api/world');
+await readWorld();
 const bare = await assign(stoneOutcrop.x, stoneOutcrop.y);
 check(
 	`(${stoneOutcrop.x},${stoneOutcrop.y}) a stone outcrop with no quarry on it is refused`,
@@ -496,7 +521,7 @@ check(
 const crewed: Record<number, { workers: number; seconds: number }> = {};
 for (const size of [1, 3]) {
 	cookie = '';
-	await api('/api/world');
+	await readWorld();
 	const r = await order(meadow.x, meadow.y, free, size);
 	const op = r.body.operations?.[0];
 	if (!op) throw new Error(`crew-of-${size} order was refused: ${JSON.stringify(r.body)}`);
@@ -515,7 +540,7 @@ check(
 // crewSize is a maximum, not a demand: asking for more bodies than the realm holds takes
 // everyone rather than refusing. Without this, a hopeful number would be a dead end.
 cookie = '';
-const small = await api('/api/world');
+const small = await readWorld();
 const everyone = await order(meadow.x, meadow.y, free, 99);
 check(
 	'asking for more hands than you have sends everyone, rather than refusing',
@@ -534,7 +559,7 @@ const estimateOf = (x: number, y: number, buildingTypeId: number, crewSize: numb
 
 for (const size of [1, 3]) {
 	cookie = '';
-	await api('/api/world');
+	await readWorld();
 	const quote = await estimateOf(meadow.x, meadow.y, free, size);
 	const placed = await order(meadow.x, meadow.y, free, size);
 	const op = placed.body.operations?.[0];
@@ -550,7 +575,7 @@ for (const size of [1, 3]) {
 
 // A refusal previews as the same refusal, rather than as a number nobody can act on.
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	'estimating an unbuildable tile refuses with the reason the order would give',
 	[
@@ -560,11 +585,11 @@ check(
 	[400, 'TILE_NOT_BUILDABLE']
 );
 // And it spends nothing: quoting is not ordering.
-const beforeQuote = woodHeld((await api('/api/world')).body);
+const beforeQuote = woodHeld((await readWorld()).body);
 await estimateOf(meadow.x, meadow.y, house, 3);
 check(
 	'an estimate costs nothing — quoting is not ordering',
-	woodHeld((await api('/api/world')).body),
+	woodHeld((await readWorld()).body),
 	beforeQuote
 );
 
@@ -573,7 +598,7 @@ check(
 // is only ever proved as far as the operation, and the durable output this epic exists to capture
 // would have no check at all.
 cookie = '';
-await api('/api/world');
+await readWorld();
 const promised = await estimateOf(meadow.x, meadow.y, free, 3);
 const raised = await order(meadow.x, meadow.y, free, 3);
 const rising = raised.body.operations?.[0];
@@ -584,7 +609,7 @@ let finished: { quality: number } | undefined;
 // appear at all — the server resolves on read, so nobody looking means nobody building.
 while (Date.now() < dueAt + 15_000) {
 	await new Promise((r) => setTimeout(r, 3000));
-	const w = await api('/api/world');
+	const w = await readWorld();
 	finished = w.body.buildings.find(
 		(b: { x: number; y: number }) => b.x === meadow.x && b.y === meadow.y
 	);
@@ -598,7 +623,7 @@ check(
 // The starting hamlet predates the column, so it is the honest null case: no band, no crash. Read
 // straight off START — this looks up a tile the *game* chose, not one the map author drew, and a
 // hand-written coordinate here is what crashed this check the day the hamlet moved.
-const hamlet = (await api('/api/world')).body.buildings.find(
+const hamlet = (await readWorld()).body.buildings.find(
 	(b: { x: number; y: number }) => b.x === START.hamletX && b.y === START.hamletY
 );
 if (!hamlet) throw new Error(`no starting hamlet at ${START.hamletX}, ${START.hamletY}`);
@@ -623,7 +648,7 @@ const professionId = (name: string) => {
 };
 
 cookie = '';
-await api('/api/world');
+await readWorld();
 // A fresh realm is three settlers, so it has no Mason at all. This *queues* rather than refusing —
 // an unsatisfiable filter and a realm where everyone is busy are the same situation, and both
 // resolve themselves the moment a qualifying worker exists.
@@ -645,7 +670,7 @@ check(
 );
 // Unchecking everything is not "nobody may build this".
 cookie = '';
-await api('/api/world');
+await readWorld();
 check(
 	'an empty filter means anyone, not nobody',
 	(await restricted(meadow.x, meadow.y, [])).status,
@@ -680,7 +705,7 @@ const occupyEveryone = async () => {
 };
 
 cookie = '';
-const busyRealm = await api('/api/world');
+const busyRealm = await readWorld();
 const woodBefore = woodHeld(busyRealm.body);
 await occupyEveryone();
 const heldUp = await order(meadow.x, meadow.y, house);
@@ -701,11 +726,11 @@ check(
 	'TILE_OCCUPIED'
 );
 // Free one gatherer, and the waiting build takes them on the very next read.
-const gathering2 = (await api('/api/world')).body.operations.filter(
+const gathering2 = (await readWorld()).body.operations.filter(
 	(o: { type: string }) => o.type === 'gather'
 );
 await api(`/api/assignments/${gathering2[0].id}`, { method: 'DELETE' });
-const startedItself = (await api('/api/world')).body.operations.find(
+const startedItself = (await readWorld()).body.operations.find(
 	(o: { id: number }) => o.id === parked.id
 );
 check(
@@ -720,7 +745,7 @@ check(
 
 // Cancelling a queued build is the same delete-and-refund path, and just as un-duplicable.
 cookie = '';
-const q2 = await api('/api/world');
+const q2 = await readWorld();
 const woodQ2 = woodHeld(q2.body);
 await occupyEveryone();
 const toCancel = (await order(meadow.x, meadow.y, house)).body.operations?.find(
@@ -771,7 +796,7 @@ async function waitOut(op: { completeAt: string }, slackMs = 2000) {
 	const wait = due - Date.now() + slackMs;
 	if (wait > 0) await new Promise((r) => setTimeout(r, wait));
 	for (let i = 0; i < 10; i++) {
-		const w = (await api('/api/world')).body;
+		const w = (await readWorld()).body;
 		if (Date.parse(w.now) >= due) return w;
 		await new Promise((r) => setTimeout(r, 1000));
 	}
@@ -789,7 +814,7 @@ type WireOp = {
 const craftOp = (w: { operations: WireOp[] }) => w.operations.find((o) => o.type === 'craft');
 
 cookie = '';
-const shopStart = await api('/api/world');
+const shopStart = await readWorld();
 const woodAtStart = woodHeld(shopStart.body);
 const raising = await order(...mill, sawmill, 3);
 const millSite = raising.body.operations?.find((o: { type: string }) => o.type === 'build');
@@ -824,13 +849,13 @@ check(
 );
 check(
 	'and the gather is still running, not quietly deleted',
-	(await api('/api/world')).body.operations.some((o: { id: number }) => o.id === working.id),
+	(await readWorld()).body.operations.some((o: { id: number }) => o.id === working.id),
 	true
 );
 await api(`/api/assignments/${working.id}`, { method: 'DELETE' });
 
 // The order itself: inputs leave stock at the click, and the batch is one operation with a clock.
-const woodBeforeBatch = woodHeld((await api('/api/world')).body);
+const woodBeforeBatch = woodHeld((await readWorld()).body);
 const settlerBatch = await craft(...mill, 1);
 const solo = craftOp(settlerBatch.body);
 if (!solo) throw new Error(`the settler batch was refused: ${JSON.stringify(settlerBatch.body)}`);
@@ -868,13 +893,13 @@ check(
 );
 check(
 	'and stock holds exactly one refund after the double cancel',
-	woodHeld((await api('/api/world')).body),
+	woodHeld((await readWorld()).body),
 	woodBeforeBatch
 );
 
 // The payoff, and the offline promise with it: order it, walk away, and the planks are there when
 // you come back — credited once, on the first read that happens after it was due.
-const planksBefore = heldOf((await api('/api/world')).body, 'Planks');
+const planksBefore = heldOf((await readWorld()).body, 'Planks');
 const batch = craftOp((await craft(...mill, 3)).body);
 if (!batch) throw new Error('the plank batch was refused');
 realm = await waitOut(batch);
@@ -885,7 +910,7 @@ check(
 );
 check(
 	'and a second read does not credit it again',
-	heldOf((await api('/api/world')).body, 'Planks'),
+	heldOf((await readWorld()).body, 'Planks'),
 	planksBefore + 10
 );
 check(
@@ -944,15 +969,15 @@ await api(`/api/orders/${byCarpenter.id}`, { method: 'DELETE' });
 // A batch placed with nobody free waits rather than bouncing, holding the inputs it has already
 // paid — and starts itself on the next read after somebody frees, with no one looking.
 const busyEveryone = async () => {
-	const idle = (await api('/api/world')).body.characters.length;
+	const idle = (await readWorld()).body.characters.length;
 	for (const { x, y } of reachable('Forest', 6)) {
-		const w = (await api('/api/world')).body;
+		const w = (await readWorld()).body;
 		if (w.operations.filter((o: { type: string }) => o.type === 'gather').length >= idle) break;
 		await assign(x, y);
 	}
 };
 await busyEveryone();
-const woodBeforeQueue = woodHeld((await api('/api/world')).body);
+const woodBeforeQueue = woodHeld((await readWorld()).body);
 const heldBatch = await craft(...mill, 1);
 const held = craftOp(heldBatch.body);
 check(
@@ -991,7 +1016,7 @@ if (!waitingBatch || !waitingBuild)
 	throw new Error('the misprice trap could not queue both orders');
 // Two settlers back, by recalling the gathers they are on — a specialist is skipped, so the
 // Carpenter keeps working and cannot be the one that starts either order.
-const busyNow = (await api('/api/world')).body;
+const busyNow = (await readWorld()).body;
 const settlerIds = new Set(
 	busyNow.characters
 		.filter((c: { professionId: number | null }) => c.professionId === null)
@@ -1003,7 +1028,7 @@ const settlerGathers = busyNow.operations.filter(
 );
 for (const g of settlerGathers.slice(0, 2))
 	await api(`/api/assignments/${g.id}`, { method: 'DELETE' });
-const restarted = (await api('/api/world')).body;
+const restarted = (await readWorld()).body;
 const startedBatch = restarted.operations.find((o: { id: number }) => o.id === waitingBatch.id);
 const startedBuild = restarted.operations.find((o: { id: number }) => o.id === waitingBuild.id);
 check(
@@ -1039,7 +1064,7 @@ await api(`/api/orders/${waitingBuild.id}`, { method: 'DELETE' });
 // And quiets the realm. Half the tiles the queue group occupied are forest, so woodcutters are
 // still earning — and "the refusal moved no Wood" measured against a rising number is a race, not
 // an assertion. Same reasoning as `heldOf` naming one resource rather than comparing all of stock.
-for (const g of (await api('/api/world')).body.operations.filter(
+for (const g of (await readWorld()).body.operations.filter(
 	(o: { type: string }) => o.type === 'gather'
 ))
 	await api(`/api/assignments/${g.id}`, { method: 'DELETE' });
@@ -1071,7 +1096,7 @@ const spendable = (w: {
 	}
 	return out;
 };
-let broke = (await api('/api/world')).body;
+let broke = (await readWorld()).body;
 for (const [x, y] of spendable(broke)) {
 	if (woodHeld(broke) < 20) break;
 	const spent = await api('/api/orders', {
@@ -1087,11 +1112,7 @@ check(
 	[woodWhenBroke < 20, refused.status, refused.body.reason],
 	[true, 400, 'INSUFFICIENT_RESOURCES']
 );
-check(
-	'and the refusal moved no Wood at all',
-	woodHeld((await api('/api/world')).body),
-	woodWhenBroke
-);
+check('and the refusal moved no Wood at all', woodHeld((await readWorld()).body), woodWhenBroke);
 
 // ---- The chain pays off: Wood → Planks → Furniture → a Longhouse -------------------------------
 //
@@ -1120,7 +1141,7 @@ check(
 );
 
 cookie = '';
-const ladder = await api('/api/world');
+const ladder = await readWorld();
 check(
 	'a fresh realm is rich in Wood and still cannot buy a Longhouse',
 	[woodHeld(ladder.body) >= 100, (await order(...spare, longhouse, 3)).body.reason],

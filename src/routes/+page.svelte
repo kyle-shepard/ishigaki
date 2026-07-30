@@ -21,7 +21,9 @@
 		type EstimateResponse,
 		type OrderReason,
 		type TravelLeg,
-		type WorldPayload
+		type WorldLive,
+		type WorldPayload,
+		type WorldStatic
 	} from '$lib/features/world/world';
 
 	// Continuous, where CELL was fixed — wheel, pinch and the +/- buttons all write this, and
@@ -279,6 +281,32 @@
 		if (payload.worldReset) worldReset = true;
 	}
 
+	// The terrain/catalog half, cached in memory only — not sessionStorage: it is re-fetched at
+	// most once a session (on boot, and again only if `worldVersion` ever moves), and Cache-Control:
+	// immutable already makes that refetch a browser-cache hit, not a network round trip. Keyed by
+	// version, not a bare flag: a reseed mid-session must refetch, not keep serving stale terrain.
+	let cachedStaticVersion: string | null = null;
+	let cachedStatic: WorldStatic | null = null;
+
+	async function ensureStatic(version: string): Promise<WorldStatic> {
+		if (cachedStatic && cachedStaticVersion === version) return cachedStatic;
+		const res = await fetch(`/api/world/static/${version}`);
+		if (!res.ok) throw new Error(`world statics failed: ${res.status}`);
+		cachedStatic = (await res.json()) as WorldStatic;
+		cachedStaticVersion = version;
+		return cachedStatic;
+	}
+
+	// GET /api/world's own shape now — the live half alone. Merged with the statics for its own
+	// `worldVersion` *before* `apply` ever sees it, so a mismatched pair is never rendered: the
+	// consistency contract WorldLive's own comment describes. A write endpoint (act, below) still
+	// hands `apply` a full WorldPayload directly — it already composed both halves server-side, so
+	// there is nothing to merge.
+	async function applyLive(payload: WorldLive) {
+		const statics = await ensureStatic(payload.worldVersion);
+		apply({ ...statics, ...payload });
+	}
+
 	// The server distinguishes "you broke a game rule" (400 with a reason) from "something
 	// went wrong" (anything else). The client has to keep that distinction visible instead of
 	// applying an error body as if it were a world.
@@ -294,7 +322,7 @@
 		try {
 			const res = await fetch('/api/world');
 			if (!res.ok) throw new Error(`world read failed: ${res.status}`);
-			apply(await res.json());
+			await applyLive(await res.json());
 			if (message === TROUBLE) message = '';
 		} catch (e) {
 			console.error(e);
@@ -322,9 +350,19 @@
 		// no deploy) actually reaches an open tab. Without it an idle player never re-reads at
 		// all: refreshes only fired on mount and when an operation came due, so "live on next
 		// read" had no next read.
+		//
+		// `document.hidden` skips both jobs — a tab nobody is looking at is exactly the "open tab
+		// doing nothing" CLAUDE.md's egress note names, and there is nothing here for the player to
+		// see anyway. `onVisible` below is the other half: a returning player must not wait up to
+		// 30 s for a heartbeat that was paused the whole time they were away.
 		const retry = setInterval(() => {
+			if (document.hidden) return;
 			if (message === TROUBLE || Date.now() - lastReadMs > IDLE_REFRESH_MS) refresh();
 		}, 3000);
+		function onVisible() {
+			if (!document.hidden) refresh();
+		}
+		document.addEventListener('visibilitychange', onVisible);
 
 		const tick = () => {
 			nowMs = Date.now() - clockOffset;
@@ -354,6 +392,7 @@
 
 		return () => {
 			clearInterval(retry);
+			document.removeEventListener('visibilitychange', onVisible);
 			cancelAnimationFrame(frame);
 		};
 	});

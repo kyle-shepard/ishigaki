@@ -156,43 +156,28 @@ export function qualityBand(quality: number): string {
 	return BANDS.find(([ceiling]) => quality < ceiling)?.[1] ?? 'Masterwork';
 }
 
-// ponytail: the whole world, every read. Terrain dominates the payload, and at 128×128 that is
-// 16,384 small ints row-major, plus one dense same-length array for the live deposit levels
-// (`tileQuantity`), most of whose entries are `null`. `tileCapacity` used to be a second dense
-// array here; it shipped the same fact 16,384 times (capacity is a pure function of terrain type,
-// per terrainType.capacity below), so it moved into the catalog instead. `tileQuantity` stays
-// dense — going sparse trades bytes for client code, and that trade wants a measurement before
-// it's made, not a guess.
+// ponytail: still the whole world's worth of terrain and catalog on the wire — 16,384 small ints
+// row-major, plus one dense same-length array for the live deposit levels (`tileQuantity`), most of
+// whose entries are `null`. `tileCapacity` used to be a second dense array here; it shipped the
+// same fact 16,384 times (capacity is a pure function of terrain type, per terrainType.capacity
+// below), so it moved into the catalog instead. `tileQuantity` stays dense — going sparse trades
+// bytes for client code, and that trade wants a measurement before it's made, not a guess. Viewport
+// culling still belongs to the map-client epic; this does not wait for it.
 //
-// **KNOWN PROBLEM, measured, not yet fixed — see readWorld in world.server.ts.** An earlier
-// version of this note weighed the response at "a few hundred KB, gzipped to a fraction" and
-// concluded it was fine at this cadence. That reasoning was about the wrong number. Gzipped it
-// really is ~6 KB to the browser, and it really is fine; what is not fine is what the *database*
-// sends to build it. Two statements behind this type return 28,583 rows a read — the tile grid
-// and its join to resources — which is ~1.3 MB of Neon egress per request, ~200x the response
-// the player receives. A 30-second heartbeat therefore costs ~156 MB an hour per open tab doing
-// nothing, and in July 2026 that plus a read-heavy test suite put 8.44 GB through a 5 GB monthly
-// allowance and got the project suspended mid-work.
-//
-// Both of those statements are static between seeds, so the ceiling is not inherent: cache them
-// in process, keyed on a version `npm run seed` bumps (the invalidation matters — seeding is a
-// supported live operation, so "terrain only changes on deploy" is false). That takes a read from
-// ~1.3 MB to a few KB. `npm run egress` is how to watch it. Viewport culling still belongs to the
-// map-client epic; this does not wait for it.
-export type WorldPayload = {
-	now: string;
+// **FIXED — see world.server.ts's `readWorldStatic`/`readWorldLive` and the history in CLAUDE.md.**
+// The measured problem was never this type's size on the wire (~6 KB gzipped, and fine): it was
+// that every `/api/world` read ran the two full-grid queries behind `terrain`/`terrainTypes` again
+// — 28,583 rows, ~1.3 MB of Neon egress — on a 30-second heartbeat, static content that only moves
+// when `npm run seed` runs. The fix is this split: `WorldStatic` is everything that answer never
+// changes for, served once per content version and cached at the CDN edge
+// (`GET /api/world/static/[version]`, `max-age=31536000, immutable`); `WorldLive` is everything that
+// moves with a write or the clock, and is all `GET /api/world`'s heartbeat fetches now. `WorldPayload`
+// stays the shape the rest of the client already consumes — the mutation endpoints
+// (`/api/orders` and friends) still return one composed payload, and the boot/heartbeat path merges
+// the two halves back into it (see the client's `applyLive`) — so nothing downstream of `world` in
+// +page.svelte had to change.
+export type WorldStatic = {
 	gridSize: number;
-	// Set by the /api/world route, not by readWorld — it is a fact about *this request*
-	// (the realm you asked for was gone), not about the world. True on exactly one response,
-	// so the client makes it sticky rather than re-reading it.
-	worldReset?: boolean;
-	// The realm's sphere of influence — a circle of `radius` tiles around its Marketplace, in the
-	// same (x, y) the rest of the wire uses. Drawn by the client (MapCanvas's `arc()`) and enforced
-	// by the server (world.server.ts's `withinReach` gate) from these same three numbers, so the
-	// line drawn and the line enforced can never disagree. Null only in principle — resolveWorld
-	// throws rather than ever shipping a realm with no Marketplace, so a live payload always
-	// carries a real circle; the type stays nullable for the moment before a world has loaded.
-	reach: { x: number; y: number; radius: number } | null;
 	terrainTypes: {
 		id: number;
 		displayName: string;
@@ -208,8 +193,8 @@ export type WorldPayload = {
 		// How much a tile of this terrain holds when full; null where the deposit is infinite (never
 		// runs out) or the ground yields nothing. One value per *type*, not per tile — the seed writes
 		// the same capacity to every tile of a given terrain, so a per-tile array on the wire would be
-		// the identical fact repeated once per tile. `tileQuantity` below is still per-tile: the live
-		// level genuinely differs tile to tile as players draw it down.
+		// the identical fact repeated once per tile. `tileQuantity` on `WorldLive` is still per-tile:
+		// the live level genuinely differs tile to tile as players draw it down.
 		capacity: number | null;
 	}[];
 	// icon names a symbol in Sprites.svelte, minus the `i-` prefix — what the resource bar draws
@@ -218,14 +203,6 @@ export type WorldPayload = {
 	// The professions a settler can be trained into, for the School's Train picker. Global
 	// catalog, unfiltered by player — the callings the world offers, like building types.
 	professions: { id: number; displayName: string }[];
-	// What you hold, one entry per resource — fractional, because accrual is continuous. The
-	// client floors it; the server never does.
-	//
-	// ratePerHour is where it is heading: everything being earned right now minus everything being
-	// eaten, signed, for the +/- beside the number. Computed by the server (see `netRates`) rather
-	// than by the client, because it is economy arithmetic — a second implementation in the panel
-	// would be free to disagree with the one that actually moves the stock.
-	stock: { resourceId: number; quantity: number; ratePerHour: number }[];
 	// What each building type costs. A type with no entries is free.
 	buildingCosts: { buildingTypeId: number; resourceId: number; quantity: number }[];
 	// What one batch consumes at each workshop — the same shape as buildingCosts, because it is the
@@ -235,12 +212,6 @@ export type WorldPayload = {
 	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
 	// client estimates travel.
 	terrain: number[];
-	// Row-major like `terrain`. How much this tile still holds right now; null where the deposit
-	// is infinite or the ground yields nothing — pair it with the terrain type's own `capacity`
-	// above to know "how full". Dense rather than a sparse list of the tiles you have touched —
-	// a sparse one would have made the client learn capacity in order to fill in the gaps, which
-	// is the same information arranged so that it can be got wrong.
-	tileQuantity: (number | null)[];
 	buildingTypes: {
 		id: number;
 		displayName: string;
@@ -263,6 +234,41 @@ export type WorldPayload = {
 		outputQuantity: number | null;
 		craftSeconds: number | null;
 	}[];
+};
+
+export type WorldLive = {
+	now: string;
+	// The content version `readWorldStatic` was built against — the seed's `contentVersion`,
+	// unpacked here. The client compares this against whatever `WorldStatic` it has cached and
+	// refetches statics on a mismatch *before* merging — the consistency contract that keeps a live
+	// response from ever being read against a stale terrain array.
+	worldVersion: string;
+	// Set by the /api/world route, not by readWorldLive — it is a fact about *this request*
+	// (the realm you asked for was gone), not about the world. True on exactly one response,
+	// so the client makes it sticky rather than re-reading it.
+	worldReset?: boolean;
+	// The realm's sphere of influence — a circle of `radius` tiles around its Marketplace, in the
+	// same (x, y) the rest of the wire uses. Drawn by the client (MapCanvas's `arc()`) and enforced
+	// by the server (world.server.ts's `withinReach` gate) from these same three numbers, so the
+	// line drawn and the line enforced can never disagree. Null only in principle — resolveWorld
+	// throws rather than ever shipping a realm with no Marketplace, so a live payload always
+	// carries a real circle; the type stays nullable for the moment before a world has loaded.
+	reach: { x: number; y: number; radius: number } | null;
+	// What you hold, one entry per resource — fractional, because accrual is continuous. The
+	// client floors it; the server never does.
+	//
+	// ratePerHour is where it is heading: everything being earned right now minus everything being
+	// eaten, signed, for the +/- beside the number. Computed by the server (see `netRates`) rather
+	// than by the client, because it is economy arithmetic — a second implementation in the panel
+	// would be free to disagree with the one that actually moves the stock.
+	stock: { resourceId: number; quantity: number; ratePerHour: number }[];
+	// Row-major like `terrain`, on `WorldStatic`. How much this tile still holds right now; null
+	// where the deposit is infinite or the ground yields nothing — pair it with the terrain type's
+	// own `capacity` to know "how full". Stays live, deliberately: it draws down per player against
+	// the same shared terrain, and a sparse-plus-client-reconstruction alternative was rejected
+	// (see the note this type used to carry) — dense is the same information arranged so it can't
+	// be got wrong.
+	tileQuantity: (number | null)[];
 	// quality is how well it was built — null on anything raised before it was recorded, which
 	// reads as nothing at all rather than as "unknown". roadMask is the player's override of a
 	// road's shape; null means derive it from the neighbours (see `roadArms`).
@@ -319,6 +325,11 @@ export type WorldPayload = {
 		workers: { characterId: number; path: number[]; arrivesAt: string }[];
 	}[];
 };
+
+// The shape every part of the client downstream of `world` still consumes — composed rather than
+// declared field-by-field, so svelte-check is what enforces the static/live split staying complete
+// and non-overlapping, not a comment promising it is.
+export type WorldPayload = WorldStatic & WorldLive;
 
 // 'craft' is a batch at a workshop: a build in all but its ending — cost taken up front, crew solved
 // by the same arithmetic, one completion time — that adds to stock instead of raising a building.

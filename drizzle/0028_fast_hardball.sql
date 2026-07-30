@@ -1,0 +1,1 @@
+ALTER TABLE "game_config" ADD COLUMN "world_version" text;

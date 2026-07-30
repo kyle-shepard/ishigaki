@@ -4,6 +4,8 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { eq, inArray, sql } from 'drizzle-orm';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
 	buildingCost,
 	buildingType,
@@ -19,7 +21,12 @@ import {
 	tile
 } from '../src/lib/server/db/schema.ts';
 import { GRID_SIZE, START_REACH_RADIUS } from '../src/lib/features/world/world.ts';
-import { START, terrainCharAt } from '../src/lib/features/world/worldgen.ts';
+import {
+	contentVersion,
+	START,
+	terrainCharAt,
+	WORLD_SEED
+} from '../src/lib/features/world/worldgen.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);
@@ -128,6 +135,18 @@ const buildingTypes = await db
 	.returning();
 const bt = Object.fromEntries(buildingTypes.map((t) => [t.displayName, t.id]));
 
+// The content version: same WORLD_SEED, same GRID_SIZE, same generator source ⇒ the same string,
+// forever (contentVersion's own comment has the full argument). Reading worldgen.ts's own text
+// here, rather than importing some pre-computed constant from it, is what makes a threshold tweak
+// inside that file roll the version without anybody having to remember to bump one by hand.
+// `vercel-build` runs this seed on every deploy, so the version must NOT move with *when* it ran —
+// a timestamp would invalidate world.server.ts's in-process memo and every client's cached statics
+// on a deploy that changed nothing about the world.
+const worldgenPath = fileURLToPath(
+	new URL('../src/lib/features/world/worldgen.ts', import.meta.url)
+);
+const worldVersion = contentVersion(WORLD_SEED, GRID_SIZE, readFileSync(worldgenPath, 'utf8'));
+
 // The one global-scalar row. Upserted on the fixed id=1 so a live edit retunes the world in
 // place (VISION #10) rather than appending a second row the singleton CHECK would reject.
 // growthPerHour ~2 → a 4-room House fills from 3 settlers in about half an hour, slow enough
@@ -153,7 +172,8 @@ await db
 			settlerBaseline: 0.15,
 			skillCurve: 0.3,
 			startX: START.hamletX,
-			startY: START.hamletY
+			startY: START.hamletY,
+			worldVersion
 		}
 	])
 	.onConflictDoUpdate({
@@ -165,7 +185,8 @@ await db
 			settlerBaseline: sql`excluded.settler_baseline`,
 			skillCurve: sql`excluded.skill_curve`,
 			startX: sql`excluded.start_x`,
-			startY: sql`excluded.start_y`
+			startY: sql`excluded.start_y`,
+			worldVersion: sql`excluded.world_version`
 		}
 	});
 
@@ -833,7 +854,7 @@ for (const batch of chunks(tiles, 4000)) {
 console.log(
 	(WIPE ? `WIPED ${players} player realm(s), then ` : 'content only, no realms touched: ') +
 		`${buildingTypes.length} building types, ${resources.length} resources, ` +
-		`${terrainRows.length} terrain types, ${tiles.length} tiles` +
+		`${terrainRows.length} terrain types, ${tiles.length} tiles · world_version ${worldVersion}` +
 		(WIPE ? '' : ` · ${players} existing realm(s) left alone`)
 );
 await client.end();

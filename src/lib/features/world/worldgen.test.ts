@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GRID_SIZE, route, START_REACH_RADIUS, withinReach } from './world.ts';
-import { START, terrainCharAt, terrainMap } from './worldgen.ts';
+import { contentVersion, START, terrainCharAt, terrainMap } from './worldgen.ts';
 
 const CHARS = new Set(['.', 'f', 'w', 'h', 'm', 's', 'c', 'i']);
 const map = terrainMap();
@@ -472,4 +472,17 @@ test('a river is a detour, not a wall — the route bends around it', () => {
 		walked.seconds > overMeadow.seconds,
 		`the crossing to (${dx},${dy}) took ${walked.seconds.toFixed(1)}s, no worse than ${overMeadow.seconds.toFixed(1)}s over open meadow — terrain cost nothing`
 	);
+});
+
+// The cache key world.server.ts's egress fix rides on: same inputs, same version, forever — never
+// a function of *when* the seed ran, which is the property that lets `vercel-build` reseed on
+// every deploy without invalidating a client's cached statics or the server's in-process memo on a
+// deploy that changed nothing about the world.
+test('contentVersion is stable for the same inputs and moves when any of them does', () => {
+	const a = contentVersion(90210, 128, 'source text');
+	const b = contentVersion(90210, 128, 'source text');
+	assert.equal(a, b);
+	assert.notEqual(a, contentVersion(90210, 128, 'source texu')); // one character of the source
+	assert.notEqual(a, contentVersion(90211, 128, 'source text')); // the seed
+	assert.notEqual(a, contentVersion(90210, 129, 'source text')); // the grid size
 });

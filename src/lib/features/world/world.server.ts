@@ -37,7 +37,9 @@ import {
 	type EstimateResponse,
 	type OperationType,
 	type OrderReason,
-	type WorldPayload
+	type WorldLive,
+	type WorldPayload,
+	type WorldStatic
 } from './world';
 
 // How fast a starting settler walks, in tiles per second. Not part of the start block, which is
@@ -235,10 +237,29 @@ export async function deletePlayer(playerId: number): Promise<void> {
 	});
 }
 
-export async function loadWorld(playerId: number): Promise<WorldPayload> {
+/**
+ * `GET /api/world`'s own read — the live half only (see `readWorldLive`), which is the whole of
+ * the payload split: a heartbeat that used to re-send the 16,384-tile grid every 30 seconds now
+ * gets none of it, because the client already has it from `/api/world/static/[version]` and only
+ * refetches that when `worldVersion` disagrees.
+ */
+export async function loadWorldLive(playerId: number): Promise<WorldLive> {
 	return db.transaction(async (tx) => {
 		await resolveWorld(tx, playerId);
-		return readWorld(tx, playerId);
+		return readWorldLive(tx, playerId);
+	});
+}
+
+/**
+ * `GET /api/world/static/[version]`'s own read. Null on a version that isn't current — a stale URL,
+ * not a game rule — so the route 404s and the client falls back to whatever version its next
+ * `/api/world` read reports, rather than ever serving one half against the other's terrain.
+ */
+export async function loadWorldStaticFor(version: string): Promise<WorldStatic | null> {
+	return db.transaction(async (tx) => {
+		const current = await loadStaticWorld(tx);
+		if (current.version !== version) return null;
+		return readWorldStatic(tx);
 	});
 }
 
@@ -751,9 +772,38 @@ type TileYield = {
 	regrowSeconds: number | null;
 };
 
-/** What each tile yields, how fast, and how much of it there is, keyed row-major. */
-async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
-	const rows = await tx
+/**
+ * The two full-grid reads this project's egress problem was measured against (see the history in
+ * CLAUDE.md and on readWorld below): the whole `tile` table, and its join to `resource` via
+ * `terrainType` — 28,583 rows a read, ~1.3 MB of Neon egress, against static content that only
+ * ever changes when `npm run seed` runs. Held in process behind the content version the seed
+ * writes to `game_config`: the same version means the same rows, so every call after the first is
+ * one tiny single-row read instead of the two heavy ones.
+ *
+ * Shared by every caller that used to run these queries itself — `tileYields`, `loadGrid`, and
+ * `readWorldStatic` — so a build order's occupancy check and an estimate's re-quote stop paying
+ * 16,384 rows too, the same fix `readWorld`'s own read gets.
+ *
+ * ponytail: a per-lambda-instance memo — module state, not a shared cache. Every cold spin-up
+ * warms it again (one ~1.3 MB DB read), which is exactly what `/api/world/static`'s year-long,
+ * immutable CDN response exists to avoid paying a second way — most cold instances should never
+ * reach this at all once the edge is serving statics. A blob/CDN artifact the seed writes directly
+ * (architecture C on issue #21) is the upgrade the day per-instance warming is itself the cost.
+ */
+let staticWorldCache: {
+	version: string;
+	tiles: (typeof tile.$inferSelect)[];
+	deposits: Map<number, TileYield>;
+} | null = null;
+
+async function loadStaticWorld(tx: Tx) {
+	const [cfg] = await tx.select({ worldVersion: gameConfig.worldVersion }).from(gameConfig);
+	if (!cfg || cfg.worldVersion === null)
+		throw new Error('no world_version in game_config — run `npm run seed` against this database');
+	if (staticWorldCache?.version === cfg.worldVersion) return staticWorldCache;
+
+	const tiles = await tx.select().from(tile);
+	const depositRows = await tx
 		.select({
 			x: tile.x,
 			y: tile.y,
@@ -767,7 +817,15 @@ async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
 		.from(tile)
 		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
 		.innerJoin(resource, eq(terrainType.yieldsResourceId, resource.id));
-	return new Map(rows.map((r) => [r.y * GRID_SIZE + r.x, r]));
+	const deposits = new Map(depositRows.map((r) => [r.y * GRID_SIZE + r.x, r]));
+
+	staticWorldCache = { version: cfg.worldVersion, tiles, deposits };
+	return staticWorldCache;
+}
+
+/** What each tile yields, how fast, and how much of it there is, keyed row-major. */
+async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
+	return (await loadStaticWorld(tx)).deposits;
 }
 
 type RankedWorker = { character: typeof character.$inferSelect; multiplier: number };
@@ -951,14 +1009,16 @@ export type EstimateResult =
 
 /**
  * The grid a build order is judged against: what every tile is made of, keyed the same
- * row-major way the wire payload is. One read of the whole grid serves both the destination's
- * buildability and the cost of every tile a route might cross — and routing genuinely needs all
- * of them, since it does not know which way it is going until it has looked.
+ * row-major way the wire payload is. Serves both the destination's buildability and the cost of
+ * every tile a route might cross — and routing genuinely needs all of them, since it does not know
+ * which way it is going until it has looked.
  *
- * **Per player, because roads are.** A tile's cost is now what is *built* on it if that changes the
+ * **Per player, because roads are.** A tile's cost is what is *built* on it if that changes the
  * ground, else the terrain's own — and buildings are player-scoped under VISION #4's interim
- * override, so your roads speed your people up and nobody else's. The COALESCE is the whole of
- * "a road is a fast tile"; there is no other place where roads affect travel.
+ * override, so your roads speed your people up and nobody else's. That used to mean one query
+ * joining the whole grid against this player's buildings every call, which was the second full-grid
+ * read this write path paid (see `loadStaticWorld`'s own note) — now the whole-grid part comes from
+ * the shared memo and only this player's own roads are read fresh: a handful of rows, not 16,384.
  */
 async function loadGrid(
 	tx: Tx,
@@ -974,34 +1034,35 @@ async function loadGrid(
 		}
 	>
 > {
-	const rows = await tx
-		.select({
-			x: tile.x,
-			y: tile.y,
-			buildable: terrainType.buildable,
-			isDeposit: terrainType.isDeposit,
-			yieldsResourceId: terrainType.yieldsResourceId,
-			movementCost: sql<number>`coalesce(${buildingType.movementCost}, ${terrainType.movementCost})`
-		})
-		.from(tile)
-		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
-		// The left joins are what keep this one read: a tile with nothing on it still comes back, with
-		// its own cost. The unique index on (player_id, x, y) is why one building can match at most.
-		.leftJoin(
-			building,
-			and(eq(building.x, tile.x), eq(building.y, tile.y), eq(building.playerId, playerId))
-		)
-		.leftJoin(buildingType, eq(building.buildingTypeId, buildingType.id));
+	const { tiles } = await loadStaticWorld(tx);
+	// A small catalog, not the grid — cheap to read fresh rather than folding into the memo.
+	const terrainById = new Map((await tx.select().from(terrainType)).map((t) => [t.id, t]));
+	// This player's own movement-cost overrides only (their roads) — the COALESCE the old single
+	// query expressed in SQL, done here in JS against a read that is this player's buildings, not
+	// the whole map.
+	const overrides = new Map(
+		(
+			await tx
+				.select({ x: building.x, y: building.y, movementCost: buildingType.movementCost })
+				.from(building)
+				.innerJoin(buildingType, eq(building.buildingTypeId, buildingType.id))
+				.where(and(eq(building.playerId, playerId), sql`${buildingType.movementCost} IS NOT NULL`))
+		).map((b) => [b.y * GRID_SIZE + b.x, b.movementCost as number])
+	);
 	return new Map(
-		rows.map((r) => [
-			r.y * GRID_SIZE + r.x,
-			{
-				buildable: r.buildable,
-				isDeposit: r.isDeposit,
-				yieldsResourceId: r.yieldsResourceId,
-				movementCost: r.movementCost
-			}
-		])
+		tiles.map((t) => {
+			const tt = terrainById.get(t.terrainTypeId)!;
+			const key = t.y * GRID_SIZE + t.x;
+			return [
+				key,
+				{
+					buildable: tt.buildable,
+					isDeposit: tt.isDeposit,
+					yieldsResourceId: tt.yieldsResourceId,
+					movementCost: overrides.get(key) ?? tt.movementCost
+				}
+			];
+		})
 	);
 }
 
@@ -1907,24 +1968,117 @@ export async function restyleRoad(
 }
 
 /** The world as stored, plus the DB's own `now` — the only clock anything trusts. */
-export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload> {
-	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
-	// The circle MapCanvas draws and world.server.ts's own gates enforce, from the same three
-	// numbers — see reachOf's own comment for why a missing Marketplace throws rather than shipping
-	// a silent radius of 0.
-	const reach = await reachOf(tx, playerId);
+/**
+ * The never-changing half of the wire payload — terrain, catalogs, costs and recipes, everything
+ * that only moves when `npm run seed` runs. This is the half `readWorld`'s own long-standing note
+ * named as the egress problem: the whole tile grid and its join to resources, 28,583 rows a read.
+ * Both now come from the shared `loadStaticWorld` memo instead, so a cache hit costs one tiny
+ * `game_config` read rather than 1.3 MB.
+ *
+ * Two callers: folded into `readWorld` below for the mutation endpoints, which still return one
+ * composed `WorldPayload` the client fully replaces its state with — and served standalone by
+ * `GET /api/world/static/[version]`, whose year-long immutable CDN response is what lets a whole
+ * fleet of lambda instances share one answer instead of each warming its own memo.
+ */
+export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
+	const { tiles } = await loadStaticWorld(tx);
 	// Ordered, because the client picks a default from this list by position.
 	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
 	const costs = await tx.select().from(buildingCost);
 	// `building_cost`'s twin: what one batch consumes at each workshop.
 	const recipes = await tx.select().from(recipeInput);
 	// Terrain and resources are global catalogs, unfiltered by player — same split as
-	// buildingTypes. The ground is the world's, not yours.
+	// buildingTypes. The ground is the world's, not yours. Small tables, so read fresh rather than
+	// folded into the memo — the memo exists for the two reads that are actually large.
 	const terrainTypes = await tx.select().from(terrainType);
 	const resources = await tx.select().from(resource);
 	// Professions the School offers — a global catalog like building types, ordered so the Train
 	// picker doesn't reshuffle between reads.
 	const professions = await tx.select().from(profession).orderBy(asc(profession.id));
+
+	// Built by index, not by sort order: `terrain` is positional, so one missing row would
+	// shift every tile after it and render a wrong-but-plausible map. The check is that the
+	// array we send is dense — a row *count* would pass on 256 rows with out-of-range
+	// coordinates and still leave holes. A hole is a corrupt world, not a game rule, so it
+	// throws rather than degrading.
+	const terrain: number[] = new Array(GRID_SIZE * GRID_SIZE);
+	for (const t of tiles) terrain[t.y * GRID_SIZE + t.x] = t.terrainTypeId;
+	for (let i = 0; i < terrain.length; i++) {
+		if (terrain[i] !== undefined) continue;
+		throw new Error(
+			tiles.length === 0
+				? 'no tile rows — the grid is unseeded; run `npm run seed` against this database'
+				: `tile grid has a hole at (${i % GRID_SIZE}, ${Math.floor(i / GRID_SIZE)})`
+		);
+	}
+
+	// Capacity is a pure function of terrain type — the seed writes the same quantity to every
+	// tile of a given type — so it rides the catalog below (one value per type) rather than a
+	// second dense per-tile array shipping the identical fact 16,384 times.
+	const capacityByType = new Map<number, number | null>();
+	for (const t of tiles)
+		if (!capacityByType.has(t.terrainTypeId)) capacityByType.set(t.terrainTypeId, t.quantity);
+
+	return {
+		gridSize: GRID_SIZE,
+		terrain,
+		terrainTypes: terrainTypes.map((t) => ({
+			id: t.id,
+			displayName: t.displayName,
+			color: t.color,
+			icon: t.icon,
+			buildable: t.buildable,
+			yieldsResourceId: t.yieldsResourceId,
+			// The same rule the server gate runs, shipped per terrain so the menu offers only what
+			// the writer would accept — a menu that lists what the server refuses is the bug this epic exists to kill.
+			buildableTypeIds: eligibleTypeIds(t, types, resources),
+			capacity: capacityByType.get(t.id) ?? null
+		})),
+		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName, icon: r.icon })),
+		professions: professions.map((p) => ({ id: p.id, displayName: p.displayName })),
+		buildingCosts: costs.map((c) => ({
+			buildingTypeId: c.buildingTypeId,
+			resourceId: c.resourceId,
+			quantity: c.quantity
+		})),
+		recipeInputs: recipes.map((r) => ({
+			buildingTypeId: r.buildingTypeId,
+			resourceId: r.resourceId,
+			quantity: r.quantity
+		})),
+		buildingTypes: types.map((t) => ({
+			id: t.id,
+			displayName: t.displayName,
+			icon: t.icon,
+			buildSeconds: t.buildSeconds,
+			housingCapacity: t.housingCapacity,
+			movementCost: t.movementCost,
+			requiresBuildingTypeId: t.requiresBuildingTypeId,
+			// All three or none — non-null is what makes this type a workshop, and the client reads
+			// exactly that to decide whether a tile offers "Make 10 Planks".
+			producesResourceId: t.producesResourceId,
+			outputQuantity: t.outputQuantity,
+			craftSeconds: t.craftSeconds
+		}))
+	};
+}
+
+/**
+ * The per-player half of the wire payload — everything that moves on this player's own writes, or
+ * with the clock. `GET /api/world` ships this half alone (see `loadWorldLive`); the mutation
+ * endpoints still compose it with `readWorldStatic` into one `WorldPayload` (see `readWorld`
+ * below), because a build order or a training already returns a full replacement for `world` on
+ * the client and there is no version-mismatch question to ask there.
+ */
+export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive> {
+	const [{ now }] = await tx.execute<{ now: Date }>(sql`select now() as now`);
+	// The circle MapCanvas draws and world.server.ts's own gates enforce, from the same three
+	// numbers — see reachOf's own comment for why a missing Marketplace throws rather than shipping
+	// a silent radius of 0.
+	const reach = await reachOf(tx, playerId);
+	const [cfg] = await tx.select().from(gameConfig);
+	if (!cfg || cfg.worldVersion === null)
+		throw new Error('no world_version in game_config — run `npm run seed` against this database');
 	const held = await tx
 		.select({ resourceId: stock.resourceId, quantity: stock.quantity })
 		.from(stock)
@@ -1933,20 +2087,13 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		// Ordered, because the resource bar is rendered in payload order and an unordered join
 		// is free to hand back a different one on every read — a bar that reshuffles itself.
 		.orderBy(asc(stock.resourceId));
-	// ponytail: these two lines are where this project's only real scaling problem lives, measured
-	// rather than suspected. The grid select returns 16,384 rows and `tileYields` another 12,199 —
-	// ~1.3 MB of Neon egress on every single read, against a response the player receives as ~6 KB
-	// gzipped. With a 30-second heartbeat that is ~156 MB an hour per open tab, and in July 2026 it
-	// put 8.44 GB through a 5 GB monthly allowance and had the project suspended. Everything else
-	// read here is per-player and tiny: stock was 1,162 rows across 166 realms.
-	//
-	// Ceiling: neither of these changes while the game runs — terrain and the resource catalog are
-	// both seeded data — so the upgrade path is to hold them in process behind a version that
-	// `npm run seed` bumps, which takes a read to a few KB. Deliberately not done yet; `npm run
-	// egress` is how to tell whether it has started to matter. Do not add a third full-grid read
-	// here without reading that first.
-	const tiles = await tx.select().from(tile);
-	const deposits = await tileYields(tx);
+	// The static grid's live twin: deposits is content (what a tile yields, how fast), pulled from
+	// the same shared memo readWorldStatic uses — only what is drawn down from it (below) is
+	// per-player.
+	const { deposits } = await loadStaticWorld(tx);
+	// A resource catalog read of its own, distinct from readWorldStatic's wire-shaped one: this one
+	// needs isSustenance for the food-rate calculation below, which never goes on the wire itself.
+	const resources = await tx.select().from(resource);
 	const drawn = await tx.select().from(tileStock).where(eq(tileStock.playerId, playerId));
 	const buildings = await tx.select().from(building).where(eq(building.playerId, playerId));
 	const characters = await tx.select().from(character).where(eq(character.playerId, playerId));
@@ -1969,22 +2116,6 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 				)
 			);
 		for (const r of rows) crews.set(r.operationId, [...(crews.get(r.operationId) ?? []), r]);
-	}
-
-	// Built by index, not by sort order: `terrain` is positional, so one missing row would
-	// shift every tile after it and render a wrong-but-plausible map. The check is that the
-	// array we send is dense — a row *count* would pass on 256 rows with out-of-range
-	// coordinates and still leave holes. A hole is a corrupt world, not a game rule, so it
-	// throws rather than degrading.
-	const terrain: number[] = new Array(GRID_SIZE * GRID_SIZE);
-	for (const t of tiles) terrain[t.y * GRID_SIZE + t.x] = t.terrainTypeId;
-	for (let i = 0; i < terrain.length; i++) {
-		if (terrain[i] !== undefined) continue;
-		throw new Error(
-			tiles.length === 0
-				? 'no tile rows — the grid is unseeded; run `npm run seed` against this database'
-				: `tile grid has a hole at (${i % GRID_SIZE}, ${Math.floor(i / GRID_SIZE)})`
-		);
 	}
 
 	// A tile nobody is standing on still recovers, and only the gather branch writes — so a
@@ -2012,19 +2143,9 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 		if (d.capacity === null || d.regrowSeconds === null) continue;
 		tileQuantity[i] = live.get(i) ?? d.capacity;
 	}
-	// Capacity is a pure function of terrain type — the seed writes the same quantity to every
-	// tile of a given type — so it rides the catalog below (one value per type) rather than a
-	// second dense per-tile array shipping the identical fact 16,384 times. Read straight off the
-	// already-loaded tile grid rather than `deposits`, which only carries terrain that yields a
-	// resource: a hole here would just mean an unbuildable type reports capacity null, same as
-	// today.
-	const capacityByType = new Map<number, number | null>();
-	for (const t of tiles)
-		if (!capacityByType.has(t.terrainTypeId)) capacityByType.set(t.terrainTypeId, t.quantity);
 
 	// Which way each stock is moving. Every input is already in hand except the per-capita food
 	// rate, and it is read from the same singleton row the drain in resolveWorld charges from.
-	const [cfg] = await tx.select().from(gameConfig);
 	const sustenance = resources.find((r) => r.isSustenance);
 	const rates = netRates(
 		operations
@@ -2044,7 +2165,7 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 				];
 			}),
 		nowMs,
-		sustenance && cfg
+		sustenance
 			? {
 					resourceId: sustenance.id,
 					perCapitaHour: cfg.foodPerCapitaHour,
@@ -2055,49 +2176,10 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 
 	return {
 		now: new Date(now).toISOString(),
-		gridSize: GRID_SIZE,
+		worldVersion: cfg.worldVersion,
 		reach,
 		tileQuantity,
-		terrainTypes: terrainTypes.map((t) => ({
-			id: t.id,
-			displayName: t.displayName,
-			color: t.color,
-			icon: t.icon,
-			buildable: t.buildable,
-			yieldsResourceId: t.yieldsResourceId,
-			// The same rule the server gate runs, shipped per terrain so the menu offers only what
-			// the writer would accept — a menu that lists what the server refuses is the bug this epic exists to kill.
-			buildableTypeIds: eligibleTypeIds(t, types, resources),
-			capacity: capacityByType.get(t.id) ?? null
-		})),
-		resources: resources.map((r) => ({ id: r.id, displayName: r.displayName, icon: r.icon })),
-		professions: professions.map((p) => ({ id: p.id, displayName: p.displayName })),
 		stock: held.map((s) => ({ ...s, ratePerHour: rates.get(s.resourceId) ?? 0 })),
-		buildingCosts: costs.map((c) => ({
-			buildingTypeId: c.buildingTypeId,
-			resourceId: c.resourceId,
-			quantity: c.quantity
-		})),
-		recipeInputs: recipes.map((r) => ({
-			buildingTypeId: r.buildingTypeId,
-			resourceId: r.resourceId,
-			quantity: r.quantity
-		})),
-		terrain,
-		buildingTypes: types.map((t) => ({
-			id: t.id,
-			displayName: t.displayName,
-			icon: t.icon,
-			buildSeconds: t.buildSeconds,
-			housingCapacity: t.housingCapacity,
-			movementCost: t.movementCost,
-			requiresBuildingTypeId: t.requiresBuildingTypeId,
-			// All three or none — non-null is what makes this type a workshop, and the client reads
-			// exactly that to decide whether a tile offers "Make 10 Planks".
-			producesResourceId: t.producesResourceId,
-			outputQuantity: t.outputQuantity,
-			craftSeconds: t.craftSeconds
-		})),
 		buildings: buildings.map((b) => ({
 			id: b.id,
 			x: b.x,
@@ -2135,4 +2217,12 @@ export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload>
 			}))
 		}))
 	};
+}
+
+/** The world as stored, plus the DB's own `now` — the only clock anything trusts. Composed from
+ * the static and live halves above; see their own comments for why each is its own function. */
+export async function readWorld(tx: Tx, playerId: number): Promise<WorldPayload> {
+	const staticHalf = await readWorldStatic(tx);
+	const liveHalf = await readWorldLive(tx, playerId);
+	return { ...staticHalf, ...liveHalf };
 }

@@ -382,7 +382,17 @@ export const gameConfig = pgTable(
 		// missing-catalog-row case in that file already gives — a default would hide the gap instead
 		// of reporting it.
 		startX: integer('start_x'),
-		startY: integer('start_y')
+		startY: integer('start_y'),
+		// A content fingerprint of the generated world — worldgen.ts's own `contentVersion`: the same
+		// WORLD_SEED, the same GRID_SIZE and the same generator source hash to the same string,
+		// forever, never a function of *when* the seed happened to run (`vercel-build` runs it on
+		// every deploy, and a timestamp version would invalidate every cache on a deploy that changed
+		// nothing). world.server.ts's in-process memo of the tile grid and its resource join keys on
+		// this one small column instead of re-reading 28,583 rows a request — see readWorld's own
+		// note. Nullable like startX/startY: a row seeded before this column existed has none, and
+		// world.server.ts throws on that the same way it throws on a missing start position — `run
+		// npm run seed`, not a silent guess.
+		worldVersion: text('world_version')
 	},
 	(t) => [
 		check('game_config_singleton', sql`${t.id} = 1`),
