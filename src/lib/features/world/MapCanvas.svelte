@@ -20,6 +20,7 @@
 		tileAt,
 		type WorldPayload
 	} from './world';
+	import { overviewFor } from './overview';
 
 	type Props = {
 		world: WorldPayload;
@@ -131,51 +132,23 @@
 	// no fidelity and buys back the whole far tier. At or above it, sprites draw detail this 1px/tile
 	// bitmap can't hold, so the per-cell loop keeps running there.
 	//
-	// Built once per content version (world.worldVersion — terrain only moves on a reseed) rather
-	// than once per payload: a payload is replaced on every heartbeat, but the terrain under it is
-	// almost always the same array. 1448×1448 = 2,096,704 px × 4 bytes (RGBA) ≈ 8.4 MB — comfortably
-	// under Safari's 16,777,216-pixel ceiling for a single canvas (2D or WebGL backing store), which
-	// is the real limit worth naming: a much bigger future world (GRID_SIZE² over that count) cannot
-	// keep doing this as one canvas.
-	//
-	// ponytail: a one-level pyramid, built synchronously on the main thread the first time the far
-	// tier is reached. The real upgrade is #21 architecture C — a pre-rendered image pyramid served
-	// from blob storage — which is also what lifts the 16.7M-pixel ceiling off the bitmap itself.
-	let overview: { version: string; canvas: OffscreenCanvas | HTMLCanvasElement } | null = null;
+	// Built and cached in overview.ts, not here: the minimap draws this exact same bitmap, and a
+	// second component building an identical ~8.4 MB canvas the moment it mounts would be the second
+	// implementation this project keeps having to notice and undo. See that module for the build and
+	// size notes.
 
-	function buildOverview(w: WorldPayload): OffscreenCanvas | HTMLCanvasElement {
-		const rgb = new Map<number, [number, number, number]>(
-			w.terrainTypes.map((t) => [
-				t.id,
-				[
-					parseInt(t.color.slice(1, 3), 16),
-					parseInt(t.color.slice(3, 5), 16),
-					parseInt(t.color.slice(5, 7), 16)
-				]
-			])
-		);
-		const data = new Uint8ClampedArray(GRID_SIZE * GRID_SIZE * 4);
-		for (let i = 0; i < w.terrain.length; i++) {
-			const [r, g, b] = rgb.get(w.terrain[i]) ?? [0, 0, 0];
-			const o = i * 4;
-			data[o] = r;
-			data[o + 1] = g;
-			data[o + 2] = b;
-			data[o + 3] = 255;
-		}
-		// OffscreenCanvas where it exists (never attached to the DOM, and this never needs to be);
-		// a plain <canvas> is exactly as good as a blit source for the browsers that lack it.
-		const canvas =
-			typeof OffscreenCanvas !== 'undefined'
-				? new OffscreenCanvas(GRID_SIZE, GRID_SIZE)
-				: document.createElement('canvas');
-		canvas.width = GRID_SIZE;
-		canvas.height = GRID_SIZE;
-		const octx = canvas.getContext('2d') as
-			CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
-		octx.putImageData(new ImageData(data, GRID_SIZE, GRID_SIZE), 0, 0);
-		return canvas;
-	}
+	// The colour beyond the world's own bounds — a wide zoom-out (the fitted floor's own 8% gutter,
+	// or simply scrolling past an edge) leaves canvas the tile loop below never touches, which used
+	// to fall through to the page's own background and read as a rendering failure rather than "the
+	// map ends here". Parchment is the wide-zoom look this project already settled on (issue #21);
+	// painting it under everything else is cheaper than tracking which pixels the loop actually
+	// reached, and terrain still stops exactly at GRID_SIZE — this is only what surrounds it.
+	//
+	// ponytail: a literal hex rather than a CSS custom property. It names a physical place ("there is
+	// no map here"), not UI chrome, so it doesn't switch with light/dark theme the way --panel-bg
+	// does — and nothing else on the page needs to reference it, so a shared token would be one
+	// consumer speculating about a second.
+	const EDGE_OF_WORLD = '#ddc9a0';
 
 	// ---- Drawing --------------------------------------------------------------------------------
 	let rafPending = false;
@@ -195,7 +168,11 @@
 		if (!ctx || !pane) return;
 		const w = pane.clientWidth;
 		const h = pane.clientHeight;
-		ctx.clearRect(0, 0, w, h);
+		// Parchment first, everywhere — the tile loop below only ever paints the rect the world
+		// actually covers, so whatever it leaves untouched (past an edge) is the answer to "what's
+		// out there" rather than last frame's leftovers or a clear-to-transparent hole.
+		ctx.fillStyle = EDGE_OF_WORLD;
+		ctx.fillRect(0, 0, w, h);
 		const scrollLeft = pane.scrollLeft;
 		const scrollTop = pane.scrollTop;
 		const firstX = Math.max(0, Math.floor(tileAt(scrollLeft, 0, cell)));
@@ -212,11 +189,7 @@
 
 		if (!drawArt) {
 			// The far tier, at any zoom the fitted floor reaches: one blit instead of up to 2,096,704
-			// fillRects. See the overview bitmap's own header comment for why this is the same picture
-			// the per-cell loop below would have painted.
-			if (!overview || overview.version !== world.worldVersion) {
-				overview = { version: world.worldVersion, canvas: buildOverview(world) };
-			}
+			// fillRects. See overview.ts for why this bitmap is built and cached there rather than here.
 			const dx0 = snappedEdge(firstX, cell, scrollLeft);
 			const dy0 = snappedEdge(firstY, cell, scrollTop);
 			const dx1 = snappedEdge(lastX + 1, cell, scrollLeft);
@@ -224,7 +197,7 @@
 			// Nearest-neighbour, not smoothed (set above): the source is already one flat colour per
 			// tile, and blurring the upscale would just soften the tile boundaries this fix keeps crisp.
 			ctx.drawImage(
-				overview.canvas,
+				overviewFor(world),
 				firstX,
 				firstY,
 				lastX - firstX + 1,

@@ -93,6 +93,26 @@ export function snappedEdge(t: number, cell: number, scroll: number): number {
 	return Math.round(t * cell - scroll);
 }
 
+/**
+ * Where a world tile coordinate lands on the minimap, in minimap pixels — `size` is the minimap's
+ * own square side (it is a fixed-size square regardless of the main view's zoom), and the whole
+ * world (0..GRID_SIZE) maps onto it linearly. One line, but exactly the arithmetic that goes wrong
+ * by a factor or an offset if it were reimplemented separately for the viewport rectangle and the
+ * settlement pins — see `minimapToWorld` for its inverse, which click-to-travel uses.
+ */
+export function worldToMinimap(t: number, size: number): number {
+	return (t / GRID_SIZE) * size;
+}
+
+/**
+ * The inverse of `worldToMinimap` — the world coordinate under a minimap-relative pixel. Clicking or
+ * dragging the minimap goes through this rather than a second copy of `GRID_SIZE / size`, so a click
+ * can never land on a tile the drawn viewport rectangle disagrees with.
+ */
+export function minimapToWorld(px: number, size: number): number {
+	return (px / size) * GRID_SIZE;
+}
+
 export type OrderReason =
 	| 'OUT_OF_BOUNDS'
 	| 'UNKNOWN_BUILDING_TYPE'

@@ -6,6 +6,8 @@ import {
 	crewBuild,
 	crewRate,
 	eligibleTypeIds,
+	GRID_SIZE,
+	minimapToWorld,
 	NAME_POOL,
 	netRates,
 	pickName,
@@ -24,6 +26,7 @@ import {
 	tileAt,
 	travelFraction,
 	withinReach,
+	worldToMinimap,
 	zoomAbout
 } from './world.ts';
 
@@ -759,4 +762,37 @@ test('snappedEdge tiles exactly: every tile’s right edge is the next tile’s 
 			}
 		}
 	}
+});
+
+// ---- The minimap's own coordinate mapping ---------------------------------------------------
+// A click at minimap pixel (px, py) has to land on the tile the drawn viewport rectangle claims
+// that pixel is — this is the arithmetic that silently goes wrong by a factor or an offset if the
+// rectangle and the click handler ever compute it two different ways.
+
+test('worldToMinimap and minimapToWorld round-trip at every corner and a fractional edge', () => {
+	const size = 200;
+	for (const t of [0, 1, 500, 1447.999, GRID_SIZE]) {
+		const px = worldToMinimap(t, size);
+		assert.ok(px >= 0 && px <= size + 1e-9, `${t} mapped outside the minimap square: ${px}`);
+		assert.ok(
+			Math.abs(minimapToWorld(px, size) - t) < 1e-9,
+			`round-trip drifted at t=${t}: ${minimapToWorld(px, size)}`
+		);
+	}
+});
+
+test('a click lands on the tile the viewport rectangle says it should', () => {
+	const size = 200;
+	// A viewport well inside the world: cell 6, scrolled to (3000, 1200), a 900×600 pane. The
+	// rectangle's own left/top edge (what the minimap derives with worldToMinimap) must map back,
+	// through minimapToWorld, to the same world tile the pane is actually scrolled to.
+	const cell = 6;
+	const scrollLeft = 3000;
+	const scrollTop = 1200;
+	const viewportX = scrollLeft / cell;
+	const viewportY = scrollTop / cell;
+	const rectX = worldToMinimap(viewportX, size);
+	const rectY = worldToMinimap(viewportY, size);
+	assert.ok(Math.abs(minimapToWorld(rectX, size) - viewportX) < 1e-9);
+	assert.ok(Math.abs(minimapToWorld(rectY, size) - viewportY) < 1e-9);
 });

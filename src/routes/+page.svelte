@@ -5,6 +5,7 @@
 	// would have been the same feature, written twice.
 	import { updated } from '$app/state';
 	import MapCanvas from '$lib/features/world/MapCanvas.svelte';
+	import Minimap from '$lib/features/world/Minimap.svelte';
 	import Sprites from '$lib/features/world/Sprites.svelte';
 	import {
 		GRID_SIZE,
@@ -15,6 +16,7 @@
 		roadStyles,
 		TIER_CLOSE_MIN,
 		TIER_MIDDLE_MIN,
+		tileAt,
 		travelFraction,
 		withinReach,
 		zoomAbout,
@@ -138,6 +140,19 @@
 	// Under this it is a click with an unsteady hand, not a pan.
 	const DRAG_SLOP = 4;
 
+	// The tile under the cursor, read continuously off the same pointermove listener the drag and
+	// pinch handling already runs on — a second listener for the same event would be the whole
+	// duplication the coordinate readout doesn't need to introduce. Null off the map or off the pane
+	// entirely, which the readout below reads as a blank.
+	let hover = $state<{ x: number; y: number } | null>(null);
+	function updateHover(e: PointerEvent) {
+		if (!pane) return;
+		const rect = pane.getBoundingClientRect();
+		const x = Math.floor(tileAt(pane.scrollLeft, e.clientX - rect.left, cell));
+		const y = Math.floor(tileAt(pane.scrollTop, e.clientY - rect.top, cell));
+		hover = x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE ? { x, y } : null;
+	}
+
 	// Zoom about a point: the world coordinate under (px, py) is read before the scale changes and
 	// re-planted under that same pixel after. Wheel notches, pinch steps and the +/- buttons all
 	// funnel through this one function, so "zoom" has exactly one implementation to get right.
@@ -184,6 +199,7 @@
 		dragged = false;
 	}
 	function panMove(e: PointerEvent) {
+		if (e.pointerType === 'mouse') updateHover(e);
 		if (e.pointerType === 'touch' && touches.has(e.pointerId)) {
 			touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
 			if (touches.size === 2 && pane) {
@@ -214,6 +230,8 @@
 		pinchDist = touches.size === 2 ? touchDistance() : 0;
 		pan = null;
 		panning = false;
+		// The cursor left the map (or lifted off it) — nothing under it to report any more.
+		if (e.pointerType === 'mouse') hover = null;
 	}
 	function swallowClick(e: MouseEvent) {
 		if (!dragged) return;
@@ -1008,6 +1026,13 @@
 		</ul>
 	{/if}
 	<div class="topbar-end">
+		<!-- Plain "x, y" rather than LoL's own 00011E:25800N — the same tile under the cursor either
+		     way, in the coordinates every other label on this page already uses (tileLabel, the
+		     buildings/citizens rows). Continuous while the cursor is over the map, so panning reads as
+		     crossing distance rather than sliding a texture; blank rather than stale once the cursor
+		     leaves. Sits in the topbar rather than floating over the map so it never has to dodge the
+		     inspector panel on the right. -->
+		<span class="coords" aria-hidden="true">{hover ? `${hover.x}, ${hover.y}` : '—, —'}</span>
 		<!-- Reachable without a wheel or a pinch. Both zoom about the pane's own centre, the same as
 		     the keyboard's +/- — there is no cursor position to hold still for a button press. -->
 		<button onclick={() => zoomButton(1 / 1.4)} disabled={!pane} aria-label="Zoom out">−</button>
@@ -1071,6 +1096,11 @@
 	>
 		<!-- The terrain layer. Canvas, not DOM — see MapCanvas's own header comment for why. -->
 		<MapCanvas {world} {selected} {cell} onselect={selectTile} />
+		<!-- The whole world, at a glance, with a viewport rectangle that says "you are seeing this
+		     much of it" better than any words could. Shown at every zoom, including the fitted floor —
+		     there the rectangle just reads as nearly the whole square, which is itself the honest
+		     answer at that zoom rather than a case worth hiding the minimap for. -->
+		<Minimap {world} {cell} onnavigate={centreOn} />
 		<div
 			class="grid"
 			style="--cell: {cell}px; width: {cell * GRID_SIZE}px; height: {cell * GRID_SIZE}px"
@@ -1553,8 +1583,15 @@
 	}
 	.topbar-end {
 		display: flex;
+		align-items: center;
 		gap: 0.5rem;
 		flex: none;
+	}
+	/* Tabular nums so the two digits don't jitter the buttons beside it as the cursor moves. */
+	.coords {
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
 	}
 	.topbar-end button {
 		background: var(--panel-bg);
