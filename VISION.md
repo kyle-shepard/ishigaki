@@ -302,6 +302,7 @@ multiplayer-shaped, scale-shaped, or both.
   exactly that view on the grounds that with one player and expansion parked it draws a single
   dot on an empty field. It was right. So this sequences behind the **shared-world reversal**
   and **expansion & borders**; the rendering is the easier half.
+
 - **Logistics, trade, military, politics** — in that order, and all after the reversal.
 - **Premium currency & rush**, **time/progression hardening**, **character autonomy**.
 
