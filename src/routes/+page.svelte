@@ -30,12 +30,28 @@
 	// everything that used to read the constant now reads the state instead: `centreOn`, the
 	// `.grid` CSS var, and every overlay's own `translate(x * cell, y * cell)`.
 	let cell = $state(32);
-	// Past MAX_CELL there is nothing left to see that CLOSE tier doesn't already show; below
-	// MIN_CELL the 48-tile world is under 100px wide and going further out buys nothing but a
-	// smaller dot.
-	const MIN_CELL = 2;
+	// Past MAX_CELL there is nothing left to see that CLOSE tier doesn't already show. The floor is
+	// the opposite problem: a fixed MIN_CELL (2px) was chosen when the world was 48 tiles wide —
+	// 96px, comfortably inside any pane. At 1448 tiles that same 2px floor is 2,896px, and a 1400px
+	// window can reach only 23% of the world's *area* before it hits the floor. The far tier's whole
+	// reason to exist — see the world at once — has to survive the world growing, so the floor is
+	// derived from the pane and GRID_SIZE instead: whichever cell size fits the *whole* grid inside
+	// the pane, minus a margin so it doesn't sit edge-to-edge. `minCellFor` is read at the moment of
+	// each zoom step (every call site already guards `if (!pane) return` first) rather than kept as
+	// tracked reactive state, since nothing needs it before the pane exists.
+	const FIT_MARGIN = 0.92; // leaves an 8% gutter around the fully-zoomed-out world
+	// A hard floor a much bigger future world (8192² is named in the ticket) can't push `cell`
+	// under — below it, snappedEdge starts rounding whole tiles to 0px (see world.test.ts) and a
+	// canvas draw call stops being worth the pixel it would paint.
+	const ABSOLUTE_MIN_CELL = 0.25;
+	const minCellFor = (paneEl: HTMLElement) =>
+		Math.max(
+			ABSOLUTE_MIN_CELL,
+			(Math.min(paneEl.clientWidth, paneEl.clientHeight) * FIT_MARGIN) / GRID_SIZE
+		);
 	const MAX_CELL = 64;
-	const clampCell = (c: number) => Math.min(MAX_CELL, Math.max(MIN_CELL, c));
+	const clampCell = (c: number, paneEl: HTMLElement) =>
+		Math.min(MAX_CELL, Math.max(minCellFor(paneEl), c));
 	// Derived, never set — there is no tier control anywhere in the UI. Same two numbers MapCanvas
 	// gates its own art on, so "where a tier starts" can't read two different answers in two files.
 	const tier = $derived(
@@ -127,7 +143,7 @@
 	// funnel through this one function, so "zoom" has exactly one implementation to get right.
 	function zoomAt(px: number, py: number, factor: number) {
 		if (!pane) return;
-		const next = clampCell(cell * factor);
+		const next = clampCell(cell * factor, pane);
 		if (next === cell) return;
 		const left = zoomAbout(pane.scrollLeft, px, cell, next);
 		const top = zoomAbout(pane.scrollTop, py, cell, next);

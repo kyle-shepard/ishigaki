@@ -79,6 +79,20 @@ export function zoomAbout(scroll: number, px: number, cell: number, nextCell: nu
 	return tileAt(scroll, px, cell) * nextCell - px;
 }
 
+/**
+ * The screen-pixel edge of tile coordinate `t` — round `t * cell - scroll` once, rather than
+ * rounding a cell's left and right edges as two independent computations. That one rounding is
+ * what MapCanvas's `draw()` calls for a tile's right edge (`t = x + 1`) and its right neighbour's
+ * left edge (the same `t = x + 1`) — same inputs, same function, so the two can never land on
+ * different sides of a half-pixel. Two edges rounded separately (`Math.round(x * cell)` and
+ * `Math.round((x + 1) * cell)` computed from a running offset, say) can drift apart at a
+ * fractional `cell`, which is exactly the seam Fault 2 was: antialiasing painted the gap as a
+ * lighter gridline nobody drew. world.test.ts pins the no-gap, no-overlap property this buys.
+ */
+export function snappedEdge(t: number, cell: number, scroll: number): number {
+	return Math.round(t * cell - scroll);
+}
+
 export type OrderReason =
 	| 'OUT_OF_BOUNDS'
 	| 'UNKNOWN_BUILDING_TYPE'

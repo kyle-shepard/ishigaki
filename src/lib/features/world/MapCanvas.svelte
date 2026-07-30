@@ -13,6 +13,7 @@
 <script lang="ts">
 	import {
 		GRID_SIZE,
+		snappedEdge,
 		TIER_CLOSE_MIN,
 		TIER_DETAIL_MIN,
 		TIER_MIDDLE_MIN,
@@ -122,6 +123,60 @@
 		return null;
 	}
 
+	// ---- The overview bitmap -------------------------------------------------------------------
+	// One pixel per tile, flat colour only — the same picture the per-cell loop below paints once
+	// `drawArt` is false (cell < TIER_MIDDLE_MIN, no art, no sprites). That's not a coincidence: it's
+	// the threshold this reuses rather than inventing a new one — below TIER_MIDDLE_MIN the per-cell
+	// loop and this bitmap are pixel-for-pixel the same picture, so swapping to one `drawImage` costs
+	// no fidelity and buys back the whole far tier. At or above it, sprites draw detail this 1px/tile
+	// bitmap can't hold, so the per-cell loop keeps running there.
+	//
+	// Built once per content version (world.worldVersion — terrain only moves on a reseed) rather
+	// than once per payload: a payload is replaced on every heartbeat, but the terrain under it is
+	// almost always the same array. 1448×1448 = 2,096,704 px × 4 bytes (RGBA) ≈ 8.4 MB — comfortably
+	// under Safari's 16,777,216-pixel ceiling for a single canvas (2D or WebGL backing store), which
+	// is the real limit worth naming: a much bigger future world (GRID_SIZE² over that count) cannot
+	// keep doing this as one canvas.
+	//
+	// ponytail: a one-level pyramid, built synchronously on the main thread the first time the far
+	// tier is reached. The real upgrade is #21 architecture C — a pre-rendered image pyramid served
+	// from blob storage — which is also what lifts the 16.7M-pixel ceiling off the bitmap itself.
+	let overview: { version: string; canvas: OffscreenCanvas | HTMLCanvasElement } | null = null;
+
+	function buildOverview(w: WorldPayload): OffscreenCanvas | HTMLCanvasElement {
+		const rgb = new Map<number, [number, number, number]>(
+			w.terrainTypes.map((t) => [
+				t.id,
+				[
+					parseInt(t.color.slice(1, 3), 16),
+					parseInt(t.color.slice(3, 5), 16),
+					parseInt(t.color.slice(5, 7), 16)
+				]
+			])
+		);
+		const data = new Uint8ClampedArray(GRID_SIZE * GRID_SIZE * 4);
+		for (let i = 0; i < w.terrain.length; i++) {
+			const [r, g, b] = rgb.get(w.terrain[i]) ?? [0, 0, 0];
+			const o = i * 4;
+			data[o] = r;
+			data[o + 1] = g;
+			data[o + 2] = b;
+			data[o + 3] = 255;
+		}
+		// OffscreenCanvas where it exists (never attached to the DOM, and this never needs to be);
+		// a plain <canvas> is exactly as good as a blit source for the browsers that lack it.
+		const canvas =
+			typeof OffscreenCanvas !== 'undefined'
+				? new OffscreenCanvas(GRID_SIZE, GRID_SIZE)
+				: document.createElement('canvas');
+		canvas.width = GRID_SIZE;
+		canvas.height = GRID_SIZE;
+		const octx = canvas.getContext('2d') as
+			CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+		octx.putImageData(new ImageData(data, GRID_SIZE, GRID_SIZE), 0, 0);
+		return canvas;
+	}
+
 	// ---- Drawing --------------------------------------------------------------------------------
 	let rafPending = false;
 	// Coalesces the flurry of native 'scroll' events a drag or a momentum scroll fires into one
@@ -151,33 +206,69 @@
 		// the same number +page.svelte derives its own tier from, so "far is flat colour" is one
 		// shared threshold rather than a fact repeated in two files that could disagree.
 		const drawArt = cell >= TIER_MIDDLE_MIN;
-		// Ground cover goes flat before landmarks do — see TIER_DETAIL_MIN. Pulled out of the loop
-		// because it is the same answer for all 16,384 tiles.
-		const detailed = cell >= TIER_DETAIL_MIN;
-		const size = atlasSizeFor(cell);
-		for (let y = firstY; y <= lastY; y++) {
-			for (let x = firstX; x <= lastX; x++) {
-				const t = terrainAt(y * GRID_SIZE + x);
-				if (!t) continue;
-				const px = x * cell - scrollLeft;
-				const py = y * cell - scrollTop;
-				ctx.fillStyle = t.color;
-				ctx.fillRect(px, py, cell, cell);
-				if (!drawArt || !t.icon) continue;
-				// The ground you walk on gives up its art first; the things you navigate by keep theirs.
-				if (!detailed && GROUND_COVER.has(t.icon)) continue;
-				const img = atlasTile(t.icon, size);
-				if (!img) continue;
-				// Mirrored on every other tile by parity of x+y, the same rule the DOM version drew
-				// with — so a run of forest still doesn't read as wallpaper now that canvas paints it.
-				if ((x + y) % 2) {
-					ctx.save();
-					ctx.translate(px + cell, py);
-					ctx.scale(-1, 1);
-					ctx.drawImage(img, 0, 0, cell, cell);
-					ctx.restore();
-				} else {
-					ctx.drawImage(img, px, py, cell, cell);
+		// Reset every frame — the overview branch below turns this off for its flat-colour blit, and
+		// it must not leak into a later frame that draws sprites and wants the default scaling back.
+		ctx.imageSmoothingEnabled = drawArt;
+
+		if (!drawArt) {
+			// The far tier, at any zoom the fitted floor reaches: one blit instead of up to 2,096,704
+			// fillRects. See the overview bitmap's own header comment for why this is the same picture
+			// the per-cell loop below would have painted.
+			if (!overview || overview.version !== world.worldVersion) {
+				overview = { version: world.worldVersion, canvas: buildOverview(world) };
+			}
+			const dx0 = snappedEdge(firstX, cell, scrollLeft);
+			const dy0 = snappedEdge(firstY, cell, scrollTop);
+			const dx1 = snappedEdge(lastX + 1, cell, scrollLeft);
+			const dy1 = snappedEdge(lastY + 1, cell, scrollTop);
+			// Nearest-neighbour, not smoothed (set above): the source is already one flat colour per
+			// tile, and blurring the upscale would just soften the tile boundaries this fix keeps crisp.
+			ctx.drawImage(
+				overview.canvas,
+				firstX,
+				firstY,
+				lastX - firstX + 1,
+				lastY - firstY + 1,
+				dx0,
+				dy0,
+				dx1 - dx0,
+				dy1 - dy0
+			);
+		} else {
+			// Ground cover goes flat before landmarks do — see TIER_DETAIL_MIN. Pulled out of the loop
+			// because it is the same answer for all 16,384 tiles.
+			const detailed = cell >= TIER_DETAIL_MIN;
+			const size = atlasSizeFor(cell);
+			for (let y = firstY; y <= lastY; y++) {
+				for (let x = firstX; x <= lastX; x++) {
+					const t = terrainAt(y * GRID_SIZE + x);
+					if (!t) continue;
+					// Snapped from each tile's *next* edge, not `px + cell` — see snappedEdge's own doc.
+					// A neighbour computes its own left edge from the same `x`/`x + 1` coordinate, so the
+					// two can never land on different sides of a half-pixel and leave the seam Fault 2 was.
+					const x0 = snappedEdge(x, cell, scrollLeft);
+					const y0 = snappedEdge(y, cell, scrollTop);
+					const x1 = snappedEdge(x + 1, cell, scrollLeft);
+					const y1 = snappedEdge(y + 1, cell, scrollTop);
+					ctx.fillStyle = t.color;
+					ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+					if (!t.icon) continue;
+					// The ground you walk on gives up its art first; the things you navigate by keep theirs.
+					if (!detailed && GROUND_COVER.has(t.icon)) continue;
+					const img = atlasTile(t.icon, size);
+					if (!img) continue;
+					// Mirrored on every other tile by parity of x+y, the same rule the DOM version drew
+					// with — so a run of forest still doesn't read as wallpaper now that canvas paints it.
+					// Same snapped rect as the fillRect above, so the art can't drift off its own tile.
+					if ((x + y) % 2) {
+						ctx.save();
+						ctx.translate(x1, y0);
+						ctx.scale(-1, 1);
+						ctx.drawImage(img, 0, 0, x1 - x0, y1 - y0);
+						ctx.restore();
+					} else {
+						ctx.drawImage(img, x0, y0, x1 - x0, y1 - y0);
+					}
 				}
 			}
 		}

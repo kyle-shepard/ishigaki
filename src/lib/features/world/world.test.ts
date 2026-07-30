@@ -17,6 +17,7 @@ import {
 	roadStyles,
 	rollStats,
 	skillValue,
+	snappedEdge,
 	STAT_MAX,
 	STAT_MIN,
 	route,
@@ -730,4 +731,32 @@ test('zoomAbout round-trips: zooming out and back in lands on the original scrol
 	const out = zoomAbout(scroll, px, cell, 12);
 	const back = zoomAbout(out, px, 12, cell);
 	assert.ok(Math.abs(back - scroll) < 1e-9, `round-trip drifted by ${back - scroll}`);
+});
+
+// ---- Snapped tile edges --------------------------------------------------------------------
+// Fault 2 was gridlines nobody drew: a fractional `cell` rounded independently at each tile's
+// left and right edge can leave a one-pixel gap antialiasing shows as a lighter seam. Pinning
+// this across a spread of fractional cell sizes and scroll offsets is what a screenshot can't do
+// at every zoom level, and what a regression here would silently reintroduce.
+
+test('snappedEdge tiles exactly: every tile’s right edge is the next tile’s left edge', () => {
+	// Below cell 1, a tile can round to zero screen pixels wide — expected at the extreme end of
+	// zoom-out (more world tiles than screen pixels), not a bug: the property that matters is that
+	// no tile ever gets a *negative* width, and that the chain of edges never gaps or overlaps.
+	for (const cell of [0.25, 0.4, 0.97, 1.3, 2.75, 8.01, 33.333, 63.99]) {
+		for (const scroll of [0, 5.5, -3.2, 137.7, 1000.1]) {
+			let prevRight = snappedEdge(0, cell, scroll);
+			for (let x = 0; x < 300; x++) {
+				const left = snappedEdge(x, cell, scroll);
+				const right = snappedEdge(x + 1, cell, scroll);
+				assert.equal(
+					left,
+					prevRight,
+					`gap or overlap at tile ${x}, cell ${cell}, scroll ${scroll}`
+				);
+				assert.ok(right >= left, `negative width at tile ${x}, cell ${cell}`);
+				prevRight = right;
+			}
+		}
+	}
 });
