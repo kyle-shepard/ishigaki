@@ -14,6 +14,21 @@ export const GRID_SIZE = 128;
 export const TIER_MIDDLE_MIN = 8; // below this: flat colour only, no art, no overlays
 export const TIER_CLOSE_MIN = 24; // at or above this: full art, and buildings/pawns/roads draw
 
+// Where ground cover stops drawing its art and becomes flat colour, while landmarks keep theirs.
+// A third number rather than a third tier: the tier a player is in still comes from the pair above,
+// and this only changes how one *kind* of terrain is painted inside the middle one.
+//
+// It exists because a 32px sprite does not survive being drawn at 12px — it loses its silhouette
+// and becomes texture. Meadow and Forest cover about 70% of the map between them, so at middle
+// distance their art stopped reading as grass and trees and started reading as speckle, busy enough
+// to fight the river running through it. Water, mountain, hills and the deposits are sparse, and a
+// sparse mark at 12px is exactly what "the range walls off the north, there is iron up there" wants.
+//
+// ponytail: tune by eye against the real map — it is a look, not a derivation, and this is the one
+// number to move. Raise it and more of the zoom range is flat colour; lower it and detail survives
+// further out. At or above TIER_CLOSE_MIN it stops meaning anything, because everything draws there.
+export const TIER_DETAIL_MIN = 18;
+
 // The opening reach radius — one number, two jobs. It is the first rung of the seeded
 // reach_milestone table, and it is the circle `findStart` (worldgen.ts) must guarantee holds a
 // Forest and a Stone outcrop before it will settle on a hamlet: the sphere of influence gates

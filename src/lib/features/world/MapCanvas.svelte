@@ -11,7 +11,14 @@
 	prop.
 -->
 <script lang="ts">
-	import { GRID_SIZE, TIER_CLOSE_MIN, TIER_MIDDLE_MIN, tileAt, type WorldPayload } from './world';
+	import {
+		GRID_SIZE,
+		TIER_CLOSE_MIN,
+		TIER_DETAIL_MIN,
+		TIER_MIDDLE_MIN,
+		tileAt,
+		type WorldPayload
+	} from './world';
 
 	type Props = {
 		world: WorldPayload;
@@ -32,6 +39,22 @@
 
 	const terrainById = $derived(new Map(world.terrainTypes.map((t) => [t.id, t])));
 	const terrainAt = (i: number) => terrainById.get(world.terrain[i]);
+
+	// Which terrain is *ground* rather than a landmark, by the icon name already on the wire. Meadow
+	// and Forest are the two that tile across most of the map — about 70% of it between them — so
+	// they are the two whose art becomes texture rather than detail once the cell gets small, and the
+	// two that give it up first (see TIER_DETAIL_MIN). Everything absent from this set is something a
+	// player navigates by, and keeps its mark all the way down to the far tier.
+	//
+	// Hills is deliberately *not* here. It is only ~4% of the map and it is the gradient that makes
+	// elevation read as a slope rather than a wall, which is worth a few pixels; flip it if a band of
+	// mounds turns out to be as noisy as the trees were.
+	//
+	// ponytail: a set in the renderer rather than a column on terrain_type, because it is a fact about
+	// drawing and nothing on the server has an opinion about it. If it ever needs to be data — a
+	// reskin choosing differently, say — it becomes a seeded boolean filtered the way
+	// `player_buildable` already is.
+	const GROUND_COVER = new Set(['meadow', 'forest']);
 
 	// ---- The atlas ----------------------------------------------------------------------------
 	// Three fixed rasterisations of each terrain symbol, quantised rather than keyed on the live
@@ -128,6 +151,9 @@
 		// the same number +page.svelte derives its own tier from, so "far is flat colour" is one
 		// shared threshold rather than a fact repeated in two files that could disagree.
 		const drawArt = cell >= TIER_MIDDLE_MIN;
+		// Ground cover goes flat before landmarks do — see TIER_DETAIL_MIN. Pulled out of the loop
+		// because it is the same answer for all 16,384 tiles.
+		const detailed = cell >= TIER_DETAIL_MIN;
 		const size = atlasSizeFor(cell);
 		for (let y = firstY; y <= lastY; y++) {
 			for (let x = firstX; x <= lastX; x++) {
@@ -138,6 +164,8 @@
 				ctx.fillStyle = t.color;
 				ctx.fillRect(px, py, cell, cell);
 				if (!drawArt || !t.icon) continue;
+				// The ground you walk on gives up its art first; the things you navigate by keep theirs.
+				if (!detailed && GROUND_COVER.has(t.icon)) continue;
 				const img = atlasTile(t.icon, size);
 				if (!img) continue;
 				// Mirrored on every other tile by parity of x+y, the same rule the DOM version drew
