@@ -18,8 +18,7 @@ import {
 	resource,
 	skill,
 	startPosition,
-	terrainType,
-	tile
+	terrainType
 } from '../src/lib/server/db/schema.ts';
 import {
 	GRID_SIZE,
@@ -63,7 +62,7 @@ if (WIPE) {
 	// back into the pool, unclaimed" a decision on the page rather than a side effect of CASCADE.
 	// It is re-populated, unclaimed, by the ordinary upsert below regardless of WIPE.
 	await db.execute(
-		sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, start_position, tile, terrain_type, resource RESTART IDENTITY CASCADE`
+		sql`TRUNCATE operation, building, character, building_cost, building_type, stock, tile_stock, settlement, player, start_position, terrain_type, resource RESTART IDENTITY CASCADE`
 	);
 }
 
@@ -689,7 +688,7 @@ await db.execute(
 // ponytail: this walks *affordability* only. It ignores build prerequisites (Stone wall → Quarry):
 // the one we add is satisfiable, so the ladder stays open, but a future unsatisfiable prereq would
 // slip past — teach it to walk prereq chains the day one could. The other blind spot, "the map
-// contains no tile to put the extractor on", is checked separately once the tiles exist below.
+// contains no tile to put the extractor on", is checked separately against the terrain census below.
 const takeable = resources.filter((r) => r.unitsPerHour > 0).map((r) => r.displayName);
 const reachable = new Set(takeable.filter((r) => !REQUIRES[r]));
 const buildable = new Set<string>();
@@ -857,22 +856,27 @@ const terrainRows = await db
 	.returning();
 const byChar = new Map(TERRAIN.map((t, i) => [t.char, terrainRows[i]]));
 
-// The map itself — one char per tile, from worldgen.ts's generator. This script's job is turning
-// those chars into rows, and refusing anything it can't.
-const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => {
-	const x = i % GRID_SIZE;
-	const y = Math.floor(i / GRID_SIZE);
-	const char = terrainCharAt(x, y);
-	const t = byChar.get(char);
-	if (!t) throw new Error(`(${x}, ${y}): unknown terrain char '${char}'`);
-	const spec = TERRAIN.find((s) => s.char === char)!;
-	// The invariant is "finite ⇔ regrow_seconds is set ⇔ quantity is set". A cross-table
-	// CHECK can't express it without denormalizing, and this is the only writer, so it is
-	// held here by construction — a terrain with one and not the other cannot be written.
+// The invariant is "finite ⇔ regrow_seconds is set ⇔ capacity is set". A cross-table CHECK can't
+// express it without denormalizing, and this is the only writer, so it is held here by construction
+// — a terrain with one and not the other cannot be written. Once per *spec*, not once per tile: it
+// is a fact about the eight rows above, and asking it 2,096,704 times (which is what the old
+// per-tile loop did) never made it any truer.
+for (const spec of TERRAIN)
 	if ((spec.capacity === undefined) !== (spec.regrowSeconds === undefined))
 		throw new Error(`${spec.displayName}: capacity and regrowSeconds must be set together`);
-	return { x, y, terrainTypeId: t.id, quantity: spec.capacity ?? null };
-});
+
+// One pass over the generated map, counting rather than materialising: which terrain chars the world
+// actually contains, and how many of each. The old code built a 2,096,704-entry array of row objects
+// here to INSERT — that array is gone with the table (see the note where `tile` used to be in
+// schema.ts), but two checks below genuinely need to know what is on the ground, so the pass stays
+// and only its output shrinks to a handful of counters.
+const census = new Map<string, number>();
+for (let y = 0; y < GRID_SIZE; y++)
+	for (let x = 0; x < GRID_SIZE; x++) {
+		const char = terrainCharAt(x, y);
+		if (!byChar.has(char)) throw new Error(`(${x}, ${y}): unknown terrain char '${char}'`);
+		census.set(char, (census.get(char) ?? 0) + 1);
+	}
 
 // Every new player's hamlet and characters land on one of these tiles, so this is the one check
 // that ties the generated map to the starts it hands out: a retuned threshold, a one-character
@@ -881,8 +885,7 @@ const tiles = Array.from({ length: GRID_SIZE * GRID_SIZE }, (_, i) => {
 // something that isn't Meadow. Checked for every entry in STARTS, not just the first — a realm can
 // land on any of them.
 const meadowAt = (x: number, y: number) => {
-	const at = tiles[y * GRID_SIZE + x];
-	const name = terrainRows.find((t) => t.id === at.terrainTypeId)!.displayName;
+	const name = byChar.get(terrainCharAt(x, y))!.displayName;
 	if (name !== 'Meadow') throw new Error(`start tile (${x}, ${y}) is ${name}, must be Meadow`);
 };
 for (const s of STARTS) {
@@ -905,41 +908,23 @@ for (const s of STARTS) {
 // Keyed on REQUIRES rather than on the `resources` rows: those were read back before the
 // requires_building_type_id UPDATE below ran, so on a fresh database they all still say null.
 const yieldingTerrain = new Set(
-	tiles.map((t) => terrainRows.find((r) => r.id === t.terrainTypeId)!.yieldsResourceId)
+	[...census.keys()].map((char) => byChar.get(char)!.yieldsResourceId)
 );
 for (const name of Object.keys(REQUIRES)) {
 	if (yieldingTerrain.has(res[name])) continue;
 	throw new Error(`no tile on the map yields ${name}, which is extracted — the ladder is sealed`);
 }
 
-// Upserted, never truncated: `tile_stock` has a foreign key into this table, so deleting and
-// reinserting the grid would take every player's harvested-forest record with it.
-//
-// Chunked, because one statement for the whole grid stopped fitting: `tile` has 4 columns
-// (x, y, terrainTypeId, quantity), so one INSERT for all of them binds `rows × 4` parameters
-// against Postgres's limit of 65,535. 65,535 / 4 = 16,383.75, so 16,000 rows a batch is the
-// largest round number that stays clear (16,000 × 4 = 64,000 params) — up from the 4,000 this
-// was tuned at for the 256×256 map. At 1,048,576 tiles (1024×1024) that keeps this a sane 66
-// batches instead of the 262 that leaving the old 4,000 unchanged would have needed. The last
-// batch is just whatever remains.
-function* chunks<T>(items: T[], size: number): Generator<T[]> {
-	for (let i = 0; i < items.length; i += size) yield items.slice(i, i + size);
-}
-for (const batch of chunks(tiles, 16000)) {
-	await db
-		.insert(tile)
-		.values(batch)
-		.onConflictDoUpdate({
-			target: [tile.x, tile.y],
-			set: { terrainTypeId: sql`excluded.terrain_type_id`, quantity: sql`excluded.quantity` }
-		});
-}
+// The grid used to be written here — 2,096,704 rows in 131 chunked INSERTs, about two minutes of
+// every deploy, for a table nothing read. It is gone; see the note where `tile` used to be in
+// schema.ts. What the world is made of now lives in exactly two places: worldgen.ts, which computes
+// it, and `game_config.terrain_hash`, which is the seed's signed statement of what it computed.
 
 console.log(
 	(WIPE ? `WIPED ${players} player realm(s), then ` : 'content only, no realms touched: ') +
 		`${buildingTypes.length} building types, ${resources.length} resources, ` +
-		`${terrainRows.length} terrain types, ${tiles.length} tiles, ${STARTS.length} start ` +
-		`position(s) · world_version ${worldVersion}` +
+		`${terrainRows.length} terrain types, ${GRID_SIZE * GRID_SIZE} tiles generated (none ` +
+		`stored), ${STARTS.length} start position(s) · world_version ${worldVersion}` +
 		(WIPE ? '' : ` · ${players} existing realm(s) left alone`)
 );
 await client.end();

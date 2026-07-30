@@ -11,7 +11,6 @@ import {
 	boolean,
 	check,
 	doublePrecision,
-	foreignKey,
 	index,
 	integer,
 	pgTable,
@@ -499,37 +498,23 @@ export const terrainType = pgTable('terrain_type', {
 	capacity: integer('capacity')
 });
 
-// Natural key, unlike `building`'s serial + unique index. The rule: surrogate key for rows
-// that get created and destroyed and referenced by id; natural key for a fixed exhaustive
-// set. There are exactly GRID_SIZE² tiles forever, (x, y) *is* the identity, and nothing
-// references a tile — a serial would be a second identity with no reader. The composite PK
-// is also exactly the index the buildable lookup wants, so it costs one index fewer.
+// There used to be a `tile` table here — one row per tile, the whole grid, written by `npm run
+// seed` on every deploy. It is gone, and the reasoning is worth keeping.
 //
-// **Not on the read path any more.** world.server.ts used to `SELECT *` this whole table (plus its
-// join to `terrain_type`/`resource`) on every world read — the egress problem CLAUDE.md and
-// world.server.ts's own `loadStaticWorld` describe. The terrain grid it holds is a pure function of
-// `WORLD_SEED` + `GRID_SIZE` + worldgen.ts's generator, so the read path generates it instead and
-// only trusts the result once its hash matches `game_config.terrain_hash` — see that column's own
-// comment. `npm run seed` still writes this table, and still must: `tile_stock.(x, y)` carries a
-// real foreign key into it (below), which is the one thing still keeping it around, and a live
-// database is more inspectable with the grid sitting in SQL than without it.
-export const tile = pgTable(
-	'tile',
-	{
-		x: integer('x').notNull(),
-		y: integer('y').notNull(),
-		terrainTypeId: integer('terrain_type_id')
-			.notNull()
-			.references(() => terrainType.id),
-		// Capacity — how much this deposit holds when full. Global, seeded, and never written
-		// at runtime; the live amount is per-player and lives in `tile_stock`. Null where the
-		// deposit is infinite or the ground yields nothing at all.
-		quantity: integer('quantity')
-	},
-	(t) => [primaryKey({ columns: [t.x, t.y] })]
-);
+// It stopped being read first: world.server.ts used to `SELECT *` the whole thing (plus its join to
+// `terrain_type`/`resource`) on every world read, which is the egress problem CLAUDE.md and
+// `loadStaticWorld` describe. The grid is a pure function of `WORLD_SEED` + `GRID_SIZE` +
+// worldgen.ts's generator, so the read path generates it instead and trusts the result only once its
+// hash matches `game_config.terrain_hash` (see that column's own comment). After that the table had
+// exactly one reader left — `tile_stock`'s foreign key — and one writer, the seed, which paid two
+// minutes of every deploy to write 2,096,704 rows nothing selected.
+//
+// That is a cost that scales with world *area*, and the world is headed for a continent (#24): the
+// same loop at 6912² is ~47 minutes inside `vercel-build`, which is not a slope, it is a wall. A
+// foreign key is not worth a deploy. `tile_stock.(x, y)` is now bare coordinates, bounded by the
+// same `OUT_OF_BOUNDS` check every other coordinate on the write path already goes through.
 
-// How much of a finite deposit *this player* has left. Per-player and not a column on `tile` —
+// How much of a finite deposit *this player* has left. Per-player and not a column on a tile row —
 // unlike `building`, this stayed player-scoped through VISION #4's reversal: gathering is its own,
 // later question ("expansion & borders", parked), and one player's clear-cut still must not thin
 // another's forest, or reach overlap would turn every shared forest into a race for the same
@@ -552,9 +537,10 @@ export const tileStock = pgTable(
 	},
 	(t) => [
 		primaryKey({ columns: [t.playerId, t.x, t.y] }),
-		// Free, since tile's primary key is already (x, y) — and without it a typo'd coordinate
-		// would quietly create stock on a tile that does not exist.
-		foreignKey({ columns: [t.x, t.y], foreignColumns: [tile.x, tile.y] }),
+		// There is no foreign key on (x, y) any more — see the note where `tile` used to be. What it
+		// bought was "a typo'd coordinate cannot create stock on a tile that does not exist", and that
+		// is now the write path's own `OUT_OF_BOUNDS` check, which every coordinate already passes
+		// through before it reaches this table.
 		// "A forest tile yields below zero trees" is a stated failure. The upper bound cannot be
 		// a CHECK — capacity lives on another table — so the clamp in `accrue` is the only guard
 		// there, and its test carries that weight.

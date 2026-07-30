@@ -232,6 +232,13 @@
       "when": 1785428512428,
       "tag": "0032_dazzling_kitty_pryde",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1785441066221,
+      "tag": "0033_red_thanos",
+      "breakpoints": true
     }
   ]
 }
