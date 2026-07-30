@@ -45,3 +45,4 @@ vite.config.ts.timestamp-*
 # Design research: scraped Lands of Lords encyclopedia (scripts/lol-harvest.ts).
 # Someone else's game data — reference only, never ships.
 .lol/
+.atlas/

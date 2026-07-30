@@ -1,18 +1,29 @@
 // Client-safe: shared constants, wire types, and the position math. No db imports.
 
-// 1448×1448 — widened again from 1024 to hold a *real* Lands of Lords domain rather than half of
-// one. Measured against LoL's own reported numbers (its tile-detail pages prove one coordinate is
-// one tile): continent Terra Borealis is 18,834 km² split across 113 domains, so one domain
-// averages ~9.2 mi² = ~23.8 km² of claimed land (confirmed against a named domain, Brame-Sur-Mer,
-// at 5,893 acres = 23.8 km²) out of a continent where claimed land is only ~14% of the total — the
-// rest is wilderness. A tile is 20 m (400 m²), so a domain that size is ~59,620 of our tiles — a
-// circle of radius 138 (MATURE_REACH_RADIUS below), sized to that, not the other way round. Six
-// domains at that radius on a 1448×1448 grid (2.10M tiles, ~29 km across) claim ~17% of the world,
-// the closest a `MATURE_REACH_RADIUS × 2`-separated packing gets to LoL's 14% without the start
-// count collapsing (see `findStarts` in worldgen.ts, MIN_START_SEPARATION). See WORLD_SEED in
-// worldgen.ts. The whole grid comes from worldgen.ts's generator; nothing here still names an
-// authored core.
-export const GRID_SIZE = 1448;
+// 6912×6912 — a continent, not a county. 47,775,744 tiles, ~138 km across.
+//
+// Measured against Lands of Lords' own reported numbers rather than guessed (its tile-detail pages
+// prove one coordinate is one tile): continent Terra Borealis is 18,834 km² split across 113
+// domains, so one domain averages ~23.8 km² of *claimed* land (confirmed against a named domain,
+// Brame-Sur-Mer, at 5,893 acres = 23.8 km²) — out of a continent where claimed land is only ~14%
+// of the total. The other 86% is wilderness, and that ratio is the point: it is what makes going
+// somewhere mean anything.
+//
+// A tile is 20 m (400 m²), so a domain that size is ~59,620 of our tiles — a circle of radius 138
+// (MATURE_REACH_RADIUS below), sized to that, not the other way round. 113 of those over 14% of the
+// world puts the world at ~48M tiles, which is this. 6912 rather than a round 6900 because it is
+// 432 × 16: an exact multiple of worldgen.ts's COARSE, so the coarse hydrology grid has no ragged
+// final row to special-case.
+//
+// **Held back until the generator could carry it.** This was 1448 while the world was built
+// eagerly, tile by tile, into typed arrays at import — at 48M tiles that is minutes of CPU and
+// gigabytes of heap per cold start, plus a 2.1M-row seed and a 96 MB terrain payload. None of those
+// exist now; see worldgen.ts's header. Tile size stays 20 m deliberately: LoL's is 8.5 m and its
+// cities read as streets of individual buildings, but what makes that true is *thousands of
+// buildings*, not the tile — ours caps at a population of 1,000, so a finer tile would spread the
+// same hundred buildings over more ground and read worse. That gap closes with VISION's deferred
+// commoner-aggregate tier, not with a map change.
+export const GRID_SIZE = 6912;
 
 // START used to live here. It is derived from the terrain now — see `findStarts` in worldgen.ts —
 // because a written-down coordinate cannot notice that the ground under it has become a lake.
@@ -236,6 +247,12 @@ export type WorldStatic = {
 	gridSize: number;
 	terrainTypes: {
 		id: number;
+		/**
+		 * The single character worldgen.ts emits for this terrain. The join between the generated
+		 * world and the catalog: the client generates a tile's char locally and looks the row up by it,
+		 * which is what replaced shipping one terrain id per tile.
+		 */
+		char: string;
 		displayName: string;
 		color: string;
 		/** Symbol id in Sprites.svelte, minus the `i-` prefix. Unknown key ⇒ colour only. */
@@ -264,10 +281,6 @@ export type WorldStatic = {
 	// What one batch consumes at each workshop — the same shape as buildingCosts, because it is the
 	// same question asked of the other table. Only workshop types appear.
 	recipeInputs: { buildingTypeId: number; resourceId: number; quantity: number }[];
-	// Row-major, index = y * gridSize + x, value = terrainTypeId — the same flat indexing the
-	// client already uses to derive (x, y). movementCost is deliberately absent: nothing on the
-	// client estimates travel.
-	terrain: number[];
 	buildingTypes: {
 		id: number;
 		displayName: string;
@@ -889,6 +902,27 @@ let routeCameFrom: Int32Array;
 let routeSettledStamp: Int32Array;
 let routeCallId = 0;
 
+/**
+ * How far outside the origin-destination bounding box the search is allowed to look.
+ *
+ * **This is what stops the buffers being world-sized.** They used to be `gridSize²`, which was a
+ * 1 MB allocation at 256×256 and is **955 MB** at 6912×6912 — enough to kill a lambda on the first
+ * build order anybody places. Deliberately not done before, and the reasoning is on `route` below:
+ * a bounding box changes what a route *is* whenever the true cheapest path needs to leave it.
+ *
+ * What makes it safe now is that it is not a tight box. Every journey this function is ever asked
+ * for happens inside one realm's sphere of influence — the server refuses anything else with
+ * OUTSIDE_REACH before routing — so origin and destination are at most `MATURE_REACH_RADIUS * 2`
+ * apart, and padding the box by a further full reach radius on every side leaves room for a detour
+ * around any lake or range that fits inside a realm. The worst case is a 552-tile span padded to
+ * 828, which is 686,000 cells: 13 MB rather than 955.
+ *
+ * ponytail: a route whose genuinely cheapest path leaves that margin comes back longer than optimal
+ * rather than wrong — it is still a real, walkable, correctly-timed route over the same graph. Widen
+ * this the day something legitimately routes further than a realm's own reach.
+ */
+const ROUTE_MARGIN = MATURE_REACH_RADIUS;
+
 /** Grows the module-scope route buffers to at least `cells`, never shrinks. Values from a smaller
  * call never leak into a bigger one — every read below is gated on `routeCallId`, not on array
  * length — so growing mid-life is just "the buffer happens to be bigger now", nothing to reset. */
@@ -910,13 +944,23 @@ export function route(
 	cost: (x: number, y: number) => number,
 	gridSize: number
 ): Route {
-	const start = originY * gridSize + originX;
-	const goal = destY * gridSize + destX;
 	// Ordering a build on the body's own tile: a one-tile path, no time. The client's travelFraction
 	// reads a zero-length leg as arrived.
-	if (start === goal) return { path: [start], seconds: 0 };
+	if (originX === destX && originY === destY)
+		return { path: [originY * gridSize + originX], seconds: 0 };
 
-	ensureRouteBuffers(gridSize * gridSize);
+	// The search window — see ROUTE_MARGIN. Every index below is *local to this window*; only the
+	// returned path is converted back to the global row-major indices the rest of the codebase uses.
+	const x0 = Math.max(0, Math.min(originX, destX) - ROUTE_MARGIN);
+	const y0 = Math.max(0, Math.min(originY, destY) - ROUTE_MARGIN);
+	const x1 = Math.min(gridSize - 1, Math.max(originX, destX) + ROUTE_MARGIN);
+	const y1 = Math.min(gridSize - 1, Math.max(originY, destY) + ROUTE_MARGIN);
+	const w = x1 - x0 + 1;
+	const h = y1 - y0 + 1;
+	const start = (originY - y0) * w + (originX - x0);
+	const goal = (destY - y0) * w + (destX - x0);
+
+	ensureRouteBuffers(w * h);
 	const best = routeBest;
 	const bestStamp = routeBestStamp;
 	const cameFrom = routeCameFrom;
@@ -934,16 +978,17 @@ export function route(
 		settledStamp[node] = callId;
 		if (node === goal) break;
 
-		const x = node % gridSize;
-		const y = (node - x) / gridSize;
+		const lx = node % w;
+		const x = lx + x0;
+		const y = (node - lx) / w + y0;
 		const here = cost(x, y);
 		for (let dy = -1; dy <= 1; dy++) {
 			for (let dx = -1; dx <= 1; dx++) {
 				if (!dx && !dy) continue;
 				const nx = x + dx;
 				const ny = y + dy;
-				if (nx < 0 || ny < 0 || nx >= gridSize || ny >= gridSize) continue;
-				const next = ny * gridSize + nx;
+				if (nx < x0 || ny < y0 || nx > x1 || ny > y1) continue;
+				const next = (ny - y0) * w + (nx - x0);
 				if (settledStamp[next] === callId) continue;
 				const step = ((dx && dy ? Math.SQRT2 : 1) * ((here + cost(nx, ny)) / 2)) / speed;
 				const soFarNext = soFar + step;
@@ -963,11 +1008,17 @@ export function route(
 	if (!Number.isFinite(goalCost))
 		throw new Error(`no route from (${originX}, ${originY}) to (${destX}, ${destY})`);
 
-	const path = [goal];
+	// Back to global row-major on the way out: the window is this function's private business, and
+	// every caller — stored operation paths, the client's `positionAt` — reads `y * GRID_SIZE + x`.
+	const global = (node: number) => {
+		const lx = node % w;
+		return ((node - lx) / w + y0) * gridSize + lx + x0;
+	};
+	const path = [global(goal)];
 	// Stops on `start` by identity, not by a sentinel in `cameFrom` — see the doc comment above for
 	// why every cell on this walk is guaranteed fresh without one.
-	for (let node = cameFrom[goal]; node !== start; node = cameFrom[node]) path.push(node);
-	path.push(start);
+	for (let node = cameFrom[goal]; node !== start; node = cameFrom[node]) path.push(global(node));
+	path.push(global(start));
 	path.reverse();
 	return { path, seconds: Math.ceil(goalCost) };
 }

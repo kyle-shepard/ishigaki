@@ -48,7 +48,10 @@
 		// Nearest-neighbour: the source is one flat colour per tile already, and smoothing a 1448px
 		// bitmap down to 200px would just blur terrain that is already as coarse as it gets.
 		ctx.imageSmoothingEnabled = false;
-		ctx.drawImage(overviewFor(world), 0, 0, GRID_SIZE, GRID_SIZE, 0, 0, SIZE, SIZE);
+		// The whole bitmap into the whole minimap. No source rectangle: it is the entire world either
+		// way, and naming one in tile coordinates was only ever right while the overview was exactly
+		// one pixel per tile (see overview.ts).
+		ctx.drawImage(overviewFor(world), 0, 0, SIZE, SIZE);
 
 		// Settlements, in the same two colours +page.svelte's own far-tier pins use for "yours" versus
 		// "everyone else's" (see its `.pin`/`.pin.foreign` rule) — one convention for "this is mine",

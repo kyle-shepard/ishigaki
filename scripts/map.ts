@@ -1,7 +1,23 @@
-// Run: npm run map — prints the world the seed would write, coloured, with a tile census.
+// Run: npm run map — prints the world the generator makes, coloured, with a tile census.
 // No database, no arguments. This is how the generator's thresholds get tuned: change them in
 // worldgen.ts, run this, look at it.
-import { MAP_SEED, STARTS, terrainMap, WORLD_SEED } from '../src/lib/features/world/worldgen.ts';
+//
+//   npm run map              the whole world, downsampled to fit a terminal
+//   npm run map -- 3000 2400 a 1:1 window with its top-left at (3000, 2400)
+//
+// The window form exists because a downsampled continent cannot show you a river. At the sizes this
+// world is now built for, one printed character is dozens of tiles wide — fine for judging where
+// the coast and the ranges are, useless for judging whether a channel is one tile across or reads
+// as a canal. Those are the two questions this script gets asked and they need two different zooms.
+import {
+	COARSE,
+	MAP_SEED,
+	starts,
+	terrainCensus,
+	terrainWindow,
+	WORLD_SEED
+} from '../src/lib/features/world/worldgen.ts';
+import { GRID_SIZE } from '../src/lib/features/world/world.ts';
 
 // Rough ANSI stand-ins for each terrain's tile colour, so a lake reads as a lake at a glance.
 const PAINT: Record<string, string> = {
@@ -15,63 +31,72 @@ const PAINT: Record<string, string> = {
 	i: '\x1b[41;97m' // iron vein — red
 };
 
-// Plain when piped or when NO_COLOR is set — 2304 escape sequences are unreadable in a file.
+// Plain when piped or when NO_COLOR is set — thousands of escape sequences are unreadable in a file.
 const colour = !!process.stdout.isTTY && !process.env.NO_COLOR;
-const rows = terrainMap();
+const DISPLAY = 200;
 
-// Downsampled for the terminal once the map genuinely stopped fitting one screen — printing the
-// world at native resolution was fine at 256×256 (a scrollback, but a readable one) and stopped
-// being fine at 1024×1024, where the grid itself no longer prints as a *shape* anybody's eye can
-// take in at once. DISPLAY_MAX is a terminal-sized cap, not a grid one: nearest-neighbour picks one
-// tile in every `stride`, which is a fair reading of the *coastline and ranges* — the features this
-// script exists to eyeball — even though it necessarily drops individual tiles (a single-tile Stone
-// outcrop can fall between samples). The census below is never downsampled — it walks the full
-// `rows` data regardless of `stride`, so what gets tuned against is always the real distribution,
-// only what gets *drawn* is thinned.
-const DISPLAY_MAX = 200;
-const stride = Math.max(1, Math.ceil(rows.length / DISPLAY_MAX));
-const sampledSize = Math.ceil(rows.length / stride);
+const [wx, wy] = process.argv.slice(2).map(Number);
+const windowed = Number.isFinite(wx) && Number.isFinite(wy);
 
-// One mark per opening `findStarts` found — base-36 so a two-digit start count still fits one
+// Whole world downsampled, or a 1:1 window — `terrainWindow`'s `stride` is the only difference.
+const stride = windowed ? 1 : Math.max(1, Math.ceil(GRID_SIZE / DISPLAY));
+const originX = windowed ? wx : 0;
+const originY = windowed ? wy : 0;
+const size = windowed ? DISPLAY : Math.ceil(GRID_SIZE / stride);
+const started = Date.now();
+const rows = terrainWindow(originX, originY, size, stride);
+const drawnMs = Date.now() - started;
+
+// One mark per opening `starts()` found — base-36 so a two-digit start count still fits one
 // character (0-9 then a-z), closest-to-the-map's-centre first, so the numbering itself shows the
-// search order. Only the hamlet tile is marked, not its whole block (house2/barn/market): with
-// potentially dozens of openings on a big map, marking every tile of every start would bury the
-// terrain the census is about under its own overlay. Keyed by *sampled* coordinate — the nearest
-// pixel this downsampling actually draws — so a start still shows up even when its exact tile isn't
-// one of the ones `stride` happens to land on.
+// search order. Only the hamlet tile is marked, not its whole block: with dozens of openings,
+// marking every tile of every start would bury the terrain under its own overlay. Keyed by the
+// nearest character cell this rendering actually draws, so a start still shows up even when its
+// exact tile isn't one the stride happens to land on.
+// Tolerated rather than fatal: "no legal opening anywhere" is a *tuning* outcome, and the whole
+// reason to run this script is to look at the world that caused it. Throwing here printed nothing
+// at all, which is the least useful possible response to a map you need to inspect.
+let found: ReturnType<typeof starts> = [];
+let startsError = '';
+try {
+	found = starts();
+} catch (e) {
+	startsError = (e as Error).message;
+}
 const marks = new Map(
-	STARTS.map((s, i) => [
-		`${Math.round(s.hamletX / stride)},${Math.round(s.hamletY / stride)}`,
+	found.map((s, i) => [
+		`${Math.round((s.hamletX - originX) / stride)},${Math.round((s.hamletY - originY) / stride)}`,
 		i.toString(36)
 	])
 );
-for (let sy = 0; sy < sampledSize; sy++) {
-	const y = Math.min(rows.length - 1, sy * stride);
+rows.forEach((row, sy) => {
 	let line = '';
-	for (let sx = 0; sx < sampledSize; sx++) {
-		const x = Math.min(rows.length - 1, sx * stride);
-		const c = rows[y][x];
+	for (let sx = 0; sx < row.length; sx++) {
+		const c = row[sx];
 		const mark = marks.get(`${sx},${sy}`);
 		line += colour ? `${PAINT[c] ?? ''}${mark ?? c}\x1b[0m` : (mark ?? c);
 	}
 	console.log(line);
-}
-if (stride > 1)
-	console.log(
-		`\n(downsampled ${stride}:1 for the terminal, nearest-neighbour — the census below is exact, over the full ${rows.length}×${rows.length} grid)`
-	);
+});
 
-const total = rows.length * rows.length;
-const census = [...rows.join('')].reduce<Record<string, number>>(
-	(acc, c) => ({ ...acc, [c]: (acc[c] ?? 0) + 1 }),
-	{}
+// The census is sampled, never exhaustive — see `terrainCensus`. Its shares are what thresholds get
+// tuned against, so the sampling stride is printed with them rather than left implicit: a share is
+// an estimate now, and one that says so.
+const CENSUS_STRIDE = 8;
+const census = terrainCensus(CENSUS_STRIDE);
+const samples = [...census.values()].reduce((a, b) => a + b, 0);
+console.log(
+	`\n${windowed ? `window ${DISPLAY}x${DISPLAY} at (${originX}, ${originY}), 1:1` : `whole world, downsampled ${stride}:1, nearest-neighbour`} · drawn in ${drawnMs} ms`
 );
 console.log(
-	`\nseed ${MAP_SEED} (${MAP_SEED - WORLD_SEED} reroll(s) from ${WORLD_SEED}) · ` +
-		`${rows.length}×${rows.length} = ${total} tiles · ${STARTS.length} start(s), closest at ` +
-		`${STARTS[0].hamletX}, ${STARTS[0].hamletY} · ` +
-		Object.entries(census)
+	`seed ${MAP_SEED}${MAP_SEED === WORLD_SEED ? '' : ` (rerolled from ${WORLD_SEED})`} · ` +
+		`${GRID_SIZE}x${GRID_SIZE} = ${GRID_SIZE * GRID_SIZE} tiles · coarse ${Math.ceil(GRID_SIZE / COARSE)}^2 · ` +
+		(found.length ? `${found.length} start(s), closest at ${found[0].hamletX}, ${found[0].hamletY}` : `NO STARTS — ${startsError}`)
+);
+console.log(
+	`census (1 tile in ${CENSUS_STRIDE * CENSUS_STRIDE}, ${samples} samples): ` +
+		[...census.entries()]
 			.sort((a, b) => b[1] - a[1])
-			.map(([c, n]) => `${c} ${n} (${Math.round((n / total) * 100)}%)`)
+			.map(([c, n]) => `${c} ${((n / samples) * 100).toFixed(2)}%`)
 			.join(' · ')
 );

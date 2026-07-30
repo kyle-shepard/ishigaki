@@ -43,7 +43,8 @@ import {
 } from './world';
 // Generation, not a query — see `loadStaticWorld`'s own comment for why the read path now imports
 // the generator it used to deliberately avoid.
-import { terrainCharAt, terrainDataHash } from './worldgen';
+import { terrainCensus, terrainCharAt } from './worldgen';
+import { terrainDataHash } from './worldgen.hash';
 
 // How fast a starting settler walks, in tiles per second. Not part of the start block, which is
 // a placement and knows nothing about legs.
@@ -356,7 +357,7 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 
 	const gathers = active.filter((op) => op.type === 'gather');
 	// One catalog read, and only when somebody is actually working.
-	const yields = gathers.length ? await tileYields(tx) : new Map();
+	const yields = gathers.length ? await tileYields(tx) : () => undefined;
 	// What this player has already drawn down. Only tiles they have actually worked have rows.
 	const drawn = gathers.length
 		? new Map(
@@ -370,7 +371,7 @@ export async function resolveWorld(tx: Tx, playerId: number): Promise<void> {
 	for (const op of active) {
 		if (op.type === 'gather') {
 			const key = op.destY * GRID_SIZE + op.destX;
-			const yielded = yields.get(key);
+			const yielded = yields(op.destX, op.destY);
 			// A tile whose terrain stopped yielding under a standing worker. Refusing at the
 			// writer means this shouldn't happen; paying nothing is the safe reading if it does.
 			if (!yielded) continue;
@@ -857,9 +858,11 @@ type TileYield = {
  */
 type StaticWorld = {
 	version: string;
-	terrainIds: Uint16Array;
+	/** The terrain_type id at one tile — a closure over the generator, never a stored grid. */
+	terrainIdAt: (x: number, y: number) => number;
 	capacityByType: Map<number, number | null>;
-	deposits: Map<number, TileYield>;
+	/** What one tile yields, or undefined for ground that yields nothing. */
+	depositAt: (x: number, y: number) => TileYield | undefined;
 };
 
 let staticWorldCache: StaticWorld | null = null;
@@ -897,7 +900,7 @@ async function loadStaticWorld(tx: Tx): Promise<StaticWorld> {
 			// would show a world that disagrees with every `tile_stock`, `building` and `settlement`
 			// row already on it, so this throws instead of guessing, the same shape as every other
 			// missing/stale-catalog throw in this file.
-			if (terrainDataHash(GRID_SIZE, terrainCharAt) !== cfg.terrainHash)
+			if (terrainDataHash(GRID_SIZE) !== cfg.terrainHash)
 				throw new Error(
 					'generated terrain does not match the seeded world (terrain_hash mismatch in ' +
 						'game_config) — worldgen.ts has changed since `npm run seed` last ran; run it again'
@@ -905,45 +908,58 @@ async function loadStaticWorld(tx: Tx): Promise<StaticWorld> {
 
 			const terrainTypes = await tx.select().from(terrainType);
 			const resources = await tx.select().from(resource);
-			const byChar = new Map(terrainTypes.map((t) => [t.char, t]));
+			// `terrain_type.char` is nullable in the schema and never null in practice — the seed
+			// writes it for every row. A null here is a catalog written before that column existed,
+			// which would silently make that terrain unmatchable rather than loudly wrong.
+			for (const t of terrainTypes)
+				if (t.char === null)
+					throw new Error(
+						`terrain_type '${t.displayName}' has no char — run \`npm run seed\` against this database`
+					);
+			const byChar = new Map(terrainTypes.map((t) => [t.char!, t]));
 			const resourceById = new Map(resources.map((r) => [r.id, r]));
 
-			const terrainIds = new Uint16Array(GRID_SIZE * GRID_SIZE);
-			const deposits = new Map<number, TileYield>();
-			for (let y = 0; y < GRID_SIZE; y++)
-				for (let x = 0; x < GRID_SIZE; x++) {
-					const char = terrainCharAt(x, y);
-					const t = byChar.get(char);
-					// A char the generator produces but the catalog carries no row for — an unseeded or
-					// stale terrain_type table, not a game rule (the terrain-hash check above already
-					// catches a generator that disagrees with the seed; this catches a seed that never
-					// ran at all).
-					if (!t)
-						throw new Error(
-							`unknown terrain char '${char}' at (${x}, ${y}) — run \`npm run seed\` against this database`
-						);
-					const i = y * GRID_SIZE + x;
-					terrainIds[i] = t.id;
-					if (t.yieldsResourceId !== null) {
-						const r = resourceById.get(t.yieldsResourceId);
-						if (r)
-							deposits.set(i, {
-								resourceId: r.id,
-								unitsPerHour: r.unitsPerHour,
-								skillId: r.skillId,
-								requiresBuildingTypeId: r.requiresBuildingTypeId,
-								capacity: t.capacity,
-								regrowSeconds: t.regrowSeconds
-							});
-					}
-				}
+			// **Two lookups, not a grid.** This used to fill a `Uint16Array` of GRID_SIZE² terrain ids
+			// and a `Map` with an entry per yielding tile, by walking the whole world on a cold start.
+			// At 1448×1448 that was 4.2 MB and defensible. At 6912×6912 it is a 96 MB typed array plus
+			// a Map of tens of millions of entries — built on a lambda spin-up, to answer questions
+			// that are only ever asked about a few hundred tiles around one realm.
+			//
+			// The generator is a pure function of (x, y), so both become closures over it and the world
+			// is never materialised on the server at all. `depositByChar` is keyed on the terrain
+			// *char*, not the tile: what a tile yields is a property of its terrain type, and the old
+			// per-tile Map was the same eight values repeated a hundred million times.
+			const depositByChar = new Map<string, TileYield>();
+			for (const t of terrainTypes) {
+				if (t.yieldsResourceId === null) continue;
+				const r = resourceById.get(t.yieldsResourceId);
+				if (!r) continue;
+				depositByChar.set(t.char!, {
+					resourceId: r.id,
+					unitsPerHour: r.unitsPerHour,
+					skillId: r.skillId,
+					requiresBuildingTypeId: r.requiresBuildingTypeId,
+					capacity: t.capacity,
+					regrowSeconds: t.regrowSeconds
+				});
+			}
+			// A char the generator produces that the catalog carries no row for — an unseeded or stale
+			// terrain_type table, not a game rule. Asked once of the sampled census rather than per
+			// tile: the alphabet is closed and eight characters wide, so a terrain missing from the
+			// catalog is missing for the whole world, and the hot path stays one map read.
+			for (const char of terrainCensus().keys())
+				if (!byChar.has(char))
+					throw new Error(
+						`unknown terrain char '${char}' from the generator — run \`npm run seed\` against this database`
+					);
+
 			const capacityByType = new Map(terrainTypes.map((t) => [t.id, t.capacity]));
 
 			const world: StaticWorld = {
 				version: cfg.worldVersion!,
-				terrainIds,
+				terrainIdAt: (x, y) => byChar.get(terrainCharAt(x, y))!.id,
 				capacityByType,
-				deposits
+				depositAt: (x, y) => depositByChar.get(terrainCharAt(x, y))
 			};
 			staticWorldCache = world;
 			return world;
@@ -956,9 +972,9 @@ async function loadStaticWorld(tx: Tx): Promise<StaticWorld> {
 	return staticWorldLoading;
 }
 
-/** What each tile yields, how fast, and how much of it there is, keyed row-major. */
-async function tileYields(tx: Tx): Promise<Map<number, TileYield>> {
-	return (await loadStaticWorld(tx)).deposits;
+/** What a tile yields, how fast, and how much of it there is — a lookup, not a materialised map. */
+async function tileYields(tx: Tx): Promise<(x: number, y: number) => TileYield | undefined> {
+	return (await loadStaticWorld(tx)).depositAt;
 }
 
 type RankedWorker = { character: typeof character.$inferSelect; multiplier: number };
@@ -1183,7 +1199,7 @@ async function loadGrid(
 		  }
 		| undefined;
 }> {
-	const { terrainIds } = await loadStaticWorld(tx);
+	const { terrainIdAt } = await loadStaticWorld(tx);
 	// A small catalog, not the grid — cheap to read fresh rather than folding into the memo.
 	const terrainById = new Map((await tx.select().from(terrainType)).map((t) => [t.id, t]));
 	// This player's own movement-cost overrides only (their roads) — the COALESCE the old single
@@ -1200,7 +1216,7 @@ async function loadGrid(
 	);
 	return {
 		get(key: number) {
-			const tt = terrainById.get(terrainIds[key]);
+			const tt = terrainById.get(terrainIdAt(key % GRID_SIZE, (key / GRID_SIZE) | 0));
 			if (!tt) return undefined;
 			return {
 				buildable: tt.buildable,
@@ -1602,7 +1618,7 @@ export async function assignWorker(playerId: number, x: number, y: number): Prom
 		// The predicate is "yields something you can actually take", not merely "yields":
 		// clay pits and iron veins carry a resource but no rate yet, and a null-check alone
 		// would leave a worker standing in one forever, earning nothing, with no feedback.
-		const yielded = (await tileYields(tx)).get(y * GRID_SIZE + x);
+		const yielded = (await tileYields(tx))(x, y);
 		if (!yielded || yielded.unitsPerHour <= 0) return { ok: false, reason: 'TILE_YIELDS_NOTHING' };
 
 		// Same gate `planBuild` runs, same reason: the reach is a sphere of influence over both what
@@ -2134,11 +2150,14 @@ export async function restyleRoad(
  * fleet of lambda instances share one answer instead of each warming its own memo.
  */
 export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
-	// `terrainIds` is already dense and terrain-hash-verified by `loadStaticWorld` — one source of
-	// that invariant rather than a second copy of the check here. `Array.from` turns the compact
-	// typed array back into the plain `number[]` the wire type promises (JSON has no typed-array
-	// notion).
-	const { terrainIds, capacityByType } = await loadStaticWorld(tx);
+	// **The terrain array is gone from the wire.** It was one integer per tile, row-major — 4.2 MB of
+	// JSON at 1448×1448, and roughly 100 MB at the continent, generated by a lambda and shipped to
+	// every browser once per content version. The client runs the same generator this server does
+	// (worldgen.ts imports nothing server-only on the path that matters), so it computes the terrain
+	// under its own viewport instead of being handed the whole world. What it needs from here is the
+	// *catalog* — including each type's `char`, which is the join between what the generator emits
+	// and what the database calls it.
+	const { capacityByType } = await loadStaticWorld(tx);
 	// Ordered, because the client picks a default from this list by position.
 	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
 	const costs = await tx.select().from(buildingCost);
@@ -2153,13 +2172,11 @@ export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
 	// picker doesn't reshuffle between reads.
 	const professions = await tx.select().from(profession).orderBy(asc(profession.id));
 
-	const terrain: number[] = Array.from(terrainIds);
-
 	return {
 		gridSize: GRID_SIZE,
-		terrain,
 		terrainTypes: terrainTypes.map((t) => ({
 			id: t.id,
+			char: t.char!,
 			displayName: t.displayName,
 			color: t.color,
 			icon: t.icon,
@@ -2226,7 +2243,7 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 	// The static grid's live twin: deposits is content (what a tile yields, how fast), pulled from
 	// the same shared memo readWorldStatic uses — only what is drawn down from it (below) is
 	// per-player.
-	const { deposits } = await loadStaticWorld(tx);
+	const { depositAt } = await loadStaticWorld(tx);
 	// A resource catalog read of its own, distinct from readWorldStatic's wire-shaped one: this one
 	// needs isSustenance for the food-rate calculation below, which never goes on the wire itself.
 	const resources = await tx.select().from(resource);
@@ -2270,7 +2287,7 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 	const nowMs = new Date(now).getTime();
 	const live = new Map(
 		drawn.map((r) => {
-			const d = deposits.get(r.y * GRID_SIZE + r.x);
+			const d = depositAt(r.x, r.y);
 			if (!d?.capacity || d.regrowSeconds === null) return [r.y * GRID_SIZE + r.x, r.quantity];
 			const { quantity } = accrue(0, 0, {
 				quantity: r.quantity,
@@ -2293,7 +2310,7 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 	// That is the measurement the old note said to wait for.
 	const drawnTiles: { i: number; quantity: number }[] = [];
 	for (const [i, quantity] of live) {
-		const d = deposits.get(i);
+		const d = depositAt(i % GRID_SIZE, (i / GRID_SIZE) | 0);
 		// Only finite deposits count down. An infinite one has nothing to report, and a drawn row
 		// against one would be a tile_stock entry the gather path should never have written.
 		if (!d || d.capacity === null || d.regrowSeconds === null) continue;
@@ -2307,7 +2324,7 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 		operations
 			.filter((o) => o.type === 'gather')
 			.flatMap((o) => {
-				const yielded = deposits.get(o.destY * GRID_SIZE + o.destX);
+				const yielded = depositAt(o.destX, o.destY);
 				// A tile whose terrain stopped yielding under a standing worker — resolveWorld pays
 				// nothing for it, so neither does the bar.
 				if (!yielded) return [];

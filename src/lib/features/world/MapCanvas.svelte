@@ -20,7 +20,8 @@
 		tileAt,
 		type WorldPayload
 	} from './world';
-	import { overviewFor } from './overview';
+	import { overviewFor, overviewScale } from './overview';
+	import { terrainCharAt } from './worldgen';
 
 	type Props = {
 		world: WorldPayload;
@@ -40,7 +41,13 @@
 	let pane: HTMLElement | null = null;
 
 	const terrainById = $derived(new Map(world.terrainTypes.map((t) => [t.id, t])));
-	const terrainAt = (i: number) => terrainById.get(world.terrain[i]);
+	// Keyed on the generator's own char, not on a terrain id shipped per tile. The payload no longer
+	// carries a terrain array — the browser runs worldgen.ts and computes the ground under its own
+	// viewport, which is what makes a 47.8M-tile world cost nothing to draw. `terrainCharAt` is
+	// chunk-cached, so redrawing a viewport already on screen is array reads.
+	const terrainByChar = $derived(new Map(world.terrainTypes.map((t) => [t.char, t])));
+	const terrainAt = (i: number) =>
+		terrainByChar.get(terrainCharAt(i % world.gridSize, Math.floor(i / world.gridSize)));
 
 	// Which terrain is *ground* rather than a landmark, by the icon name already on the wire. Meadow
 	// and Forest are the two that tile across most of the map — about 70% of it between them — so
@@ -196,12 +203,15 @@
 			const dy1 = snappedEdge(lastY + 1, cell, scrollTop);
 			// Nearest-neighbour, not smoothed (set above): the source is already one flat colour per
 			// tile, and blurring the upscale would just soften the tile boundaries this fix keeps crisp.
+			// Source rect in *overview pixels*, not tiles — the bitmap is a fixed size now and one of
+			// its pixels covers several tiles (see `overviewScale`). Passing tile coordinates here was
+			// correct only while the two happened to be the same number.
 			ctx.drawImage(
 				overviewFor(world),
-				firstX,
-				firstY,
-				lastX - firstX + 1,
-				lastY - firstY + 1,
+				firstX * overviewScale,
+				firstY * overviewScale,
+				(lastX - firstX + 1) * overviewScale,
+				(lastY - firstY + 1) * overviewScale,
 				dx0,
 				dy0,
 				dx1 - dx0,

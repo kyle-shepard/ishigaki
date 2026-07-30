@@ -27,6 +27,7 @@
 		type WorldPayload,
 		type WorldStatic
 	} from '$lib/features/world/world';
+	import { terrainCharAt } from '$lib/features/world/worldgen';
 
 	// Continuous, where CELL was fixed — wheel, pinch and the +/- buttons all write this, and
 	// everything that used to read the constant now reads the state instead: `centreOn`, the
@@ -572,7 +573,10 @@
 
 	const terrainById = $derived(new Map(world?.terrainTypes.map((t) => [t.id, t]) ?? []));
 	const resourceName = $derived(new Map(world?.resources.map((r) => [r.id, r.displayName]) ?? []));
-	const terrainAt = (i: number) => terrainById.get(world!.terrain[i]);
+	// See MapCanvas: terrain is computed locally from the generator now, not shipped per tile.
+	const terrainByChar = $derived(new Map(world?.terrainTypes.map((t) => [t.char, t]) ?? []));
+	const terrainAt = (i: number) =>
+		terrainByChar.get(terrainCharAt(i % GRID_SIZE, Math.floor(i / GRID_SIZE)));
 	const buildingTypeById = $derived(new Map(world?.buildingTypes.map((t) => [t.id, t]) ?? []));
 	// The art carries what's on a tile for everyone who can see it. The label is the same
 	// information for everyone who can't — so it names the building too, not just the ground.
@@ -620,7 +624,7 @@
 	// A building with no cost rows is free, and says so rather than showing an empty bracket.
 	const priceOf = (id: number) => quantities(world?.buildingCosts ?? [], id) || 'free';
 	const resourceAt = (x: number, y: number) => {
-		const id = terrainById.get(world!.terrain[y * GRID_SIZE + x])?.yieldsResourceId;
+		const id = terrainByChar.get(terrainCharAt(x, y))?.yieldsResourceId;
 		return id ? resourceName.get(id) : 'nothing';
 	};
 	// An unknown key resolves to no symbol and draws nothing — a tile missing its art, not a

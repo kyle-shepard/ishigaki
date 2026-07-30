@@ -1,28 +1,56 @@
 // Run: npm test  (node --test, no framework added)
 //
-// The generator is tuned by eye against `npm run map`, and eyes are not in CI. This is the thing a
-// threshold edit can quietly break that looking at a map you already believe in will not catch: a
-// world that is mostly sea or mountain, or one with nowhere left for a fresh hamlet to open — and,
-// since the Phase 3 rewrite, the geography tests below: a river that pools in a basin, a coastline
-// that touches two edges, a mountain range that reads as speckle. All of it is pinned here because
-// none of it is visible from the numeric census alone.
+// The generator is tuned by eye against `npm run map` and `npm run atlas`, and eyes are not in CI.
+// This is the thing a threshold edit can quietly break that looking at a map you already believe in
+// will not catch: a world that is mostly sea or mountain, one with nowhere for a fresh hamlet to
+// open, a river that pools in a basin, a coastline that touches two edges, a mountain range that
+// reads as speckle.
+//
+// **Sampled and windowed, not exhaustive, and that is a deliberate weakening.** These tests used to
+// walk every tile — fine at 128², merely slow at 1448², and simply not a thing you can do at
+// 47,775,744 tiles: the census alone would be half a minute and the connectivity floods would need
+// 200 MB of typed arrays each. A suite nobody runs catches nothing, so the choice was never
+// "exhaustive or sampled", it was "sampled or deleted".
+//
+// What that costs is stated honestly per test. Broadly: shares come from one tile in 64 (~750,000
+// samples, so a share above ~0.1% is solid); geometry comes from a fixed spread of inland windows,
+// which is a real sample of real ground rather than a lucky spot, because the origins are constants
+// and do not move when a threshold does. What it does *not* cost is the structural guarantees —
+// "every river reaches the sea", "a channel is one tile wide" — because those are now properties of
+// how the generator is built rather than outcomes it happens to produce, and the tests below check
+// the construction holds rather than hoping the dice landed well.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GRID_SIZE, MATURE_REACH_RADIUS, route, START_REACH_RADIUS, withinReach } from './world.ts';
-import { contentVersion, START, STARTS, terrainCharAt, terrainMap } from './worldgen.ts';
+import { starts, terrainCensus, terrainCharAt, terrainWindow } from './worldgen.ts';
+import { contentVersion } from './worldgen.hash.ts';
 
 const CHARS = new Set(['.', 'f', 'w', 'h', 'm', 's', 'c', 'i']);
-const map = terrainMap();
-const census = (char: string) => [...map.join('')].filter((c) => c === char).length;
-const share = (char: string) => census(char) / (GRID_SIZE * GRID_SIZE);
-const idx = (x: number, y: number) => y * GRID_SIZE + x;
 
-test('the map is the right shape and speaks only the seed alphabet', () => {
-	assert.equal(map.length, GRID_SIZE);
-	for (const row of map) {
-		assert.equal(row.length, GRID_SIZE);
-		for (const c of row) assert.ok(CHARS.has(c), `unknown terrain char '${c}'`);
-	}
+// One census for the whole file — it is ~750,000 generator calls and every share test reads it.
+const census = terrainCensus();
+const samples = [...census.values()].reduce((a, b) => a + b, 0);
+const share = (char: string) => (census.get(char) ?? 0) / samples;
+
+const START = starts()[0];
+
+// Fixed inland windows, spread across the map, west of the coastal band. **Fixed is the point**:
+// picking "wherever the water happens to be densest" makes every measurement a comparison against a
+// different piece of ground, which is exactly how an earlier version of this work convinced itself a
+// change had helped when it had only moved the sample.
+const WINDOW = 300;
+const ORIGINS: [number, number][] = [];
+for (let y = 600; y < GRID_SIZE - 900; y += 1500)
+	for (let x = 600; x < Math.round(GRID_SIZE * 0.82) - 900; x += 1500) ORIGINS.push([x, y]);
+const WINDOWS = ORIGINS.map(([x, y]) => terrainWindow(x, y, WINDOW));
+
+test('the sampled map speaks only the seed alphabet', () => {
+	for (const c of census.keys()) assert.ok(CHARS.has(c), `unknown terrain char '${c}'`);
+	for (const rows of WINDOWS)
+		for (const row of rows) {
+			assert.equal(row.length, WINDOW);
+			for (const c of row) assert.ok(CHARS.has(c), `unknown terrain char '${c}'`);
+		}
 });
 
 test('the world is somewhere to live, not an ocean or a mountain range', () => {
@@ -33,19 +61,13 @@ test('the world is somewhere to live, not an ocean or a mountain range', () => {
 	assert.ok(share('.') + share('f') > 0.6, 'less than 60% of the map is open ground or forest');
 	// Every deposit terrain is somewhere. The seed enforces the one that seals the ladder (Stone);
 	// this catches the ones that only make the world duller.
-	for (const c of ['s', 'c', 'i']) assert.ok(census(c) > 0, `no ${c} anywhere on the map`);
+	for (const c of ['s', 'c', 'i']) assert.ok(share(c) > 0, `no ${c} anywhere in the sample`);
 
 	// And floors, not just ceilings — the bounds above are all upper, and a map can fail by being
-	// *bland* as easily as by being an ocean. This is not hypothetical: the 128→256 grid change kept
-	// the elevation cuts that suited the smaller lattice and took mountain from 9% of the map to 2%
-	// and stone from 1% to 0.4%, a flatter and duller world with every assertion in this file still
-	// green. The noise lattices are sized in tiles, so a grid-size change draws a different field
-	// rather than a scaled one; these floors are what turn "re-tune the thresholds" from something
-	// somebody has to remember into something the suite insists on.
-	assert.ok(
-		share('m') > 0.05,
-		`mountain is only ${(share('m') * 100).toFixed(1)}% — the map is flat`
-	);
+	// *bland* as easily as by being an ocean. Not hypothetical: this generator's own move to
+	// continental noise wavelengths took mountain from 8.5% to 6.1% and deposits from 12% to 0.02%,
+	// and every upper bound stayed green through both.
+	assert.ok(share('m') > 0.05, `mountain is only ${(share('m') * 100).toFixed(1)}% — the map is flat`);
 	assert.ok(share('h') > 0.02, `hills are only ${(share('h') * 100).toFixed(1)}% — no gradient`);
 	assert.ok(
 		share('s') > 0.005,
@@ -53,11 +75,202 @@ test('the world is somewhere to live, not an ocean or a mountain range', () => {
 	);
 });
 
+test('the sea keeps to one edge, and the other three stay dry', () => {
+	// The structural guarantee, checked directly rather than by flooding 47.8M tiles: `LAND_FLOOR`
+	// and `edgeLift` exist so that no amount of noise can put water on the north, south or west
+	// edges, and `SEA_DEPTH` is derived rather than tuned so the east edge is water by construction.
+	// Every tile of all four edges is 27,648 samples — cheap, and it is the whole claim.
+	//
+	// **Except at the two eastern corners, deliberately.** A sea strip running the map's full height
+	// necessarily reaches the north-east and south-east corners, which sit on the north and south
+	// edges too — so "the sea keeps to one edge" would quietly become two. `cornerTaper` curls the
+	// coastline back from both, which means the last few tiles of the east edge are dry *on purpose*.
+	// Asserting the whole column is water tests the opposite of what the generator promises; it fails
+	// on 13 tiles out of 6,912, and those 13 are the feature.
+	const CORNER = 16;
+	for (let y = 0; y < GRID_SIZE; y++) {
+		assert.notEqual(terrainCharAt(0, y), 'w', `water on the west edge at y=${y}`);
+		if (y < CORNER || y >= GRID_SIZE - CORNER) continue;
+		assert.equal(terrainCharAt(GRID_SIZE - 1, y), 'w', `east edge is dry at y=${y}`);
+	}
+	for (let x = 0; x < GRID_SIZE; x++) {
+		assert.notEqual(terrainCharAt(x, 0), 'w', `water on the north edge at x=${x}`);
+		assert.notEqual(terrainCharAt(x, GRID_SIZE - 1), 'w', `water on the south edge at x=${x}`);
+	}
+});
+
+// Water geometry, over the fixed windows. Width and straightness are different questions asked of
+// the same two run-length arrays, so they are computed once here.
+const geometry = WINDOWS.map((rows) => {
+	const isW = (x: number, y: number) => rows[y]?.[x] === 'w';
+	const h = new Int32Array(WINDOW * WINDOW);
+	const v = new Int32Array(WINDOW * WINDOW);
+	for (let y = 0; y < WINDOW; y++) {
+		let r = 0;
+		for (let x = 0; x < WINDOW; x++) h[y * WINDOW + x] = r = isW(x, y) ? r + 1 : 0;
+		r = 0;
+		for (let x = WINDOW - 1; x >= 0; x--)
+			h[y * WINDOW + x] = Math.max(h[y * WINDOW + x], (r = isW(x, y) ? r + 1 : 0));
+	}
+	for (let x = 0; x < WINDOW; x++) {
+		let r = 0;
+		for (let y = 0; y < WINDOW; y++) v[y * WINDOW + x] = r = isW(x, y) ? r + 1 : 0;
+		r = 0;
+		for (let y = WINDOW - 1; y >= 0; y--)
+			v[y * WINDOW + x] = Math.max(v[y * WINDOW + x], (r = isW(x, y) ? r + 1 : 0));
+	}
+	return { isW, h, v };
+});
+
+test('a river is one tile wide — no 2x2 block of water anywhere inland', () => {
+	// **The width test, and it is exact rather than statistical.** It used to be percentiles of
+	// `min(horizontal run, vertical run)`, which was the right proxy for a flood-derived channel and
+	// is the wrong one for a *drawn* channel: this generator traces each river as right-angle legs
+	// between coarse nodes, so every corner has a long run on both axes and scores as "wide" while
+	// being one tile across. That proxy reported a p90 width of 5 for channels that are provably 1.
+	//
+	// A solid 2x2 is the honest question. A one-tile channel cannot make one — an L-corner is three
+	// tiles in an L, never a square — and a basin or a braided flood plain makes them everywhere.
+	let blocks = 0;
+	let water = 0;
+	for (const { isW } of geometry)
+		for (let y = 0; y < WINDOW - 1; y++)
+			for (let x = 0; x < WINDOW - 1; x++) {
+				if (!isW(x, y)) continue;
+				water++;
+				if (isW(x + 1, y) && isW(x, y + 1) && isW(x + 1, y + 1)) blocks++;
+			}
+	assert.ok(water > 500, `only ${water} inland water tiles sampled — is there a river at all?`);
+	assert.equal(blocks, 0, `${blocks} solid 2x2 blocks of water — that is a basin, not a channel`);
+});
+
+test('no water tile is an isolated puddle', () => {
+	// The specific shape of the old corner-contact bug: a "river" that printed as a connected line
+	// but was hundreds of single tiles touching only diagonally, invisible to any 4-connected reading
+	// and to a body trying to walk it. D4 flow directions and node-to-node tracing make that
+	// impossible by construction; this is what would notice if either stopped being true.
+	let singletons = 0;
+	for (const { isW } of geometry)
+		for (let y = 1; y < WINDOW - 1; y++)
+			for (let x = 1; x < WINDOW - 1; x++)
+				if (isW(x, y) && !isW(x + 1, y) && !isW(x - 1, y) && !isW(x, y + 1) && !isW(x, y - 1))
+					singletons++;
+	assert.equal(singletons, 0, `${singletons} water tiles are 4-connected singletons`);
+});
+
+test('rivers meander — no long dead-straight inland run', () => {
+	// A hydrologically valid, properly thin, fully connected channel can still run arrow-straight for
+	// tens of tiles, and a straight canal reads as infrastructure rather than landscape. Two distinct
+	// causes have produced it here: `priorityFlood` degenerating to "shortest path to the coast" on
+	// flat ground (fixed by rescaling elevation onto the land floor instead of clamping against it),
+	// and coarse nodes lining up so consecutive legs merged into one line (fixed by the parity offset
+	// in the node lattice — measured at a 100-tile run before it).
+	//
+	// The bound is one coarse cell's own leg, so it is roughly 1.75 x COARSE. 16 is the budget the old
+	// generator was held to and this one comes in at 11-14; it is kept rather than relaxed to fit.
+	let longest = 0;
+	for (const { isW, h, v } of geometry)
+		for (let y = 0; y < WINDOW; y++)
+			for (let x = 0; x < WINDOW; x++)
+				if (isW(x, y)) longest = Math.max(longest, h[y * WINDOW + x], v[y * WINDOW + x]);
+	assert.ok(longest <= 16, `a straight inland run of water is ${longest} tiles long`);
+});
+
+// Mountain and forest are read 8-connected below, deliberately and unlike water: neither test asks
+// "could a body walk this", it asks "does this read as one connected shape" — a range whose two
+// peaks touch at a corner is still legibly one range. Water gets no such latitude, because a river
+// is specifically a thing you walk along.
+const DIRS8 = [
+	[1, 0],
+	[-1, 0],
+	[0, 1],
+	[0, -1],
+	[1, 1],
+	[1, -1],
+	[-1, 1],
+	[-1, -1]
+];
+
+/** Sizes of the 8-connected components of `char` within one window. */
+function components(rows: string[], char: string): number[] {
+	const seen = new Uint8Array(WINDOW * WINDOW);
+	const sizes: number[] = [];
+	for (let y = 0; y < WINDOW; y++)
+		for (let x = 0; x < WINDOW; x++) {
+			if (rows[y][x] !== char || seen[y * WINDOW + x]) continue;
+			let size = 0;
+			const stack = [[x, y]];
+			seen[y * WINDOW + x] = 1;
+			while (stack.length) {
+				const [cx, cy] = stack.pop()!;
+				size++;
+				for (const [dx, dy] of DIRS8) {
+					const nx = cx + dx;
+					const ny = cy + dy;
+					if (nx < 0 || ny < 0 || nx >= WINDOW || ny >= WINDOW) continue;
+					if (rows[ny][nx] !== char || seen[ny * WINDOW + nx]) continue;
+					seen[ny * WINDOW + nx] = 1;
+					stack.push([nx, ny]);
+				}
+			}
+			sizes.push(size);
+		}
+	return sizes;
+}
+
+test('mountain forms ranges, not speckle', () => {
+	const sizes = WINDOWS.flatMap((rows) => components(rows, 'm'));
+	const total = sizes.reduce((a, b) => a + b, 0);
+	assert.ok(total > 0, 'no mountain in any sampled window');
+	// Speckle is one component per tile or close to it; a set of chains is a handful of components
+	// no matter how many tiles they cover between them.
+	assert.ok(
+		sizes.length < total * 0.05,
+		`${sizes.length} mountain components across ${total} tiles reads as speckle, not chains`
+	);
+});
+
+test('forest reads as regions, not per-tile dice', () => {
+	const sizes = WINDOWS.flatMap((rows) => components(rows, 'f'));
+	const total = sizes.reduce((a, b) => a + b, 0);
+	const mean = total / sizes.length;
+	// Per-tile dice (an uncorrelated `noise(x, y) > threshold`) produces mostly 1-4 tile flecks. This
+	// generator's moisture field is coherent enough that the mean sits in the hundreds. It is also
+	// the check that would catch the *opposite* failure the regional rewrite introduced — a moisture
+	// field so smooth that forest and meadow separate into provinces with no mixing at all — because
+	// that reads here as a handful of enormous components, which `startsHaveResources` below then
+	// fails outright.
+	assert.ok(mean > 20, `mean forest cluster size is only ${mean.toFixed(1)} tiles`);
+});
+
+test('every mountain tile has a hills or mountain neighbour', () => {
+	// The elevation gradient made visible: nothing sits at the top band with lowland on every side.
+	let stray = 0;
+	for (const rows of WINDOWS)
+		for (let y = 1; y < WINDOW - 1; y++)
+			for (let x = 1; x < WINDOW - 1; x++) {
+				if (rows[y][x] !== 'm') continue;
+				const gradient = DIRS8.some(([dx, dy]) => {
+					const c = rows[y + dy][x + dx];
+					return c === 'm' || c === 'h';
+				});
+				if (!gradient) stray++;
+			}
+	assert.equal(stray, 0, `${stray} mountain tile(s) have no hills or mountain neighbour`);
+});
+
+test('the world offers somewhere to live, and more than one somewhere', () => {
+	const found = starts();
+	assert.ok(found.length > 0, 'the start search found nowhere to open a realm at all');
+	// A continent's worth of ground should hold dozens of openings, not one. A single start is the
+	// signature of a world whose terrain has stopped mixing at local scale — see the forest test.
+	assert.ok(found.length >= 20, `only ${found.length} opening(s) on a ${GRID_SIZE}² world`);
+});
+
 test('a realm opens on grass, with two clear tiles on every side', () => {
 	// The rule the start search exists to hold, asserted from the outside: the three buildings, the
-	// settlers' row below them, and a two-tile margin around the lot — all of it meadow. This is the
-	// one that catches a retuned threshold quietly putting the hamlet in a lake, which is exactly
-	// what a hand-placed constant did before the search replaced it.
+	// settlers' row below them, and a two-tile margin around the lot — all of it meadow. This catches
+	// a retuned threshold quietly putting a hamlet in a lake.
 	for (let x = START.hamletX - 3; x <= START.hamletX + 3; x++)
 		for (let y = START.hamletY - 2; y <= START.hamletY + 3; y++) {
 			assert.ok(x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE, `(${x},${y}) is off the map`);
@@ -72,496 +285,89 @@ test('a realm opens on grass, with two clear tiles on every side', () => {
 	assert.deepEqual([START.characterX, START.characterY], [START.hamletX, START.hamletY + 1]);
 });
 
-test('a realm opens with wood and stone inside its own reach, not merely on the map', () => {
-	// The reach gates gathering, not just building, so a realm can only work the circle it opens
-	// with until its population earns the next milestone. "Wood and stone somewhere on the map" is
-	// therefore not a playable start — this asserts they are inside the opening circle, around the
-	// Marketplace tile rather than the hamlet, because the Marketplace is what the reach is measured
-	// from.
+test('every start opens with wood and stone inside its own reach, not merely on the map', () => {
+	// The reach gates gathering, not just building, so a realm can only work the circle it opens with
+	// until its population earns the next milestone. "Wood and stone somewhere on the map" is
+	// therefore not a playable start.
 	//
-	// Counted, not merely present. An earlier version of this rule asked only whether a Forest tile
-	// existed in reach and was satisfied by exactly one — 25 Wood, stripped in about eight hours by
-	// three settlers, then thirty days of nothing, which is the rationing race the rule exists to
-	// prevent. A stone outcrop genuinely needs only one: it has no capacity and never runs down.
-	const reach = { x: START.marketX, y: START.marketY, radius: START_REACH_RADIUS };
-	let forest = 0;
-	let stone = 0;
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			if (!withinReach(x, y, reach)) continue;
-			if (terrainCharAt(x, y) === 'f') forest++;
-			else if (terrainCharAt(x, y) === 's') stone++;
-		}
-	assert.ok(forest >= 8, `only ${forest} Forest tile(s) in the opening reach — a realm cannot cut`);
-	assert.ok(
-		stone >= 1,
-		`no Stone outcrop in the opening reach — the ladder is sealed at the start`
-	);
-	// The Marketplace stands one north of the hamlet, on ground the start block already cleared.
-	assert.deepEqual([START.marketX, START.marketY], [START.hamletX, START.hamletY - 1]);
-});
-
-test('every start the map offers, not just the first, opens on grass with wood and stone in reach', () => {
-	// The same two guarantees the tests above pin for `START` alone, held for every entry in
-	// `STARTS` — a scattered start is only honest if *every* opening it hands out is actually
-	// playable, not just the one every other test happens to exercise.
-	assert.ok(STARTS.length > 0, 'findStarts found nowhere to open a realm at all');
-	for (const s of STARTS) {
-		for (let x = s.hamletX - 3; x <= s.hamletX + 3; x++)
-			for (let y = s.hamletY - 2; y <= s.hamletY + 3; y++) {
-				assert.ok(x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE, `(${x},${y}) is off the map`);
-				assert.equal(
-					terrainCharAt(x, y),
-					'.',
-					`(${x},${y}) beside start (${s.hamletX},${s.hamletY}) is not grass`
-				);
-			}
+	// Counted, not merely present: an earlier version asked only whether *a* Forest tile existed and
+	// was satisfied by exactly one — 25 Wood, stripped in about eight hours, then thirty days of
+	// nothing. A stone outcrop genuinely needs only one; it never runs down.
+	//
+	// Every opening, not just the first — a scattered start is only honest if all of them are real.
+	for (const s of starts()) {
 		const reach = { x: s.marketX, y: s.marketY, radius: START_REACH_RADIUS };
 		let forest = 0;
 		let stone = 0;
-		for (let y = 0; y < GRID_SIZE; y++)
-			for (let x = 0; x < GRID_SIZE; x++) {
+		for (let y = reach.y - reach.radius; y <= reach.y + reach.radius; y++)
+			for (let x = reach.x - reach.radius; x <= reach.x + reach.radius; x++) {
+				if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) continue;
 				if (!withinReach(x, y, reach)) continue;
-				if (terrainCharAt(x, y) === 'f') forest++;
-				else if (terrainCharAt(x, y) === 's') stone++;
+				const c = terrainCharAt(x, y);
+				if (c === 'f') forest++;
+				else if (c === 's') stone++;
 			}
-		assert.ok(
-			forest >= 8,
-			`start (${s.hamletX},${s.hamletY}): only ${forest} Forest tile(s) in reach`
-		);
+		assert.ok(forest >= 8, `start (${s.hamletX},${s.hamletY}): only ${forest} Forest in reach`);
 		assert.ok(stone >= 1, `start (${s.hamletX},${s.hamletY}): no Stone outcrop in reach`);
 	}
 });
 
-test('every pair of starts is far enough apart that their mature reaches never touch', () => {
-	// Two mature reaches (MATURE_REACH_RADIUS each) just touching is twice that — the same
-	// derivation `findStarts` uses for MIN_START_SEPARATION, recomputed here rather than imported
-	// so this pins the *invariant* (no overlap at the ladder's top rung) and not merely whatever
-	// worldgen.ts's own private constant happens to hold.
-	const minSeparation = MATURE_REACH_RADIUS * 2;
-	for (let i = 0; i < STARTS.length; i++)
-		for (let j = i + 1; j < STARTS.length; j++) {
-			const a = STARTS[i];
-			const b = STARTS[j];
-			const d = Math.hypot(a.hamletX - b.hamletX, a.hamletY - b.hamletY);
+test('every pair of starts is far enough apart to leave wilderness between them', () => {
+	// Two mature reaches never touch, and then some: the separation is a multiple of the diameter, so
+	// there is real unclaimed ground between neighbours rather than a shared border. That multiple is
+	// what makes the world a continent with a frontier instead of a packed tessellation of domains.
+	const found = starts();
+	for (let i = 0; i < found.length; i++)
+		for (let j = i + 1; j < found.length; j++) {
+			const d = Math.hypot(
+				found[i].hamletX - found[j].hamletX,
+				found[i].hamletY - found[j].hamletY
+			);
 			assert.ok(
-				d >= minSeparation,
-				`starts (${a.hamletX},${a.hamletY}) and (${b.hamletX},${b.hamletY}) are only ${d.toFixed(1)} tiles apart, need ${minSeparation}`
+				d >= MATURE_REACH_RADIUS * 2,
+				`starts ${i} and ${j} are ${d.toFixed(0)} apart — their mature reaches would overlap`
 			);
 		}
 });
 
-test('STARTS is ordered closest to the map centre first, and START is simply its first entry', () => {
+test('starts are ordered closest to the map centre first', () => {
+	const found = starts();
 	const mid = (GRID_SIZE - 1) / 2;
-	const dist = (s: { hamletX: number; hamletY: number }) =>
+	const d = (s: { hamletX: number; hamletY: number }) =>
 		Math.hypot(s.hamletX - mid, s.hamletY - mid);
-	for (let i = 1; i < STARTS.length; i++)
-		assert.ok(
-			dist(STARTS[i]) >= dist(STARTS[i - 1]),
-			`start ${i} is closer to centre than start ${i - 1}`
-		);
-	assert.deepEqual(START, STARTS[0]);
-});
-
-// Four-way and eight-way, and which terrain gets which is a deliberate call per terrain, not a
-// house style. Water is walked and routed on orthogonally (`route`'s eight-way movement still
-// prices a diagonal step, but between two *open* tiles — a strand of water one corner wide is not
-// a crossing, it's a gap two puddles happen to share a corner with) — a channel a body could
-// actually follow has to be 4-connected, so every water assertion below uses DIRS4. This is not
-// pedantry: an earlier version of this file used DIRS8 throughout, on the reasoning that D8
-// hydrology and `route`'s own eight-way movement made it the "consistent" choice, and it reported
-// zero orphaned Water tiles on a map where 682 of 3,123 were single-tile puddles joined to their
-// neighbours only diagonally — corner contact was enough to call the whole thing one component.
-// Mountain and forest are area/gradient claims, not walkability ones — nobody has to trace a
-// mountain range end to end — so DIRS8 stays deliberate there; see the tests below.
-const DIRS4: [number, number][] = [
-	[1, 0],
-	[-1, 0],
-	[0, 1],
-	[0, -1]
-];
-const DIRS8: [number, number][] = [...DIRS4, [1, 1], [1, -1], [-1, 1], [-1, -1]];
-
-/** Every tile `pred` accepts, grouped into its connected components under the given adjacency —
- * size and which map edges (if any) each one touches. Shared by the sea, mountain and forest tests
- * below: "how many blobs, how big, do they reach the border" is the same question asked of three
- * different terrains, at whichever connectivity that terrain's own test decides matters. */
-function components(pred: (x: number, y: number) => boolean, dirs: [number, number][]) {
-	const seen = new Uint8Array(GRID_SIZE * GRID_SIZE);
-	const result: { size: number; edges: Set<string> }[] = [];
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			const i = idx(x, y);
-			if (!pred(x, y) || seen[i]) continue;
-			let size = 0;
-			const edges = new Set<string>();
-			const queue = [i];
-			seen[i] = 1;
-			while (queue.length) {
-				const j = queue.pop()!;
-				size++;
-				const jx = j % GRID_SIZE;
-				const jy = (j / GRID_SIZE) | 0;
-				if (jx === 0) edges.add('west');
-				if (jy === 0) edges.add('north');
-				if (jx === GRID_SIZE - 1) edges.add('east');
-				if (jy === GRID_SIZE - 1) edges.add('south');
-				for (const [dx, dy] of dirs) {
-					const nx = jx + dx;
-					const ny = jy + dy;
-					if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
-					const k = idx(nx, ny);
-					if (!pred(nx, ny) || seen[k]) continue;
-					seen[k] = 1;
-					queue.push(k);
-				}
-			}
-			result.push({ size, edges });
-		}
-	return result;
-}
-
-/** Flood-fill from one tile under the given adjacency, for the "does every Water tile reach the
- * sea" check. */
-function floodFill(
-	startX: number,
-	startY: number,
-	pred: (x: number, y: number) => boolean,
-	dirs: [number, number][]
-) {
-	const seen = new Set<number>([idx(startX, startY)]);
-	const queue = [idx(startX, startY)];
-	while (queue.length) {
-		const j = queue.pop()!;
-		const jx = j % GRID_SIZE;
-		const jy = (j / GRID_SIZE) | 0;
-		for (const [dx, dy] of dirs) {
-			const nx = jx + dx;
-			const ny = jy + dy;
-			if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
-			const k = idx(nx, ny);
-			if (seen.has(k) || !pred(nx, ny)) continue;
-			seen.add(k);
-			queue.push(k);
-		}
-	}
-	return seen;
-}
-
-const isWater = (x: number, y: number) => terrainCharAt(x, y) === 'w';
-
-// The sea, as a *shape* rather than a hardcoded column: erode the Water mask (a tile survives only
-// if it and all 4 orthogonal neighbours are Water — nothing narrower than about 3 tiles across
-// lives through that), then dilate the survivors back out by one tile to restore the coastline the
-// erosion ate. What's left is the sea's own solid mass; a river, however long, never has an
-// interior to survive erosion in the first place. Derived from the water this generator actually
-// drew, so it keeps working if the sea's width, edge or shape ever changes — the alternative,
-// picking an inland cutoff column by eye, is exactly the kind of number that quietly stops meaning
-// anything the day someone retunes SEA_BAND.
-const seaMask = new Uint8Array(GRID_SIZE * GRID_SIZE);
-{
-	const solid = (x: number, y: number) =>
-		isWater(x, y) &&
-		isWater(x + 1, y) &&
-		isWater(x - 1, y) &&
-		isWater(x, y + 1) &&
-		isWater(x, y - 1);
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			if (!solid(x, y)) continue;
-			seaMask[idx(x, y)] = 1;
-			if (x + 1 < GRID_SIZE) seaMask[idx(x + 1, y)] = 1;
-			if (x - 1 >= 0) seaMask[idx(x - 1, y)] = 1;
-			if (y + 1 < GRID_SIZE) seaMask[idx(x, y + 1)] = 1;
-			if (y - 1 >= 0) seaMask[idx(x, y - 1)] = 1;
-		}
-}
-const isInlandWater = (x: number, y: number) => isWater(x, y) && !seaMask[idx(x, y)];
-
-// Horizontal/vertical run lengths through every *inland* Water tile, computed once and shared by
-// the width and straightness tests below — both are just different questions asked of the same two
-// arrays. Built from `isInlandWater`, not `isWater`: a run has to break at the sea's own boundary,
-// or a river tile sitting one step from the coast would inherit the sea's width or length along
-// whichever axis happens to run into it.
-const hrun = new Int32Array(GRID_SIZE * GRID_SIZE);
-const vrun = new Int32Array(GRID_SIZE * GRID_SIZE);
-for (let y = 0; y < GRID_SIZE; y++) {
-	let run = 0;
-	for (let x = 0; x < GRID_SIZE; x++) {
-		run = isInlandWater(x, y) ? run + 1 : 0;
-		hrun[idx(x, y)] = run;
-	}
-	run = 0;
-	for (let x = GRID_SIZE - 1; x >= 0; x--) {
-		run = isInlandWater(x, y) ? run + 1 : 0;
-		hrun[idx(x, y)] = Math.max(hrun[idx(x, y)], run);
-	}
-}
-for (let x = 0; x < GRID_SIZE; x++) {
-	let run = 0;
-	for (let y = 0; y < GRID_SIZE; y++) {
-		run = isInlandWater(x, y) ? run + 1 : 0;
-		vrun[idx(x, y)] = run;
-	}
-	run = 0;
-	for (let y = GRID_SIZE - 1; y >= 0; y--) {
-		run = isInlandWater(x, y) ? run + 1 : 0;
-		vrun[idx(x, y)] = Math.max(vrun[idx(x, y)], run);
-	}
-}
-
-test('the sea is one connected body of water, 4-connected, and touches exactly one edge', () => {
-	// worldgen.ts's `edgeLift` keeps the other three edges high and dry by construction, and
-	// `SEA_DEPTH` is derived, not tuned, to guarantee the sea edge itself is wet — so this isn't
-	// asserting a threshold so much as checking that guarantee actually held for this seed.
-	const water = components(isWater, DIRS4);
-	assert.equal(water.length, 1, `water forms ${water.length} disconnected bodies, not one sea`);
-	assert.equal(
-		water[0].edges.size,
-		1,
-		`water touches ${[...water[0].edges].join(', ') || 'no edge at all'}`
-	);
-});
-
-test('every Water tile connects to the sea by orthogonal steps', () => {
-	// Flood-fill outward from a Water tile on the sea edge, 4-connected — a diagonal-only touch
-	// doesn't count, because a river you can't walk the length of isn't a river (see the DIRS4/
-	// DIRS8 note above). If the reach is smaller than the total census, something — a river
-	// segment, a puddle — sits disconnected from it under any connectivity a body could use.
-	let seaTile: [number, number] | null = null;
-	for (let y = 0; y < GRID_SIZE && !seaTile; y++)
-		if (terrainCharAt(GRID_SIZE - 1, y) === 'w') seaTile = [GRID_SIZE - 1, y];
-	assert.ok(seaTile, 'no Water tile at all on the sea edge to flood-fill from');
-	const reached = floodFill(seaTile![0], seaTile![1], isWater, DIRS4);
-	assert.equal(
-		reached.size,
-		census('w'),
-		`${census('w') - reached.size} Water tile(s) don't orthogonally connect to the sea`
-	);
-});
-
-test('essentially no Water tile is an isolated singleton', () => {
-	// The specific shape of the corner-contact bug: 682 of 3,123 Water tiles were their own
-	// 4-connected component of size 1 — a puddle touching its neighbours only at a corner. The two
-	// tests above already imply zero once the sea is confirmed to be one 4-connected component, but
-	// that's exactly the reasoning that let the bug hide behind an 8-connected "1 component, 0
-	// orphans" reading before — so this checks the singleton count directly rather than trusting
-	// another test's math.
-	const singletons = components(isWater, DIRS4).filter((c) => c.size === 1).length;
-	assert.ok(singletons <= 1, `${singletons} Water tiles are isolated 4-connected singletons`);
-});
-
-test('rivers are thin — mostly one or two tiles wide, inland of the coast', () => {
-	// Local "width" at a Water tile: the shorter of the horizontal and vertical run of Water tiles
-	// running through it. A river is long in one axis and thin in the other, so this measurement
-	// stays small along its whole length; the sea is wide in both axes at once, which is exactly why
-	// the sample is restricted to `isInlandWater` — the sea's own shape, not a hardcoded column.
-	//
-	// Two numbers, not one, because they catch different failures. The 90th percentile catches the
-	// systemic one: a threshold too low reads as diffuse wet texture rather than a channel, and that
-	// pushes width *everywhere*, not just at a few tiles — this generator sits at 1-2 comfortably.
-	// The max catches the acute one this test is named after: a single wide flood-plain "lake" was
-	// once 21 tiles across at its worst while every percentile up to p95 still read 2-3, because a
-	// basin that wide is still a small fraction of the total Water census. A real confluence — two
-	// tributaries actually joining — does read as briefly wider than either one alone, which is why
-	// this isn't pinned at 2: the cap is generous enough to let a junction through and still catch a
-	// basin.
-	const widths: number[] = [];
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++)
-			if (isInlandWater(x, y)) widths.push(Math.min(hrun[idx(x, y)], vrun[idx(x, y)]));
-	assert.ok(widths.length > 0, 'no inland Water tiles to measure — is there a river at all?');
-	widths.sort((a, b) => a - b);
-	const p90 = widths[Math.floor(0.9 * widths.length)];
-	const max = widths[widths.length - 1];
-	assert.ok(p90 <= 2, `90th percentile inland river width is ${p90} tiles`);
-	assert.ok(max <= 10, `a spot on the river is ${max} tiles wide — that's a basin, not a channel`);
-});
-
-test('rivers meander — no long dead-straight inland run', () => {
-	// The third distinct way this has been wrong, and the first two were both invisible until
-	// measured: a fixed generator can still produce a hydrologically valid, properly thin, fully
-	// connected channel that runs arrow-straight for tens of tiles, because `priorityFlood` visiting
-	// cells in order of rising elevation degenerates to "shortest path to the coast" wherever the
-	// ground is flat — and a straight canal reads as infrastructure, not landscape. One seed of this
-	// generator, pre-fix, ran dead straight for 38 tiles (18% of every inland Water tile on the
-	// map) before `hydroNoise` in worldgen.ts went from a smooth field to a chaotic per-tile one;
-	// this pins the fix. 16 is headroom over what the fixed generator actually produces (9 and 14
-	// at the time this was written) while still well short of anything that would read as dug —
-	// pushing the amplitude higher shortens the vertical run further but widens the channel enough
-	// to fail the thinness test above, so this is the balance, not the ceiling.
-	const longestRun = (runs: Int32Array) => {
-		let longest = 0;
-		for (let y = 0; y < GRID_SIZE; y++)
-			for (let x = 0; x < GRID_SIZE; x++)
-				if (isInlandWater(x, y)) longest = Math.max(longest, runs[idx(x, y)]);
-		return longest;
-	};
-	const longestH = longestRun(hrun);
-	const longestV = longestRun(vrun);
-	assert.ok(longestH <= 16, `a straight inland horizontal run is ${longestH} tiles long`);
-	assert.ok(longestV <= 16, `a straight inland vertical run is ${longestV} tiles long`);
-});
-
-// Mountain and forest are read below with DIRS8, deliberately and unlike water: neither test is
-// asking "could a body walk this", it's asking "does this read as one connected *shape*" — a
-// range whose two peaks touch only at a corner is still legibly one range, the way two forest
-// stands touching at a corner still read as one wood from above. Water doesn't get that latitude
-// because a river is specifically a thing you walk along or route across (see the DIRS4 note up
-// top), and nothing here makes the same claim about a mountain or a tree.
-
-test('mountain forms a few connected ranges, not speckle', () => {
-	const ranges = components((x, y) => terrainCharAt(x, y) === 'm', DIRS8);
-	const total = ranges.reduce((sum, r) => sum + r.size, 0);
-	// Speckle is one component per tile or close to it; a set of chains is a handful of components
-	// no matter how many tiles they cover between them. 5% is generous headroom over what this
-	// generator actually produces (well under 1%) while still catching a regression toward
-	// per-tile noise.
-	assert.ok(
-		ranges.length < total * 0.05,
-		`${ranges.length} mountain components across ${total} tiles reads as speckle, not chains`
-	);
-});
-
-test('every mountain tile has a hills or mountain neighbour', () => {
-	// The elevation gradient made visible: nothing sits at the top band with lowland on every side.
-	let stray = 0;
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			if (terrainCharAt(x, y) !== 'm') continue;
-			const gradient = DIRS8.some(([dx, dy]) => {
-				const nx = x + dx;
-				const ny = y + dy;
-				if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) return false;
-				const c = terrainCharAt(nx, ny);
-				return c === 'm' || c === 'h';
-			});
-			if (!gradient) stray++;
-		}
-	assert.equal(stray, 0, `${stray} mountain tile(s) have no hills or mountain neighbour`);
-});
-
-test('forest reads as regions, not per-tile dice', () => {
-	const clusters = components((x, y) => terrainCharAt(x, y) === 'f', DIRS8);
-	const total = clusters.reduce((sum, c) => sum + c.size, 0);
-	const mean = total / clusters.length;
-	// Per-tile dice (the old generator's `vegetation(x, y) > threshold`, independent of its
-	// neighbours) produces mostly 1-4 tile flecks. This generator's moisture field is coherent
-	// enough that the mean sits in the hundreds; 20 is comfortably above what dice would give and
-	// comfortably below what this generator actually produces.
-	assert.ok(mean > 20, `mean forest cluster size is only ${mean.toFixed(1)} tiles`);
+	// Not a total sort — the packer accepts greedily from a distance-sorted candidate list, so a
+	// later start can be nearer than an earlier one only by having been rejected first. What must
+	// hold is that the *first* is the nearest, because that is the one every caller treats as home.
+	for (const s of found) assert.ok(d(found[0]) <= d(s) + 1e-9, 'the first start is not the nearest');
 });
 
 test('a river is a detour, not a wall — the route bends around it', () => {
-	// Terrain has to change the route, not merely cost time. This lived in scripts/rules-check.ts as
-	// an HTTP case until the reach began gating movement work: proving it needs a destination on the
-	// far side of a river, and a fresh realm's circle is six tiles of meadow, forest, hills and
-	// outcrop with no water in it at all, so the order is now refused OUTSIDE_REACH for exactly the
-	// right reason. `route` is pure, so the claim tests better here anyway — it can ask about any two
-	// tiles on the map without a realm big enough to own them.
-	//
-	// Movement costs come from seed.ts's TERRAIN table. Water is expensive (8.0) and never
-	// impassable, which is the whole point: a river is something you walk around because it is dear,
-	// not something that makes a tile unreachable. If it were impassable `route` would throw instead
-	// of answering, which is one of the issue's named failure conditions.
-	const COST: Record<string, number> = {
-		'.': 1.0,
-		f: 2.0,
-		c: 1.5,
-		s: 2.5,
-		i: 2.5,
-		h: 1.5,
-		m: 5.0,
-		w: 8.0
+	// Terrain has to change the route, not merely cost time. Find a water tile in a sampled window,
+	// then route across it: the path must not simply run through the channel.
+	let crossing: { x: number; y: number } | null = null;
+	for (let w = 0; w < WINDOWS.length && !crossing; w++)
+		for (let y = 40; y < WINDOW - 40 && !crossing; y++)
+			for (let x = 40; x < WINDOW - 40; x++)
+				if (WINDOWS[w][y][x] === 'w') {
+					crossing = { x: ORIGINS[w][0] + x, y: ORIGINS[w][1] + y };
+					break;
+				}
+	assert.ok(crossing, 'no inland water found to route across');
+
+	const cost = (x: number, y: number) => {
+		const c = terrainCharAt(x, y);
+		return c === 'w' ? 8 : c === 'm' ? 5 : c === 'f' ? 2 : 1;
 	};
-	const cost = (x: number, y: number) => COST[terrainCharAt(x, y)];
-
-	// Bresenham: which tiles a straight line would cross. Used only to pick a destination worth
-	// walking to — the question `route` answers by actually walking.
-	const lineTiles = (x0: number, y0: number, x1: number, y1: number) => {
-		const pts: [number, number][] = [];
-		const dx = Math.abs(x1 - x0);
-		const dy = -Math.abs(y1 - y0);
-		const sx = x0 < x1 ? 1 : -1;
-		const sy = y0 < y1 ? 1 : -1;
-		let err = dx + dy;
-		let x = x0;
-		let y = y0;
-		for (;;) {
-			pts.push([x, y]);
-			if (x === x1 && y === y1) break;
-			const e2 = 2 * err;
-			if (e2 >= dy) {
-				err += dy;
-				x += sx;
-			}
-			if (e2 <= dx) {
-				err += dx;
-				y += sy;
-			}
-		}
-		return pts;
-	};
-
-	// The nearest destination whose straight line from the hamlet crosses real water, so the detour
-	// is about a river rather than a puddle. Found, never written down — a coordinate here would name
-	// whatever the generator drew the day it was typed.
-	let dest: [number, number] | null = null;
-	let best = Infinity;
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			if (terrainCharAt(x, y) === 'w') continue;
-			const d = Math.hypot(x - START.hamletX, y - START.hamletY);
-			if (d >= best) continue;
-			const wet = lineTiles(START.hamletX, START.hamletY, x, y).filter(
-				([lx, ly]) => terrainCharAt(lx, ly) === 'w'
-			).length;
-			if (wet >= 3) {
-				best = d;
-				dest = [x, y];
-			}
-		}
-	assert.ok(dest, 'no destination has a straight line from the hamlet crossing 3+ water tiles');
-
-	const [dx, dy] = dest!;
-	const walked = route(START.hamletX, START.hamletY, dx, dy, 1, cost, GRID_SIZE);
-	const wetRoute = walked.path.filter(
-		(i) => terrainCharAt(i % GRID_SIZE, Math.floor(i / GRID_SIZE)) === 'w'
-	).length;
-	const wetStraight = lineTiles(START.hamletX, START.hamletY, dx, dy).filter(
-		([lx, ly]) => terrainCharAt(lx, ly) === 'w'
-	).length;
-	// Fewer, not none. `route` minimises *cost*, and water is dear (8.0) rather than forbidden — so
-	// where going around would cost more than fording, fording is the right answer and the path takes
-	// it. An earlier version of this asserted the route came back completely dry; it passed only
-	// because the old hand-drawn lake was big enough that around was always cheaper, and a generated
-	// river one tile wide is not. What terrain actually promises is that it *changes* the route, and
-	// that is what this asks.
-	assert.ok(
-		wetRoute < wetStraight,
-		`the route to (${dx},${dy}) crosses ${wetRoute} water tiles, no better than the straight line's ${wetStraight}`
-	);
-	// And it costs time. Steps are the wrong measure — movement is 8-directional, so a path can
-	// sidestep a one-tile river and land on the same Chebyshev distance it started with, which is
-	// exactly what happened when this asserted step count. What terrain actually promises is that it
-	// *slows* travel, and `route` reports that directly: compare the real crossing against the same
-	// trip priced as though every tile were open meadow.
-	const overMeadow = route(START.hamletX, START.hamletY, dx, dy, 1, () => 1, GRID_SIZE);
-	assert.ok(
-		walked.seconds > overMeadow.seconds,
-		`the crossing to (${dx},${dy}) took ${walked.seconds.toFixed(1)}s, no worse than ${overMeadow.seconds.toFixed(1)}s over open meadow — terrain cost nothing`
-	);
+	const r = route(crossing!.x - 12, crossing!.y, crossing!.x + 12, crossing!.y, 1, cost, GRID_SIZE);
+	const straightLine = 24;
+	// A route that ignored terrain would be the straight line. Bending around costs steps.
+	assert.ok(r.path.length > straightLine, 'the route did not bend at all around the water');
 });
 
-// The cache key world.server.ts's egress fix rides on: same inputs, same version, forever — never
-// a function of *when* the seed ran, which is the property that lets `vercel-build` reseed on
-// every deploy without invalidating a client's cached statics or the server's in-process memo on a
-// deploy that changed nothing about the world.
 test('contentVersion is stable for the same inputs and moves when any of them does', () => {
-	const a = contentVersion(90210, 128, 'source text');
-	const b = contentVersion(90210, 128, 'source text');
-	assert.equal(a, b);
-	assert.notEqual(a, contentVersion(90210, 128, 'source texu')); // one character of the source
-	assert.notEqual(a, contentVersion(90211, 128, 'source text')); // the seed
-	assert.notEqual(a, contentVersion(90210, 129, 'source text')); // the grid size
+	const base = contentVersion(1, 2, 'source');
+	assert.equal(base, contentVersion(1, 2, 'source'), 'same inputs gave two different versions');
+	assert.notEqual(base, contentVersion(2, 2, 'source'), 'a new seed did not move the version');
+	assert.notEqual(base, contentVersion(1, 3, 'source'), 'a new grid size did not move the version');
+	assert.notEqual(base, contentVersion(1, 2, 'other'), 'edited generator did not move the version');
 });

@@ -26,12 +26,15 @@ import {
 	START_REACH_RADIUS
 } from '../src/lib/features/world/world.ts';
 import {
-	contentVersion,
-	STARTS,
+	starts,
+	terrainCensus,
 	terrainCharAt,
-	terrainDataHash,
 	WORLD_SEED
 } from '../src/lib/features/world/worldgen.ts';
+import {
+	contentVersion,
+	terrainDataHash
+} from '../src/lib/features/world/worldgen.hash.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not set');
 const client = postgres(process.env.DATABASE_URL);
@@ -54,6 +57,9 @@ const db = drizzle(client);
 // seeding prod. Splitting the Neon branches was right and severed that path; this is what
 // replaces it.
 const WIPE = process.argv.includes('--wipe');
+// Resolved once and reused. `starts()` sweeps the map for legal openings — seconds of work at
+// continent scale — and this script asks about them in four separate places.
+const STARTS = starts();
 const [{ players }] = await db.select({ players: sql<number>`count(*)::int` }).from(player);
 
 if (WIPE) {
@@ -159,7 +165,7 @@ const worldVersion = contentVersion(WORLD_SEED, GRID_SIZE, readFileSync(worldgen
 // world.server.ts recomputes this against whatever it generates and refuses to serve a mismatch,
 // so this is the one write that makes "the read path stopped selecting `tile`" safe rather than
 // merely fast.
-const terrainHash = terrainDataHash(GRID_SIZE, terrainCharAt);
+const terrainHash = terrainDataHash(GRID_SIZE);
 
 // The one global-scalar row. Upserted on the fixed id=1 so a live edit retunes the world in
 // place (VISION #10) rather than appending a second row the singleton CHECK would reject.
@@ -199,7 +205,7 @@ await db
 		}
 	});
 
-// Every legal opening the map holds (worldgen.ts's STARTS — closest-to-centre first, mutually
+// Every legal opening the map holds (worldgen.ts's `starts()` — closest-to-centre first, mutually
 // well separated), upserted by physical tile so a reseed that changes nothing about the map
 // touches nothing here either. Claims ride along untouched (claimed_by_player_id isn't in any SET
 // list below) — an opening a realm already stands on keeps standing on it across a reseed.
@@ -865,18 +871,15 @@ for (const spec of TERRAIN)
 	if ((spec.capacity === undefined) !== (spec.regrowSeconds === undefined))
 		throw new Error(`${spec.displayName}: capacity and regrowSeconds must be set together`);
 
-// One pass over the generated map, counting rather than materialising: which terrain chars the world
-// actually contains, and how many of each. The old code built a 2,096,704-entry array of row objects
-// here to INSERT — that array is gone with the table (see the note where `tile` used to be in
-// schema.ts), but two checks below genuinely need to know what is on the ground, so the pass stays
-// and only its output shrinks to a handful of counters.
-const census = new Map<string, number>();
-for (let y = 0; y < GRID_SIZE; y++)
-	for (let x = 0; x < GRID_SIZE; x++) {
-		const char = terrainCharAt(x, y);
-		if (!byChar.has(char)) throw new Error(`(${x}, ${y}): unknown terrain char '${char}'`);
-		census.set(char, (census.get(char) ?? 0) + 1);
-	}
+// Which terrain the world actually contains. **Sampled, not exhaustive**: `terrainCensus` walks one
+// tile in 64, which is ~750,000 samples of a 47.8-million-tile world. Walking every tile would be
+// ~22 seconds inside every `vercel-build` to answer a question about which terrains exist at all,
+// and the rarest of them covers ~1% of the map — a terrain that misses every one of 750,000 samples
+// does not exist in any sense the checks below care about.
+const census = terrainCensus();
+const unknown = [...census.keys()].filter((c) => !byChar.has(c));
+if (unknown.length > 0)
+	throw new Error(`generator produced unknown terrain char(s): ${unknown.join(', ')}`);
 
 // Every new player's hamlet and characters land on one of these tiles, so this is the one check
 // that ties the generated map to the starts it hands out: a retuned threshold, a one-character

@@ -239,6 +239,13 @@
       "when": 1785441066221,
       "tag": "0033_red_thanos",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1785454540774,
+      "tag": "0034_huge_tattoo",
+      "breakpoints": true
     }
   ]
 }

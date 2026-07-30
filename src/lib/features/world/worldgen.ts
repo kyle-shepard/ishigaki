@@ -1,136 +1,139 @@
-// What terrain sits on every tile of the world, as one char per tile. The seed turns these into
-// rows; this decides what they are.
+// What terrain sits on every tile of the world, as one char per tile — computed on demand, never
+// stored. Ask it about a tile and it answers; ask it about all 47,775,744 of them and it will
+// answer that too, one at a time, which is the whole point.
 //
-// Fully generated, one source. There used to be a hand-authored core (`LAYOUT`) sitting in the
-// middle of the map, because the start tiles and the travel demo needed to be exactly what they
-// were — but that stopped being a fair trade once the world grew past what hand-authoring can
-// cover: `findStarts` searches the generated ground for every legal, well-separated opening
-// instead of one being drawn for it (see below), and scripts/rules-check.ts finds its terrain
-// features in the payload rather than naming a coordinate. One alphabet, one code path, no second
-// frame to keep in sync.
+// **Two resolutions, and that is the architecture.** The old generator built the entire grid
+// eagerly into typed arrays at module import, because its hydrology stage — priority-flood, D4 flow
+// direction, flow accumulation — is a whole-grid algorithm by nature: there is no such thing as
+// "the river at just this one tile" without knowing its neighbours. That reasoning was right, and
+// it is why every other stage was made eager too, for consistency. It also put the cost of the
+// *whole world* in front of every consumer: ~2.4 s and hundreds of megabytes at 1448x1448, and at
+// the continent this is now sized for (#24) it is a minute of CPU and multiple gigabytes of
+// Float64Array, per lambda cold start, before anybody has looked at a single tile.
 //
-// Deterministic on purpose. `vercel-build` re-runs the seed on every deploy, and the tile grid is
-// upserted rather than rebuilt: a generator that rolled fresh each time would rearrange the ground
-// under standing buildings and other players' half-cleared forests. Same seed, same world, forever
-// — a new map is a `WORLD_SEED` edit, and a deliberate one.
+// So the hydrology keeps its whole-grid algorithm and stops running at tile resolution. A **coarse
+// grid** — one cell per COARSE x COARSE block of tiles — carries the three things that genuinely
+// cannot be decided locally: which way water flows, how much of it passes through, and whether a
+// given patch of low ground actually connects to the sea. That grid is small enough to build
+// eagerly at import and keep (at COARSE 6 the continent is 1152x1152 cells, ~21 MB and 1.1 s), and
+// everything else — elevation, ridges, minerals, moisture, and the tile-level shape of the rivers
+// themselves — is a **pure function of (x, y)** against that coarse grid plus noise. Nothing walks
+// the world to answer a question about one tile.
 //
-// A named pipeline now, not three fields and five thresholds: domain-warped fBm for elevation, a
-// falloff toward one chosen edge for the sea (the coastline is wherever the water threshold and
-// that falloff happen to cross — emergent, never drawn), a ridged multifractal added into the high
-// band so mountains come out as chains, a second elevation cut for Hills between lowland and peak,
-// then priority-flood depression filling → D4 downhill directions → flow accumulation for rivers
-// that are guaranteed to reach the sea by construction rather than by luck. D4, not the more usual
-// D8, because a river has to be a channel you could walk the length of — see the comment on
-// `priorityFlood` for the corner-only channels D8 produced instead. Moisture (and so forest vs.
-// meadow) is lifted near whatever water the hydrology pass produced, so woodland reads as a region
-// rather than a coin flip per tile. Full technique names are in the comments below, next to the
-// code that earns them — this file is the whole of the R-step research turned into something
-// `npm run map` can be checked against.
+// Three consequences worth knowing:
+//
+//  - **The client can run this.** It is the same module, no database, no filesystem: the browser
+//    computes the terrain under its own viewport instead of being shipped a 48M-entry array. That
+//    is what took the terrain payload off the wire.
+//  - **Thresholds carry across grid sizes now.** They never used to: `field` built a lattice sized
+//    to GRID_SIZE, so changing the grid drew a different number of random values and handed back a
+//    genuinely different field whose elevation histogram sat somewhere else — every previous grid
+//    change (128->256, 256->1024, 1024->1448) came with a retuning pass and a comment apologising
+//    for it. `field` is a hash now, evaluated per sample point, so the value at lattice point
+//    (i, j) is the same value forever regardless of how big the world is. A bigger world is
+//    literally more of the same world, not a differently-shaped one.
+//  - **Rivers are one tile wide by construction**, not by tuning. See `riverAt`.
+//
+// The pipeline, in order: domain-warped fBm for elevation, a falloff toward one chosen edge for the
+// sea (the coastline is wherever the water threshold and that falloff happen to cross — emergent,
+// never drawn), a ridged multifractal added into the high band so mountains come out as chains, a
+// second elevation cut for Hills between lowland and peak; then, on the coarse grid, priority-flood
+// depression filling -> D4 downhill directions -> flow accumulation, so rivers are guaranteed to
+// reach the sea by construction rather than by luck; then per tile, a river is wherever a coarse
+// channel's traced path crosses. Moisture (and so forest vs. meadow) is lifted near whatever water
+// the hydrology produced, so woodland reads as a region rather than a coin flip per tile.
+//
+// Deterministic on purpose. `vercel-build` re-runs the seed on every deploy, and realms stand on
+// ground this decides: a generator that rolled fresh each time would rearrange the world under
+// standing buildings. Same seed, same world, forever — a new map is a `WORLD_SEED` edit, and a
+// deliberate one.
 
 // The `.ts` extension is load-bearing: this module is imported by `scripts/` under plain Node,
 // which does not resolve extensionless paths. Same reason world.test.ts writes it that way.
 import { GRID_SIZE, MATURE_REACH_RADIUS, START_REACH_RADIUS, withinReach } from './world.ts';
-// node:crypto rather than a dependency — this file is scripts/tests-only (nothing under
-// src/routes imports it), so a stdlib import here never reaches the browser bundle.
-import { createHash } from 'node:crypto';
 
-// Bumped for the 128×128 cut (decision 3): a clean break rather than 7× the old world regenerated
-// under standing buildings. `npm run seed -- --wipe` is the deliberate step that actually clears
-// the ground for it — this constant alone changes nothing for anybody already playing.
 /** Change this and the world changes. Nothing else does. */
 export const WORLD_SEED = 90210;
 
 /**
- * A content fingerprint for this generator: the same seed, the same grid size and the same source
- * text of this file hash to the same sixteen hex characters, forever — never a function of when
- * anything ran. `scripts/seed.ts` is the only caller; it reads this file's own text once (the
- * generator's *code* is the content — a threshold tweak has to roll the version) and hands it in
- * here rather than this module reading itself off disk, so the function stays pure over its three
- * inputs and `npm test` can pin it without touching the filesystem.
+ * How many tiles across one coarse hydrology cell is. The one number trading river detail against
+ * the cost of the eager coarse pass: the coarse grid is (GRID_SIZE / COARSE)^2 cells, and
+ * everything eager in this module is sized by that.
  *
- * Sixteen hex characters of sha256, not the whole digest — this lands in a game_config column and
- * a URL segment, where a collision would need someone to engineer one, not stumble into it.
+ * 6 puts the continent at 1152x1152 = 1,327,104 cells: ~21 MB held for the life of the process and
+ * 1.1 s at import, against 47.8M cells and several gigabytes if the hydrology still ran per tile.
+ * For scale, the old whole-grid generator took 2.4 s to build a world 23x smaller than this one.
+ *
+ * It is 6 rather than something cheaper because of *straightness*, which is the one thing this
+ * number controls that a player can see. The channel is traced node to node, so a river's longest
+ * dead-straight run comes out at about 1.75 x COARSE — measured across twelve fixed inland windows:
+ *
+ *     COARSE   6    8   10   12   16   24
+ *     straight 11  17   18   20   27   42
+ *
+ * At 24 that is 42 tiles — 840 m of arrow-straight water, which reads as a canal somebody dug. 6 is
+ * the setting that comes in under the 16-tile budget worldgen.test.ts already held the old generator
+ * to, rather than one that needs the budget argued down to fit it. It costs 530 ms over COARSE 8 and
+ * also buys a proportionally finer moisture transform, which is the other thing the coarse grid
+ * feeds.
  */
-export function contentVersion(seed: number, gridSize: number, generatorSource: string): string {
-	return createHash('sha256')
-		.update(`${seed}:${gridSize}:${generatorSource}`)
-		.digest('hex')
-		.slice(0, 16);
-}
+export const COARSE = 6;
+const COARSE_SIZE = Math.ceil(GRID_SIZE / COARSE);
 
 /**
- * A hash of the generated terrain grid's *data* — every tile's char — rather than of the source
- * text that produced it (`contentVersion`'s job). The two answer different questions: `contentVersion`
- * keys the CDN/in-process caches ("has anything about the generator changed"), while this is the load-
- * bearing safety check world.server.ts's `loadStaticWorld` runs before it will serve a generated world
- * in place of a database read — "is the world I would generate right now provably the one `tile_stock`,
- * `building` and `settlement` rows already refer to". Hashing the *data* rather than the source text is
- * what makes that a real proof: two generators with identical output but different comments or variable
- * names would pass a data hash and rightly fail nothing, whereas `contentVersion` (correctly) treats
- * that as a new version because it exists to invalidate caches on any change, not to prove equivalence.
+ * Value noise's random lattice, as a hash rather than an array: the pseudo-random value at integer
+ * lattice point (i, j) for a given seed, in [0, 1). Two multiply-xorshift rounds on the mixed
+ * inputs — the same family as the mulberry32 PRNG this replaced, which had to be *walked* in order
+ * and so had to be stored.
  *
- * Row by row into one incremental hash rather than building a `gridSize`-length array of row strings
- * first: at 1448×1448 that's the same 2,096,704-char pass either way, just without holding every row
- * string alive at once for `Array.prototype.join` to concatenate afterward.
+ * Storing it was the problem. `field` used to build an `Array` of `(GRID_SIZE / spacing + 2)^2`
+ * doubles at module import; at the continent, the finest-spaced field alone was hundreds of
+ * megabytes, and every field's contents changed whenever GRID_SIZE did — which is precisely why
+ * every previous grid change came with a retuning pass. A hash has no size, no import cost, and
+ * gives the same answer at (i, j) forever, so the same thresholds describe a 1448-tile world and a
+ * 6912-tile one.
+ *
+ * `Math.imul` throughout, so every intermediate stays a 32-bit integer: the same arithmetic in the
+ * browser and in Node, which is what makes it safe for the client to generate its own terrain and
+ * get the server's answer.
  */
-export function terrainDataHash(
-	gridSize: number,
-	charAt: (x: number, y: number) => string
-): string {
-	const hash = createHash('sha256');
-	for (let y = 0; y < gridSize; y++) {
-		let row = '';
-		for (let x = 0; x < gridSize; x++) row += charAt(x, y);
-		hash.update(row);
-	}
-	return hash.digest('hex').slice(0, 16);
-}
-
-/** mulberry32 — a small, well-behaved PRNG. Seeded, so every field below is reproducible. */
-function mulberry32(seed: number): () => number {
-	let a = seed >>> 0;
-	return () => {
-		a = (a + 0x6d2b79f5) | 0;
-		let t = Math.imul(a ^ (a >>> 15), 1 | a);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
-/**
- * A smooth random field in [0, 1): random values on a lattice every `spacing` tiles, interpolated
- * between with smoothstep. Coarse spacing gives broad shapes (a lake, a range), fine spacing gives
- * texture. Sampled per tile; the whole lattice is built once, at import.
- */
-function field(seed: number, spacing: number): (x: number, y: number) => number {
-	const n = Math.ceil(GRID_SIZE / spacing) + 2;
-	const rng = mulberry32(seed);
-	const lattice = Array.from({ length: n * n }, rng);
-	const smooth = (t: number) => t * t * (3 - 2 * t);
-	return (x, y) => {
-		const gx = x / spacing;
-		const gy = y / spacing;
-		const x0 = Math.floor(gx);
-		const y0 = Math.floor(gy);
-		const fx = smooth(gx - x0);
-		const fy = smooth(gy - y0);
-		const at = (i: number, j: number) => lattice[j * n + i];
-		const top = at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx;
-		const bottom = at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx;
-		return top * (1 - fy) + bottom * fy;
-	};
+function hashNoise(seed: number, i: number, j: number): number {
+	let h = (seed ^ Math.imul(i | 0, 0x27d4eb2d) ^ Math.imul(j | 0, 0x165667b1)) >>> 0;
+	h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+	h = Math.imul(h ^ (h >>> 13), 0x297a2d39);
+	return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const smoothstep = (t: number) => t * t * (3 - 2 * t);
 
 /**
+ * A smooth random field in [0, 1): pseudo-random values on a lattice every `spacing` tiles,
+ * interpolated between with smoothstep. Coarse spacing gives broad shapes (a lake, a range), fine
+ * spacing gives texture. Pure — no lattice is built and nothing is held; see `hashNoise`.
+ */
+function field(seed: number, spacing: number): (x: number, y: number) => number {
+	return (x, y) => {
+		const gx = x / spacing;
+		const gy = y / spacing;
+		const x0 = Math.floor(gx);
+		const y0 = Math.floor(gy);
+		const fx = smoothstep(gx - x0);
+		const fy = smoothstep(gy - y0);
+		const top =
+			hashNoise(seed, x0, y0) * (1 - fx) + hashNoise(seed, x0 + 1, y0) * fx;
+		const bottom =
+			hashNoise(seed, x0, y0 + 1) * (1 - fx) + hashNoise(seed, x0 + 1, y0 + 1) * fx;
+		return top * (1 - fy) + bottom * fy;
+	};
+}
+
+/**
  * Fractal Brownian motion: `octaves` calls to `field`, halving amplitude and halving spacing
  * (doubling frequency) each step, normalised back to roughly [0, 1). The coarse octave decides
- * where the broad shapes are — the sea, the ranges — and each finer one breaks their edges up, the
- * same idea the old two-field generator used but carried further. `seedBase` must not overlap the
- * seed offsets any other field in `generator` reads, or two "independent" layers would turn out to
- * be the same lattice.
+ * where the broad shapes are — the sea, the ranges — and each finer one breaks their edges up.
+ * `seedBase` must not overlap the seed offsets any other field in this file reads, or two
+ * "independent" layers would turn out to be the same lattice.
  */
 function fbm(
 	seedBase: number,
@@ -158,11 +161,11 @@ function fbm(
 
 /**
  * Ridged multifractal: the same octave stack as `fbm`, but each layer is folded around its
- * midpoint first (`1 - |2n - 1|`), so instead of a smooth hill every octave contributes a *ridge*
- * — high wherever that octave's noise crosses 0.5, low either side of it. A ridge is a connected
- * line by construction (it's a contour of the underlying noise), so adding this into elevation
- * before the mountain cut is what turns "high ground" into chains rather than the speckle a plain
- * height threshold gives.
+ * midpoint first (`1 - |2n - 1|`), so instead of a smooth hill every octave contributes a *ridge* —
+ * high wherever that octave's noise crosses 0.5, low either side of it. A ridge is a connected line
+ * by construction (it's a contour of the underlying noise), so adding this into elevation before
+ * the mountain cut is what turns "high ground" into chains rather than the speckle a plain height
+ * threshold gives.
  */
 function ridged(
 	seedBase: number,
@@ -188,26 +191,12 @@ function ridged(
 	};
 }
 
-// Eight-way, for the moisture distance transform below — a soft "how far to the nearest water"
-// estimate, where a diagonal shortcut is a fine approximation because nothing has to *walk* it.
-const NEIGHBORS8: readonly [number, number][] = [
-	[-1, -1],
-	[0, -1],
-	[1, -1],
-	[-1, 0],
-	[1, 0],
-	[-1, 1],
-	[0, 1],
-	[1, 1]
-];
-
-// Four-way, for the hydrology below (priority-flood, D4 flow direction, accumulation). Diagonals
-// were tried here first and rejected: a D8 downhill step can carve a channel that only ever
-// touches its neighbours corner-to-corner, which prints as a connected line but is 682 orphaned
-// puddles under any 4-connected reading — including a player's own pathing, which is orthogonal
-// movement plus diagonal steps between *open* tiles, not a guarantee that a strand of water one
-// corner wide is a channel at all. D4 makes a river orthogonally contiguous by construction, so
-// there is nothing left to accidentally get wrong at classification time.
+// Four-way, for the coarse hydrology below (priority-flood, D4 flow direction, accumulation) and
+// for the sea-connectivity flood. Diagonals were tried here first and rejected: a D8 downhill step
+// can carve a channel that only ever touches its neighbours corner-to-corner, which prints as a
+// connected line but is a string of orphaned puddles under any 4-connected reading — including a
+// player's own pathing. D4 makes a channel orthogonally contiguous by construction, so there is
+// nothing left to accidentally get wrong at classification time.
 const NEIGHBORS4: readonly [number, number][] = [
 	[1, 0],
 	[-1, 0],
@@ -259,41 +248,37 @@ class MinHeap {
 }
 
 /**
- * Priority-flood depression filling, done together with D4 flow-direction assignment — the
- * standard combined form of the algorithm (Barnes, Lehman & Mulla 2014), adapted to four
- * directions rather than the textbook eight: expand outward from the outlets in order of rising
- * elevation, and whichever cell discovers a tile first is, by construction, that tile's downhill
- * neighbour. One pass gives both the filled DEM and the drainage tree.
+ * Priority-flood depression filling, done together with D4 flow-direction assignment — the standard
+ * combined form of the algorithm (Barnes, Lehman & Mulla 2014), adapted to four directions rather
+ * than the textbook eight: expand outward from the outlets in order of rising elevation, and
+ * whichever cell discovers a tile first is, by construction, that cell's downhill neighbour. One
+ * pass gives both the filled DEM and the drainage tree.
  *
- * D4, not D8, and deliberately: D8 was tried first, on the reasoning that `route`'s own eight-way
- * movement made it the "consistent" choice, and it produced a river that measured as one connected
- * component only because corner-touching tiles counted as touching — 682 of the 3,123 water tiles
- * on the seed this was tuned against turned out to be single-tile puddles joined to their
- * neighbours only diagonally, invisible to a 4-connected reading and to a player trying to trace
- * the thing. A channel has to be orthogonally contiguous to be a channel; D4 makes that true by
- * construction instead of hoping the classification step notices when it isn't.
+ * Runs over the **coarse** grid — `width` cells a side, not GRID_SIZE — which is the whole reason
+ * this module no longer has to build the world to answer a question about one tile.
  *
- * `outlets` is deliberately not "every border cell", the textbook seed set — it is only the tiles
- * on the map's one sea edge (see `generator` below). Seeding just that edge is what turns "drains
- * to the map edge" into "drains to the sea": a basin that would otherwise spill off a
- * mountain-side edge is filled instead, because that edge was never offered as an escape. Every
- * reachable cell ends up with a downhill path that lands on the sea, 4-connected the whole way,
- * which is the connectivity `worldgen.test.ts` checks for.
+ * `outlets` is deliberately not "every border cell", the textbook seed set — it is only the cells
+ * on the map's one sea edge. Seeding just that edge is what turns "drains to the map edge" into
+ * "drains to the sea": a basin that would otherwise spill off a mountain-side edge is filled
+ * instead, because that edge was never offered as an escape. Every reachable cell ends up with a
+ * downhill path that lands on the sea, 4-connected the whole way.
  *
- * The `+ EPS` on each fill is what keeps the result strictly downhill even across a lattice cell
- * that would otherwise tie with its neighbour: without it, two tiles filled to the same height
- * would have nowhere to send their flow, and accumulation would stall on the plateau instead of
- * reaching the sea.
+ * The `+ EPS` on each fill is what keeps the result strictly downhill even across a cell that would
+ * otherwise tie with its neighbour: without it, two cells filled to the same height would have
+ * nowhere to send their flow, and accumulation would stall on the plateau instead of reaching the
+ * sea.
  */
 function priorityFlood(
 	elevation: Float64Array,
+	width: number,
 	outlets: number[]
-): { downhill: Int32Array; order: number[] } {
+): { downhill: Int32Array; order: Int32Array } {
 	const n = elevation.length;
 	const filled = new Float64Array(n);
 	const downhill = new Int32Array(n).fill(-1);
 	const visited = new Uint8Array(n);
-	const order: number[] = [];
+	const order = new Int32Array(n);
+	let popped = 0;
 	const heap = new MinHeap();
 	const EPS = 1e-6;
 
@@ -304,14 +289,14 @@ function priorityFlood(
 	}
 	while (heap.size > 0) {
 		const { key, i } = heap.pop();
-		order.push(i);
-		const x = i % GRID_SIZE;
-		const y = (i / GRID_SIZE) | 0;
+		order[popped++] = i;
+		const x = i % width;
+		const y = (i / width) | 0;
 		for (const [dx, dy] of NEIGHBORS4) {
 			const nx = x + dx;
 			const ny = y + dy;
-			if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
-			const j = ny * GRID_SIZE + nx;
+			if (nx < 0 || ny < 0 || nx >= width || ny >= width) continue;
+			const j = ny * width + nx;
 			if (visited[j]) continue;
 			visited[j] = 1;
 			filled[j] = Math.max(elevation[j], key + EPS);
@@ -319,17 +304,20 @@ function priorityFlood(
 			heap.push(filled[j], j);
 		}
 	}
-	return { downhill, order };
+	// Every cell is reachable from the sea edge by construction (the grid is 4-connected and the
+	// whole edge is seeded), so `popped` is `n`; the subarray is belt-and-braces against a future
+	// outlet set that isn't.
+	return { downhill, order: order.subarray(0, popped) };
 }
 
 /**
- * Upstream flow accumulation, given the drainage tree `priorityFlood` produced: how many tiles'
- * worth of flow pass through each cell on their way to an outlet. `order` is outlet-to-summit (the
+ * Upstream flow accumulation, given the drainage tree `priorityFlood` produced: how many cells'
+ * worth of flow pass through each one on their way to an outlet. `order` is outlet-to-summit (the
  * flood's own pop order), so walking it backwards visits every cell after everything that drains
  * into it — one pass is enough to fold each cell's whole upstream catchment into itself and hand
  * the total down to its own downhill neighbour.
  */
-function flowAccumulation(downhill: Int32Array, order: number[]): Float64Array {
+function flowAccumulation(downhill: Int32Array, order: Int32Array): Float64Array {
 	const acc = new Float64Array(downhill.length).fill(1);
 	for (let k = order.length - 1; k >= 0; k--) {
 		const i = order[k];
@@ -339,360 +327,503 @@ function flowAccumulation(downhill: Int32Array, order: number[]): Float64Array {
 	return acc;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The fields. Pure `(x, y) => value` closures over `hashNoise`, built once at import and holding
+// nothing. Seed offsets are each given their own block so that no two "independent" fields ever
+// read the same lattice: 0-9 for the elevation fBm's octaves, 10-19 for the ridge's, 20-21 for the
+// domain warp, 22 for minerals, 23 for moisture, 24 for the coarse hydrology's tie-breaking noise,
+// 25-26 for the river tracing's per-cell jitter.
+// ---------------------------------------------------------------------------------------------
+
+// **Wavelengths are continental, and that is a correction.** These were 40, 34, 24, 4 and 11 tiles
+// — sized when the world was 128 tiles across and carried forward unexamined through every widening
+// since. At 6912 they produce a world with no large-scale structure at all: every octave is smaller
+// than 1/170th of the map, so the continent comes out as one uniform speckle, mountains scattered as
+// isolated flecks rather than ranges, no region distinguishable from any other. Every numeric check
+// passed while that was true — the census is a histogram and a histogram cannot see arrangement.
+// It took rendering the map to an image to notice.
+//
+// So the stack now spans the world: the coarsest octave is a fraction of the continent and each
+// finer one halves it, down to a few tiles. That is what a fractal landscape is supposed to be, and
+// it is why the octave counts went up with the spacings rather than instead of them — starting at
+// 2048 with the old four octaves would have fixed the shape of the continent and left no detail at
+// the scale a player actually stands on.
+const heightField = fbm(WORLD_SEED, 9, 2048);
+const ridgeField = ridged(WORLD_SEED + 10, 8, 1400);
+// The warp displaces the elevation sample, so it has to work at the scale of the thing it is
+// bending: a 24-tile warp against a 2048-tile range does nothing you can see.
+const warpX = field(WORLD_SEED + 20, 700);
+const warpY = field(WORLD_SEED + 21, 700);
+// Deposits read as *fields* rather than as per-tile confetti — one octave at four tiles was
+// literally uncorrelated noise at the scale of a tile, which is the "per-tile dice" failure the
+// forest test exists to catch, applied to minerals where nothing was checking.
+// Moisture and minerals are each **two fields, explicitly weighted**, rather than one fBm stack.
+//
+// fBm alone cannot do what these two need. Its amplitude halves every octave, so a stack based at
+// 900 tiles has its 7-tile octave contributing about one percent of the range — nowhere near enough
+// to cross a threshold. That makes the regional structure clean and the local ground *uniform*:
+// forest and meadow end up in huge separate provinces with no copses in the fields and no glades in
+// the woods. Measured consequence, not an aesthetic quibble — it took the number of legal openings
+// on the map from 100 to zero, because a starting reach is six tiles across and the start rule needs
+// wood and stone inside it, which a landscape with no fine-scale mixing simply never offers.
+//
+// The old generator had the opposite failure: one octave at 11 tiles, pure local scatter, no regions
+// at all. A landscape has both, so this says both. `REGION_WEIGHT` is the dial between them.
+const REGION_WEIGHT = 0.62;
+const mix =
+	(regional: (x: number, y: number) => number, local: (x: number, y: number) => number) =>
+	(x: number, y: number) =>
+		REGION_WEIGHT * regional(x, y) + (1 - REGION_WEIGHT) * local(x, y);
+const minerals = mix(fbm(WORLD_SEED + 22, 4, 160), field(WORLD_SEED + 27, 5));
+const moistureNoise = mix(fbm(WORLD_SEED + 23, 5, 900), field(WORLD_SEED + 28, 9));
+
+// Domain warp: elevation is sampled at (x, y) *displaced* by a second pair of noise fields, rather
+// than at (x, y) itself. A straight fBm call reads as rings around each octave's lattice points —
+// warping the sample point is the standard fix, and it's why this map's ranges bend instead of
+// reading as blobs.
+// **Strength scales with the wavelength it is bending, and forgetting that was a real bug.** The
+// warp's whole job is to stop elevation reading as its own lattice: a straight fBm gives axis-aligned
+// gradients, and drainage laid on axis-aligned gradients comes out as a comb of parallel rivers. When
+// the elevation base went from 40 tiles to 2048 this stayed at 16, which against a 2048-tile feature
+// is no displacement at all — the warp was still in the code and had stopped doing anything. 300 is
+// the same fraction of the new base that 16 was of the old.
+const WARP_STRENGTH = 300;
+
+// The sea sits against the east edge — arbitrary, but it's the edge VISION's own example map names
+// ("the sea is east"). SEA_BAND is how wide the coastal falloff reaches inland; LAND_FLOOR is a
+// hard clamp on elevation *before* that falloff, so no amount of noise can ever put water on one of
+// the other three edges — only the band next to the sea edge can ever read as water, and the
+// coastline within that band is wherever WATER_T happens to cross the noise. SEA_DEPTH is set to
+// `1 - WATER_T` (`fbm`'s output is bounded to [0, 1), so `land` never reaches 1) — not tuned by eye
+// like the rest of this block, but *derived*, so the very edge column is a hard guarantee of water
+// rather than a statistical likelihood. Without that guarantee, a tall enough headland can rise
+// right at x = SEA_EDGE_X and pinch the coastline into two components that both still "touch the
+// sea edge" — the sea would technically still keep to one edge, but stop being one connected sea.
+const SEA_EDGE_X = GRID_SIZE - 1;
+const SEA_BAND = Math.round(GRID_SIZE * 0.18);
+const LAND_FLOOR = 0.42;
+const WATER_T = 0.32;
+const SEA_DEPTH = 1 - WATER_T + 0.02;
+const seaFalloff = (x: number) => smoothstep(clamp((SEA_EDGE_X - x) / SEA_BAND, 0, 1));
+
+// A strip that runs the map's whole height necessarily reaches the northeast and southeast corners,
+// which sit on the north/south edges too — without this, "one edge" quietly becomes two wherever
+// the coast meets a corner. Tapering the depression out near y = 0 and y = GRID_SIZE - 1 curls the
+// coastline back from both corners instead, the same hard-clamp approach LAND_FLOOR uses rather
+// than hoping the noise never reaches that far.
+const CORNER_MARGIN = 10;
+const cornerTaper = (y: number) =>
+	smoothstep(clamp(Math.min(y, GRID_SIZE - 1 - y) / CORNER_MARGIN, 0, 1));
+
+// The other three edges are rim, not coast — high ground the way VISION's own example map describes
+// ("the range walls off the north"), and *load-bearing* high ground: without it, flow accumulation
+// occasionally routes a real river along the very edge of the grid, and every Water tile has to
+// reach the sea. Raising the rim keeps both promises with one mechanism instead of a second special
+// case at classification time — a river simply has nowhere low enough to run along the border.
+const EDGE_MARGIN = 8;
+const EDGE_LIFT = 0.3;
+const edgeLift = (x: number, y: number) => {
+	const distToRim = Math.min(x, y, GRID_SIZE - 1 - y);
+	return EDGE_LIFT * (1 - smoothstep(clamp(distToRim / EDGE_MARGIN, 0, 1)));
+};
+
+// The ridge only piles onto land that already reads as high ground — gated smoothly between
+// RIDGE_GATE_LOW and RIDGE_GATE_HIGH — rather than scaling every tile by however "tall" it is. A
+// flat `* land` multiplier (the first thing tried here) lifts the *whole* map a little, since most
+// of the grid is mid-elevation, not just the would-be peaks; gating on a narrow high band is what
+// keeps the ridge a mountain-range effect instead of a global elevation bump.
+const RIDGE_WEIGHT = 0.6;
+const RIDGE_GATE_LOW = 0.78;
+const RIDGE_GATE_HIGH = 0.92;
+const ridgeGate = (land: number) =>
+	smoothstep(clamp((land - RIDGE_GATE_LOW) / (RIDGE_GATE_HIGH - RIDGE_GATE_LOW), 0, 1));
+
 /**
- * Generated ground, for one seed. Builds the whole grid eagerly rather than sampling lazily per
- * tile, because the hydrology stage (priority-flood, D4, flow accumulation) is a whole-grid
- * algorithm by nature — there's no such thing as "the river at just this one tile" without knowing
- * its neighbours. Everything else in the pipeline could stay a pure `(x, y) => value` closure like
- * the old generator; this one can't, so nothing here does, for consistency.
- *
- * The stages, in the order the plan names them:
- *  1. **Elevation** — domain-warped fBm (`fbm`), so ranges meander instead of reading as the
- *     circular lattice a single `field()` call gives.
- *  2. **Sea** — elevation multiplied down toward one chosen edge (`SEA_EDGE_X`). `LAND_FLOOR` is a
- *     hard clamp on elevation *before* that falloff, so no amount of noise can ever put water on
- *     one of the other three edges — only the band next to the sea edge can ever read as water,
- *     and the coastline within that band is wherever `WATER_T` happens to cross the noise.
- *  3. **Mountain ranges** — a ridged multifractal (`ridged`) added on top, scaled by how "high" the
- *     ground already reads so it piles onto real high ground rather than punching false peaks out
- *     of the lowlands or the sea.
- *  4. **Hills** — one more elevation cut, between the habitable band and the mountain band.
- *  5. **Rivers** — `priorityFlood` + `flowAccumulation`, seeded only from the sea edge, so every
- *     drop of water on the map is guaranteed a monotonically downhill path to the sea. A tile whose
- *     accumulation clears `RIVER_T` is Water regardless of what its elevation alone would have said
- *     — the same rule a real valley follows.
- *  6. **Moisture** — a noise field, lifted near whichever water stages 2 and 5 actually produced
- *     (a breadth-first distance transform from every Water tile), so forest reads as a region
- *     rather than a coin flip per tile.
- *  7. **Deposits** — the same mineral field as before, still banded by elevation within the
- *     habitable band.
+ * The ground's height at one tile, before any water is decided — the one function every other stage
+ * reads, and the whole of what used to be an eagerly-filled `Float64Array` the size of the world.
+ * Pure, local, and independent of GRID_SIZE except through the three deliberate edge terms above.
  */
-function generator(seed: number): (x: number, y: number) => string {
-	const n = GRID_SIZE * GRID_SIZE;
-	const idx = (x: number, y: number) => y * GRID_SIZE + x;
-
-	// Seed offsets below are each given their own block so that no two "independent" fields ever
-	// read the same lattice: 0–9 for the elevation fBm's octaves, 10–19 for the ridge's, 20–21 for
-	// the domain warp, 22 for minerals, 23 for moisture, 24 for the hydrology nudge.
-	const heightField = fbm(seed, 4, 40);
-	const ridgeField = ridged(seed + 10, 4, 34);
-	const warpX = field(seed + 20, 24);
-	const warpY = field(seed + 21, 24);
-	const minerals = field(seed + 22, 4);
-	const moistureNoise = field(seed + 23, 11);
-
-	// Domain warp: elevation is sampled at (x, y) *displaced* by a second pair of noise fields,
-	// rather than at (x, y) itself. A straight fBm call reads as rings around each octave's lattice
-	// points — warping the sample point is the standard fix, and it's why this map's ranges bend
-	// instead of reading as the old generator's blobs. Clamped back onto the grid: a warp is a
-	// lookup into `field`'s own lattice, and that lattice doesn't extend past the edges.
-	const WARP_STRENGTH = 16;
-	const warpedAt = (x: number, y: number) => ({
-		wx: clamp(x + (warpX(x, y) - 0.5) * 2 * WARP_STRENGTH, 0, GRID_SIZE - 1),
-		wy: clamp(y + (warpY(x, y) - 0.5) * 2 * WARP_STRENGTH, 0, GRID_SIZE - 1)
-	});
-
-	// The sea sits against the east edge — arbitrary, but it's the edge VISION's own example map
-	// names ("the sea is east"). SEA_BAND is how wide the coastal falloff reaches inland; LAND_FLOOR
-	// is the hard floor described above. SEA_DEPTH is set to `1 - WATER_T` (`fbm`'s output is
-	// mathematically bounded to [0, 1), so `land` never reaches 1) — not tuned by eye like the rest
-	// of this block, but *derived*, so the very edge column is a hard guarantee of water rather
-	// than a statistical likelihood. Without that guarantee, a tall enough headland can rise right
-	// at x = SEA_EDGE_X and pinch the coastline into two components that both still "touch the sea
-	// edge" — the sea would technically still keep to one edge, but stop being one connected sea.
-	const SEA_EDGE_X = GRID_SIZE - 1;
-	const SEA_BAND = Math.round(GRID_SIZE * 0.18);
-	const LAND_FLOOR = 0.42;
-	const WATER_T = 0.32;
-	const SEA_DEPTH = 1 - WATER_T + 0.02;
-	const seaFalloff = (x: number) => smoothstep(clamp((SEA_EDGE_X - x) / SEA_BAND, 0, 1));
-	// A strip that runs the map's whole height necessarily reaches the northeast and southeast
-	// corners, which sit on the north/south edges too — without this, "one edge" quietly becomes
-	// two wherever the coast meets a corner. Tapering the depression out near y = 0 and
-	// y = GRID_SIZE - 1 curls the coastline back from both corners instead, the same hard-clamp
-	// approach LAND_FLOOR uses rather than hoping the noise never reaches that far.
-	const CORNER_MARGIN = 10;
-	const cornerTaper = (y: number) =>
-		smoothstep(clamp(Math.min(y, GRID_SIZE - 1 - y) / CORNER_MARGIN, 0, 1));
-
-	// The other three edges are rim, not coast — high ground the way VISION's own example map
-	// describes ("the range walls off the north"), and *load-bearing* high ground: without it,
-	// flow accumulation occasionally routes a real river along the very edge of the grid, and the
-	// river tests below need every Water tile to reach the sea, not just the tiles that aren't
-	// sitting on a border the sea rule already had to keep dry. Raising the rim is what keeps both
-	// promises with one mechanism instead of a second special case at classification time — a
-	// river simply has nowhere low enough to run along the border in the first place.
-	const EDGE_MARGIN = 8;
-	const EDGE_LIFT = 0.3;
-	const edgeLift = (x: number, y: number) => {
-		const distToRim = Math.min(x, y, GRID_SIZE - 1 - y);
-		return EDGE_LIFT * (1 - smoothstep(clamp(distToRim / EDGE_MARGIN, 0, 1)));
-	};
-
-	// Thresholds. Picked by eye against `npm run map` (see the comment on each): water below
-	// WATER_T (declared above, next to the SEA_DEPTH that's derived from it), then habitable, then
-	// Hills, then Mountain at the top — the same "cut a height field into bands" idea the old
-	// generator used, just against a richer field. Both sit high enough that the habitable band —
-	// meadow, forest, and the deposits banded within it — stays the majority of the map, the way the
-	// pre-ridge generator's did: most of `elevation`'s mass is mid-band, and the ridge's long tail is
-	// what actually reaches these.
+function elevationAt(x: number, y: number): number {
+	// The warp is clamped back onto the grid: the lattice `field` interpolates over is unbounded
+	// now, but keeping the sample point on-map means the sea falloff and the rim lift still describe
+	// the same coastline the classification below reads.
+	const wx = clamp(x + (warpX(x, y) - 0.5) * 2 * WARP_STRENGTH, 0, GRID_SIZE - 1);
+	const wy = clamp(y + (warpY(x, y) - 0.5) * 2 * WARP_STRENGTH, 0, GRID_SIZE - 1);
+	// **Rescaled onto the floor, never clamped against it.** The floor's job is to guarantee that no
+	// amount of noise can put water on the three non-sea edges. `Math.max(raw, LAND_FLOOR)` does that
+	// by flattening every low tile onto exactly one height, which hands `priorityFlood` a perfectly
+	// level western plain — and on level ground the flood has nothing to prefer, so it lays down
+	// evenly-spaced parallel drainage lanes. Rendered, that is a comb of a dozen dead-straight rivers
+	// side by side across a sixth of the continent. Softening the clamp to a compression (tried second)
+	// does not fix it either: compressed-flat is still flat enough.
 	//
-	// **These are tuned per grid size and do not carry over.** The noise lattices are sized in
-	// *tiles* (`fbm(seed, 4, 40)`), so changing GRID_SIZE does not scale the world — it builds a
-	// lattice with a different number of points, draws different random values into it, and hands
-	// back a genuinely different field whose elevation histogram sits somewhere else. Going 128→256
-	// with the old cuts (0.9 / 1.02) took mountain from 9% of the map to 2% and stone from 1% to
-	// 0.4%: the same seed, a flatter, blander world, and every automated bound still green because
-	// they were all upper bounds. The lower bounds in worldgen.test.ts exist so the next size change
-	// fails loudly instead of quietly flattening the map. Re-tune against `npm run map`'s census.
-	//
-	// Retuned again for 256→1024 (VISION's city-scale epic): 0.7/0.8 unchanged already landed close
-	// (mountain 8.3%, hills 5.0%, stone 1.2% — every floor still comfortably cleared), but a touch
-	// low against the 256×256 census this is meant to still read like (mountain ~9%, hills ~6%). Cut
-	// down to 0.68/0.79 to land mountain at 9% and hills at 6% almost exactly; census below.
-	//
-	// Retuned again for 1024→1448 (the domain-scale epic, MATURE_REACH_RADIUS 95→138): 0.68/0.79
-	// carried over unchanged read close but a touch flat again (mountain 7.5%, hills 5.4%) — the same
-	// story as every previous grid change, just smaller this time since 1024→1448 is a 1.4× linear
-	// move rather than 2× or 4×. Cut down to 0.65/0.755 to land mountain at 8.9% and hills at 6.4%,
-	// close to the 256×256/1024×1024 census this is meant to keep reading like.
-	const HILLS_T = 0.65;
-	const MOUNTAIN_T = 0.755;
-	// A tile over this many upstream tiles' worth of flow is a river. There's no natural absolute
-	// scale for accumulation — it depends on how the drainage tree happens to branch — so this is
-	// tuned against the printed map rather than derived, and tuned high: at 40 (this constant's
-	// first value) almost a quarter of the map read as water, most of it a diffuse wet texture
-	// rather than anything you'd call a river. 1800 (the value tuned at 128×128) leaves a handful
-	// of trunk rivers with visible tributaries — inland water (the sea's own coastal band excluded)
-	// lands around 1% of the map, not the ~10% a low threshold gives.
-	//
-	// Retuned to 4500 for the move to 256×256 (decision 4's shared-world reversal): the same
-	// spacing-based noise fields produce roughly the same *size* of individual terrain feature at
-	// any GRID_SIZE (`field`'s wavelength is in absolute tiles, not a fraction of the grid), but a
-	// bigger canvas gives real drainage basins more room to actually grow before they hit the
-	// map's edge or another basin — 1800 carried over unchanged left the 90th-percentile river
-	// width at 3 tiles (worldgen.test.ts's own budget is 2).
-	//
-	// Retuned again to 60,000 for 1024×1024 — the jump is much steeper than 128→256's (2.5×) because
-	// this is a 4× *linear* / 16× *area* change rather than 2×/4×, and drainage basin size scales with
-	// the catchment area a basin can actually draw from, not with the map's edge length. 4,500 carried
-	// over unchanged reproduced the exact 128→256 failure (90th-percentile width 3, a 25-tile straight
-	// run) for the same reason: far more upstream tiles now feed the same channel before it reaches
-	// the sea. Re-tune by eye against `npm run map` again the next time GRID_SIZE moves.
-	//
-	// Retuned again to 400,000 for 1024→1448 (only a 1.4× linear / 2× area move, the smallest grid
-	// change yet, but 60,000 carried over unchanged still failed both river tests — width and
-	// straightness both got *worse*, not better, at the old threshold, because a wider catchment
-	// feeds more accumulation into the same channel before it reaches the cut). Landed jointly with
-	// `hydroNoise`'s own amplitude below rather than alone: at 60,000–320,000 with amplitude in
-	// [0.5, 3], either the width test or the straightness test failed depending on which specific
-	// channel the noise happened to route the flow through — the two constants trade off against each
-	// other on this seed, not just against grid size, so this pair is the first spot in the sweep that
-	// cleared both (90th-percentile width 2, longest straight run 13).
-	const RIVER_T = 400000;
+	// A linear remap of the field's whole [0, 1) range onto [LAND_FLOOR, 1) has no degenerate region at
+	// all — every tile keeps a distinct height and a real gradient — while holding the floor guarantee
+	// exactly. It shifts the entire elevation distribution upward, which is why the band thresholds
+	// below are read off a fresh measurement rather than carried over.
+	const land = LAND_FLOOR + (1 - LAND_FLOOR) * heightField(wx, wy);
+	const drowned = land - SEA_DEPTH * (1 - seaFalloff(x)) * cornerTaper(y);
+	return drowned + RIDGE_WEIGHT * ridgeField(wx, wy) * ridgeGate(land) + edgeLift(x, y);
+}
 
-	// The ridge only piles onto land that already reads as high ground — gated smoothly between
-	// RIDGE_GATE_LOW and RIDGE_GATE_HIGH — rather than scaling every tile by however "tall" it is.
-	// A flat `* land` multiplier (the first thing tried here) lifts the *whole* map a little, since
-	// most of the grid is mid-elevation, not just the would-be peaks; gating on a narrow high band
-	// is what keeps the ridge a mountain-range effect instead of a global elevation bump.
-	const RIDGE_WEIGHT = 0.6;
-	const RIDGE_GATE_LOW = 0.62;
-	const RIDGE_GATE_HIGH = 0.82;
-	const ridgeGate = (land: number) =>
-		smoothstep(clamp((land - RIDGE_GATE_LOW) / (RIDGE_GATE_HIGH - RIDGE_GATE_LOW), 0, 1));
+// ---------------------------------------------------------------------------------------------
+// The coarse grid: the three facts about a tile that genuinely cannot be decided by looking at it.
+// ---------------------------------------------------------------------------------------------
 
+// A coarse cell's own point in *tile* coordinates — its centre, jittered within the cell. The
+// jitter is what the traced river channel bends around: with every node on an exact cell centre a
+// river's course corrections would land on a perfect COARSE-tile lattice and read as a canal, which
+// is the same "straight reads as dug, not as landscape" failure the old per-tile hydrology noise
+// existed to fix, just at a different scale. 0.34 keeps a node comfortably inside its own cell, so
+// two adjacent nodes never cross over each other and the traced path between them stays monotone.
+const NODE_JITTER = 0.15;
+
+/**
+ * A fixed zigzag baked into the node lattice, on top of the random jitter: every odd row of coarse
+ * cells has its nodes pushed `NODE_PARITY` of a cell east, every even row the same distance west
+ * (and correspondingly for columns and `nodeY`).
+ *
+ * **This is what bounds a river's straight runs, and it has to be deterministic.** The channel from
+ * a cell to its downhill neighbour is drawn as an L — a horizontal leg then a vertical one — so two
+ * vertically-chained cells produce two vertical legs that merge into a single line whenever their
+ * node x's happen to coincide. Random jitter alone only makes that *unlikely*: `Math.round` collapses
+ * a few tiles of jitter onto a handful of integers, so a chain of k cells lines up with probability
+ * around 7^-(k-1), and over three quarters of a million coarse cells the long tail of that is a
+ * certainty, not a risk. Measured, before this: a 100-tile dead-straight run at one spacing and a
+ * 27-tile one at another, with the difference between them being luck rather than design.
+ *
+ * The parity offset removes the coincidence instead of betting against it. `NODE_PARITY` is bigger
+ * than `NODE_JITTER`, so two vertically-adjacent nodes differ in x by at least
+ * `2 * (NODE_PARITY - NODE_JITTER) * COARSE` — never zero, whatever the noise does — and the L's
+ * horizontal leg therefore always breaks the vertical chain. A straight run is bounded by one cell's
+ * own leg, by construction, rather than by how the dice fell.
+ */
+const NODE_PARITY = 0.25;
+// Spacing 1 — no interpolation, so every cell's offset is independent of its neighbours'. At
+// spacing 3 (tried first) the jitter varies smoothly across three cells, which correlates exactly
+// the neighbours this is trying to decorrelate.
+const jitterX = field(WORLD_SEED + 25, 1);
+const jitterY = field(WORLD_SEED + 26, 1);
+const nodeX = (cx: number, cy: number) =>
+	Math.round(
+		cx * COARSE +
+			COARSE / 2 +
+			(jitterX(cx, cy) - 0.5) * 2 * NODE_JITTER * COARSE +
+			(cy & 1 ? NODE_PARITY : -NODE_PARITY) * COARSE
+	);
+const nodeY = (cx: number, cy: number) =>
+	Math.round(
+		cy * COARSE +
+			COARSE / 2 +
+			(jitterY(cx, cy) - 0.5) * 2 * NODE_JITTER * COARSE +
+			(cx & 1 ? NODE_PARITY : -NODE_PARITY) * COARSE
+	);
+
+// A cell over this many upstream cells' worth of flow carries a river. There is no natural absolute
+// scale for accumulation — it depends on how the drainage tree happens to branch — so this is tuned
+// against `npm run map` rather than derived.
+//
+// **It no longer moves with GRID_SIZE**, which is new and is the point of the coarse grid. The old
+// per-tile threshold had to be re-derived on every single grid change (1,800 -> 4,500 -> 60,000 ->
+// 400,000 across four world sizes) because accumulation counts *upstream cells*, and quadrupling
+// the tile count quadruples every catchment. Accumulation is counted in coarse cells now, and a
+// coarse cell is a fixed area of ground, so a given threshold means the same size of catchment at
+// any world size. What it selects for is a channel draining at least this many COARSE x COARSE
+// blocks — at COARSE 6, one block is 120 m square, and 2,702 of them is ~39 km2 of catchment, which
+// is a river rather than a ditch.
+//
+// It *does* move with COARSE, and quadratically: halving COARSE quarters a cell's area, so the same
+// physical catchment counts four times as many cells. Keep the product RIVER_T x COARSE^2 fixed and
+// the rivers stay the same rivers.
+const RIVER_T = 2702;
+
+/**
+ * Chaotic, per-cell-independent noise added to the coarse elevation for the hydrology *only* —
+ * never for terrain classification, which stays on unperturbed `elevationAt` throughout, so nothing
+ * here can relabel a tile's terrain band.
+ *
+ * It exists because `priorityFlood` visits cells in order of rising elevation and hands each one a
+ * parent from whichever neighbour was visited first: on flat ground fed from one straight edge of
+ * outlets, that degenerates to "shortest path to the coast", which is a straight line. A *smooth*
+ * perturbation only wiggles around that line; genuinely per-cell-independent noise (spacing 1, no
+ * interpolation left to smooth it) is what breaks the degeneracy, because the cheapest unvisited
+ * neighbour keeps changing hand to hand instead of settling into one direction.
+ *
+ * Its amplitude and RIVER_T used to be coupled and had to be swept jointly on every grid change,
+ * because they traded channel width against straightness. That trade is gone: width is now fixed at
+ * one tile by `riverAt`, so this only has to do the one job it was for.
+ */
+const hydroNoise = field(WORLD_SEED + 24, 1);
+const HYDRO_NOISE_AMPLITUDE = 0.035;
+
+type Coarse = {
+	downhill: Int32Array;
+	acc: Float64Array;
+	/** 1 where this cell's own node point reads as water *and* that water reaches the open sea. */
+	sea: Uint8Array;
+	/** Coarse cells from this cell to the nearest one carrying river or sea; -1 if unreachable. */
+	distToWater: Int32Array;
+};
+
+/**
+ * The eager pass — the only one in this file, and the only thing here whose cost scales with the
+ * world. Everything above is a pure closure; everything below reads this.
+ */
+function buildCoarse(): Coarse {
+	const n = COARSE_SIZE * COARSE_SIZE;
 	const elevation = new Float64Array(n);
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			const { wx, wy } = warpedAt(x, y);
-			const land = Math.max(heightField(wx, wy), LAND_FLOOR);
-			const drowned = land - SEA_DEPTH * (1 - seaFalloff(x)) * cornerTaper(y);
-			elevation[idx(x, y)] =
-				drowned + RIDGE_WEIGHT * ridgeField(wx, wy) * ridgeGate(land) + edgeLift(x, y);
+	for (let cy = 0; cy < COARSE_SIZE; cy++)
+		for (let cx = 0; cx < COARSE_SIZE; cx++) {
+			const i = cy * COARSE_SIZE + cx;
+			// Sampled at the cell's own jittered node, not its geometric centre, so the height the
+			// hydrology reasons about is the height at the point the channel is actually traced
+			// through — otherwise a river can be routed downhill through ground that is uphill at the
+			// tile the channel lands on.
+			elevation[i] =
+				elevationAt(nodeX(cx, cy), nodeY(cx, cy)) +
+				HYDRO_NOISE_AMPLITUDE * (hydroNoise(cx, cy) - 0.5);
 		}
 
-	// A rescale onto [LAND_FLOOR, 1) was tried in place of the clamp above and rejected: it kept
-	// every low tile's relative height, but it also shifted the *whole* distribution — the mid and
-	// high bands moved too, which meant retuning every threshold below to get the census back in
-	// bounds. The clamp is cheaper to keep and the actual fault is narrower than "the floor exists"
-	// — it's that `priorityFlood` gets fed a perfectly flat plateau wherever a whole *stretch* of
-	// ground clamps to the same 0.42, and flow accumulation has no real gradient to converge along
-	// there. `hydroElevation` is a copy of elevation with a noise field added on *only* for the
-	// hydrology to read — never for terrain classification, which stays on unperturbed `elevation`
-	// throughout, so nothing here can relabel a tile's terrain band and the noise is free to be as
-	// strong as the actual fault needs, not capped by some other threshold's headroom.
-	//
-	// What that fault needed turned out to be surprising. `EPS` alone breaks ties by discovery
-	// order, not by anything resembling terrain, so a dozen parallel branches of the drainage tree
-	// could each claim a lane across a flat stretch and none of them merge — a 30-tile-*wide*
-	// "river". A smooth, low-amplitude noise field (`field(seed, 5)`, amplitude 0.09) fixed that
-	// width problem, but left the surviving single channel running dead straight for up to 38 tiles
-	// at a stretch — smooth noise, even sampled through its own short-wavelength domain warp,
-	// didn't move that number, because `priorityFlood` visits cells in order of rising elevation and
-	// hands each one a parent from whichever neighbour was visited first: on a truly flat surface
-	// fed from one straight edge of outlets, that degenerates to "shortest path to the coast",
-	// which is a straight line, and a *smooth* perturbation only wiggles around that line rather
-	// than giving the flood a reason to prefer a different neighbour every few tiles. Only genuinely
-	// chaotic, per-tile-independent noise — `field(seed, 1)`, spacing 1, no interpolation left to
-	// smooth it — breaks that degeneracy: every tile is its own local pit or bump, so the "nearest"
-	// unvisited neighbour keeps changing hand to hand instead of settling into one direction. 0.5 is
-	// picked the same way as the rest of this pipeline: high enough that the longest straight run in
-	// `npm run map` drops from 38 tiles to single digits, without pushing width back out (there's a
-	// real trade — more noise breaks up straight runs but roughens the channel edge, so this is the
-	// smallest amplitude that gets both).
-	//
-	// Retuned to 1.1 for 1024→1448, alongside RIVER_T above (see its own comment): 0.5 carried over
-	// unchanged left a 30-tile straight run, and the amplitude/threshold pair turned out to be coupled
-	// on this seed rather than independent — a swept grid of both (0.5–3 amplitude × 60,000–500,000
-	// threshold) mostly traded one test's failure for the other's, because each combination routes the
-	// flow tree through a different specific channel on a map this size. 1.1/400,000 is the first pair
-	// in that sweep that cleared both invariants; re-sweep jointly, not each alone, the next time
-	// GRID_SIZE moves.
-	const hydroNoise = field(seed + 24, 1);
-	const hydroElevation = new Float64Array(n);
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			const i = idx(x, y);
-			hydroElevation[i] = elevation[i] + 1.1 * (hydroNoise(x, y) - 0.5);
-		}
-
-	// Rivers drain only to the sea edge — see the doc comment on `priorityFlood` for why seeding
-	// just that column, rather than the whole border, is what guarantees every river reaches it.
 	const outlets: number[] = [];
-	for (let y = 0; y < GRID_SIZE; y++) outlets.push(idx(SEA_EDGE_X, y));
-	const { downhill, order } = priorityFlood(hydroElevation, outlets);
+	for (let cy = 0; cy < COARSE_SIZE; cy++) outlets.push(cy * COARSE_SIZE + (COARSE_SIZE - 1));
+	const { downhill, order } = priorityFlood(elevation, COARSE_SIZE, outlets);
 	const acc = flowAccumulation(downhill, order);
 
-	// Water: either the sea's own elevation cut, or a river's flow accumulation. Nothing here needs
-	// to special-case the three non-sea edges — `edgeLift` already keeps them high enough that a
-	// drainage channel has nowhere to run along them, so a plain accumulation cut is all this is.
-	// (A per-tile "not on this edge" filter was tried here first and rejected: flow accumulation is
-	// monotonic downhill, so silencing one cell on a real channel silences it only there, splitting
-	// the visible river into two components instead of keeping it off the border to begin with.)
-	const isWater = new Uint8Array(n);
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			const i = idx(x, y);
-			isWater[i] = elevation[i] < WATER_T || acc[i] > RIVER_T ? 1 : 0;
-		}
-
-	// A tile can read as Water purely from the sea-band elevation cut without ever being downhill of
-	// the sea or of a river. A river tile can't do this — priorityFlood's own doc comment is that
-	// accumulation is monotonic along a D4 chain rooted at `outlets`, so a river tile's whole path to
-	// the sea is water too — but the raw `elevation[i] < WATER_T` cut has no such guarantee: it's a
-	// per-tile threshold with no notion of what's between here and open water. `SEA_BAND` scales with
-	// GRID_SIZE (`* 0.18`) so the coastal shelf stays a constant *fraction* of the map, but the noise
-	// driving `elevation` does not — its wavelength is fixed in absolute tiles (`fbm(seed, 4, 40)`) —
-	// so a wide enough band gives that noise several full wavelengths of room to fold the shelf in on
-	// itself and seal off a lagoon that never actually reaches open water. Invisible at 256×256, where
-	// the band (46 tiles) was narrower than the noise's own wavelength; real at 1024×1024, where the
-	// band (184 tiles) is four-plus wavelengths wide.
-	//
-	// Pruned the same way the hydrology above already reasons about reachability, rather than by
-	// shrinking `SEA_BAND` (tried first — it also shrinks total water share, which is the fraction
-	// this constant's whole job is to hold steady): flood outward from the same sea outlets,
-	// 4-connected, and dry out any Water tile never reached. A pocket nothing can walk to from the sea
-	// was never really *part of* the sea — this is worldgen.test.ts's own "one connected sea" and
-	// "every Water tile connects to the sea" invariants, enforced here at generation time instead of
-	// left as a coin flip a wide coastal band can lose. A dried tile falls through to the ordinary
-	// terrain classification below on its own (real, undepressed-for-classification) elevation, same
-	// as any other tile — a sealed-off basin reads as low, damp ground, not a special case.
-	const reachedSea = new Uint8Array(n);
+	// Which low ground actually reaches the open sea. A cell whose node reads as below the water
+	// threshold is a candidate; flooding 4-connected from the sea edge is what separates real
+	// coastline from a lagoon the coastal band happened to seal off inland. The old generator did
+	// this per tile over the whole grid, for the same reason and with the same argument — a pocket
+	// nothing can swim to from the sea was never part of the sea.
+	const sea = new Uint8Array(n);
 	{
-		const stack = outlets.filter((i) => isWater[i]);
-		for (const i of stack) reachedSea[i] = 1;
+		const low = (i: number) =>
+			elevationAt(nodeX(i % COARSE_SIZE, (i / COARSE_SIZE) | 0), nodeY(i % COARSE_SIZE, (i / COARSE_SIZE) | 0)) <
+			WATER_T;
+		const stack = outlets.filter(low);
+		for (const i of stack) sea[i] = 1;
 		while (stack.length) {
 			const i = stack.pop()!;
-			const x = i % GRID_SIZE;
-			const y = (i / GRID_SIZE) | 0;
+			const x = i % COARSE_SIZE;
+			const y = (i / COARSE_SIZE) | 0;
 			for (const [dx, dy] of NEIGHBORS4) {
 				const nx = x + dx;
 				const ny = y + dy;
-				if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
-				const j = ny * GRID_SIZE + nx;
-				if (!isWater[j] || reachedSea[j]) continue;
-				reachedSea[j] = 1;
+				if (nx < 0 || ny < 0 || nx >= COARSE_SIZE || ny >= COARSE_SIZE) continue;
+				const j = ny * COARSE_SIZE + nx;
+				if (sea[j] || !low(j)) continue;
+				sea[j] = 1;
 				stack.push(j);
 			}
 		}
 	}
-	for (let i = 0; i < n; i++) if (isWater[i] && !reachedSea[i]) isWater[i] = 0;
 
-	// Moisture's water-proximity term: a breadth-first distance transform from every Water tile.
-	// Eight-connected on purpose, unlike the hydrology above — this is a soft "how close is damp
-	// ground" estimate, not a claim about a channel you could walk, so a diagonal shortcut is a
-	// fine approximation rather than a bug. Multi-source, so it costs one pass over the grid
-	// regardless of how many rivers or how much coastline there is.
+	// Moisture's water-proximity term, in coarse cells: a multi-source breadth-first distance
+	// transform from every cell carrying sea or river. The old generator ran this per tile over the
+	// whole grid; at coarse resolution one cell is COARSE tiles, which is the same order as the
+	// six-tile reach the boost had anyway, and it costs one pass over a grid 256 times smaller.
 	const distToWater = new Int32Array(n).fill(-1);
-	const queue: number[] = [];
-	for (let i = 0; i < n; i++)
-		if (isWater[i]) {
-			distToWater[i] = 0;
-			queue.push(i);
-		}
-	for (let head = 0; head < queue.length; head++) {
-		const i = queue[head];
-		const x = i % GRID_SIZE;
-		const y = (i / GRID_SIZE) | 0;
-		for (const [dx, dy] of NEIGHBORS8) {
-			const nx = x + dx;
-			const ny = y + dy;
-			if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
-			const j = ny * GRID_SIZE + nx;
-			if (distToWater[j] !== -1) continue;
-			distToWater[j] = distToWater[i] + 1;
-			queue.push(j);
+	{
+		const queue: number[] = [];
+		for (let i = 0; i < n; i++)
+			if (sea[i] || acc[i] > RIVER_T) {
+				distToWater[i] = 0;
+				queue.push(i);
+			}
+		for (let head = 0; head < queue.length; head++) {
+			const i = queue[head];
+			const x = i % COARSE_SIZE;
+			const y = (i / COARSE_SIZE) | 0;
+			for (const [dx, dy] of NEIGHBORS4) {
+				const nx = x + dx;
+				const ny = y + dy;
+				if (nx < 0 || ny < 0 || nx >= COARSE_SIZE || ny >= COARSE_SIZE) continue;
+				const j = ny * COARSE_SIZE + nx;
+				if (distToWater[j] !== -1) continue;
+				distToWater[j] = distToWater[i] + 1;
+				queue.push(j);
+			}
 		}
 	}
-	// How far the boost reaches, and how much it can add to the raw moisture noise at zero
-	// distance. Six tiles is a short walk from a riverbank, not a whole valley — enough to thicken
-	// a forest along the water without painting the entire habitable band as woodland.
-	const MOISTURE_RANGE = 6;
-	const MOISTURE_BOOST = 0.35;
-	const FOREST_T = 0.55;
 
-	// Deposit banding within the habitable band, same idea as the old generator: clay nearest the
-	// water, iron highest, just under the Hills line.
-	const habitable = HILLS_T - WATER_T;
-	const midBand = WATER_T + habitable * 0.55;
-	const highBand = WATER_T + habitable * 0.8;
+	return { downhill, acc, sea, distToWater };
+}
 
-	const chars = new Array<string>(n);
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			const i = idx(x, y);
-			if (isWater[i]) {
-				chars[i] = 'w';
-				continue;
-			}
-			const e = elevation[i];
-			if (e > MOUNTAIN_T) {
-				chars[i] = 'm';
-				continue;
-			}
-			if (e > HILLS_T) {
-				chars[i] = 'h';
-				continue;
-			}
-			if (minerals(x, y) > 0.84) {
-				chars[i] = e > highBand ? 'i' : e > midBand ? 's' : 'c';
-				continue;
-			}
-			const dist = distToWater[i];
-			const boost = dist >= 0 ? MOISTURE_BOOST * Math.max(0, 1 - dist / MOISTURE_RANGE) : 0;
-			chars[i] = moistureNoise(x, y) + boost > FOREST_T ? 'f' : '.';
+const coarse = buildCoarse();
+
+/**
+ * Is this tile part of a river channel?
+ *
+ * **One tile wide, by construction rather than by tuning** — the single biggest simplification the
+ * coarse grid buys. The old generator decided this per tile with an accumulation threshold, and
+ * channel width was an emergent property of how the flood's tie-breaking spread across flat ground:
+ * it produced 30-tile-wide "rivers" on plateaus, needed a chaotic noise field to fix, and then
+ * needed that field's amplitude swept jointly against the threshold on every grid change because
+ * the two traded width against straightness. Here the channel is *drawn*: from each river cell's
+ * node point to its downhill neighbour's node point, as an L — horizontal leg then vertical leg.
+ *
+ * Three properties fall out of that with nothing to tune:
+ *  - **Width is exactly one tile**, everywhere, always.
+ *  - **The channel is 4-connected end to end.** The two legs share a corner, and consecutive cells
+ *    share a node point, so the whole drainage tree is orthogonally contiguous — which is what makes
+ *    a river something a body can walk the length of rather than a string of corner-touching
+ *    puddles.
+ *  - **Every river reaches the sea**, because the coarse drainage tree does and this traces it.
+ *
+ * The scan is over the coarse cells near this tile rather than the tile's own cell alone: a node is
+ * jittered up to `NODE_JITTER` of a cell from centre and its leg reaches into the neighbouring
+ * cell, so a channel belonging to a cell two over can legitimately cross here. Two cells of margin
+ * covers that with room to spare, and it is 25 O(1) tests, not a search.
+ */
+function riverAt(x: number, y: number): boolean {
+	const cx0 = Math.floor(x / COARSE);
+	const cy0 = Math.floor(y / COARSE);
+	for (let cy = cy0 - 2; cy <= cy0 + 2; cy++) {
+		if (cy < 0 || cy >= COARSE_SIZE) continue;
+		for (let cx = cx0 - 2; cx <= cx0 + 2; cx++) {
+			if (cx < 0 || cx >= COARSE_SIZE) continue;
+			const i = cy * COARSE_SIZE + cx;
+			if (coarse.acc[i] <= RIVER_T) continue;
+			const ax = nodeX(cx, cy);
+			const ay = nodeY(cx, cy);
+			const d = coarse.downhill[i];
+			// An outlet cell has no downhill neighbour: run its channel straight out to the sea edge,
+			// which SEA_DEPTH guarantees is water. Without this the trunk of every river would stop one
+			// node short of the coast and read as a channel that never arrives.
+			const bx = d === -1 ? GRID_SIZE - 1 : nodeX(d % COARSE_SIZE, (d / COARSE_SIZE) | 0);
+			const by = d === -1 ? ay : nodeY(d % COARSE_SIZE, (d / COARSE_SIZE) | 0);
+			// Horizontal leg at ay, from ax to bx; then vertical leg at bx, from ay to by.
+			if (y === ay && x >= Math.min(ax, bx) && x <= Math.max(ax, bx)) return true;
+			if (x === bx && y >= Math.min(ay, by) && y <= Math.max(ay, by)) return true;
 		}
+	}
+	return false;
+}
 
-	return (x, y) => chars[idx(x, y)];
+// Thresholds. Picked by eye against `npm run map`: water below WATER_T (declared above, next to the
+// SEA_DEPTH derived from it), then habitable, then Hills, then Mountain at the top. Both sit high
+// enough that the habitable band — meadow, forest, and the deposits banded within it — stays the
+// majority of the map: most of `elevationAt`'s mass is mid-band, and the ridge's long tail is what
+// actually reaches these.
+//
+// **These no longer move with GRID_SIZE.** Every previous grid change retuned them, because the old
+// `field` drew a lattice sized to the grid and so handed back a genuinely different elevation
+// histogram at every world size. `hashNoise` gives the same value at the same lattice point forever
+// (see its own comment), so a bigger world is more of the same world and these describe it
+// unchanged. The floors in worldgen.test.ts stay anyway — they are cheap, and they are what would
+// catch this claim turning out to be wrong.
+const HILLS_T = 0.8;
+const MOUNTAIN_T = 0.855;
+
+// How far the moisture boost reaches and how much it adds at zero distance. Two coarse cells is
+// ~32 tiles — a river valley's worth of damp ground, enough to thicken a forest along the water
+// without painting the entire habitable band as woodland.
+// Where a tile carries a deposit rather than plain ground. Read off the mineral field's own
+// distribution (its p84) rather than guessed: this was 0.84 when `minerals` was a single octave of
+// value noise, which is roughly uniform, and multi-octave fBm concentrates toward 0.5 — at the old
+// threshold the new field put deposits on 0.02% of the map instead of 12%, which sealed the ladder.
+const MINERAL_T = 0.64;
+
+const MOISTURE_RANGE = 2;
+const MOISTURE_BOOST = 0.35;
+const FOREST_T = 0.55;
+
+// Deposit banding within the habitable band: clay nearest the water, iron highest, just under the
+// Hills line.
+const habitable = HILLS_T - WATER_T;
+// Cut at 0.71 / 0.92 of the habitable span rather than 0.55 / 0.8: elevation is not uniform across
+// that span, it is bunched near its top, so the old fractions put almost every deposit above the
+// high cut — 3.5% iron against 1.0% clay. These land the three roughly even.
+const midBand = WATER_T + habitable * 0.71;
+const highBand = WATER_T + habitable * 0.92;
+
+/**
+ * The terrain char for one tile — the whole generator, as a pure function.
+ *
+ * Chunk-cached, because the callers that matter ask in runs rather than at random: the client
+ * redraws a viewport every frame, `findStarts` sweeps a neighbourhood, and the seed's own checks
+ * walk a block. A cold tile costs roughly a dozen noise evaluations and twenty-five O(1) channel
+ * tests; a cached one costs an array read. See `chunkFor`.
+ */
+export function terrainCharAt(x: number, y: number): string {
+	return String.fromCharCode(chunkFor(x, y)[(y & CHUNK_MASK) * CHUNK + (x & CHUNK_MASK)]);
+}
+
+/**
+ * The same answer, without touching the chunk cache — for callers sampling the world sparsely
+ * rather than walking a neighbourhood.
+ *
+ * The distinction is worth the second export because the cache actively hurts that case: a chunk is
+ * 4,096 tiles, so a caller taking one sample every 35 tiles (the whole-world overview) pays for
+ * 1,225 classifications it will never read, and evicts a cache somebody else was using to do it.
+ * Measured: the whole-world view in `npm run map` went from 18 s to well under a second by
+ * classifying the ~40,000 tiles it actually draws instead of the 47.8M it was touching.
+ */
+export function terrainCharDirect(x: number, y: number): string {
+	return String.fromCharCode(classify(x, y));
+}
+
+function classify(x: number, y: number): number {
+	if (riverAt(x, y)) return WATER;
+	const e = elevationAt(x, y);
+	// Sea, not merely low: the coarse sea mask is what keeps a sealed-off inland basin from reading
+	// as ocean. A basin that fails it falls through to the ordinary bands below on its own real
+	// elevation, which reads as low, damp ground — not a special case.
+	if (e < WATER_T && coarse.sea[coarseIndex(x, y)]) return WATER;
+	if (e > MOUNTAIN_T) return MOUNTAIN;
+	if (e > HILLS_T) return HILLS;
+	if (minerals(x, y) > MINERAL_T) return e > highBand ? IRON : e > midBand ? STONE_CHAR : CLAY;
+	const dist = coarse.distToWater[coarseIndex(x, y)];
+	const boost = dist >= 0 ? MOISTURE_BOOST * Math.max(0, 1 - dist / MOISTURE_RANGE) : 0;
+	return moistureNoise(x, y) + boost > FOREST_T ? FOREST_CHAR : MEADOW;
+}
+
+const coarseIndex = (x: number, y: number) =>
+	Math.min(COARSE_SIZE - 1, Math.floor(y / COARSE)) * COARSE_SIZE +
+	Math.min(COARSE_SIZE - 1, Math.floor(x / COARSE));
+
+// Char codes, so a chunk is a Uint8Array rather than an array of one-character strings.
+const MEADOW = 46; // '.'
+const FOREST_CHAR = 102; // 'f'
+const WATER = 119; // 'w'
+const HILLS = 104; // 'h'
+const MOUNTAIN = 109; // 'm'
+const STONE_CHAR = 115; // 's'
+const CLAY = 99; // 'c'
+const IRON = 105; // 'i'
+
+// 64x64 tiles a chunk — 4 KB each, and big enough that a client viewport at close zoom is a handful
+// of them. CHUNK must stay a power of two: the masking in `terrainCharAt` depends on it.
+const CHUNK = 64;
+const CHUNK_MASK = CHUNK - 1;
+// How many chunks to keep. 4,096 is 16 MB and covers a 4,096 x 4,096-tile working set — far more
+// than any one viewport or start search touches, and bounded, which is the property that matters on
+// a long-lived lambda instance. ponytail: eviction is "drop the whole map when it is full", not
+// LRU. Every consumer here works over a locality that fits, so a wholesale drop is rare; make it an
+// LRU the day a profile shows this thrashing.
+const CHUNK_BUDGET = 4096;
+const chunks = new Map<number, Uint8Array>();
+
+function chunkFor(x: number, y: number): Uint8Array {
+	const cx = x >> 6;
+	const cy = y >> 6;
+	const key = cy * ((GRID_SIZE >> 6) + 1) + cx;
+	const hit = chunks.get(key);
+	if (hit) return hit;
+	const built = new Uint8Array(CHUNK * CHUNK);
+	const x0 = cx * CHUNK;
+	const y0 = cy * CHUNK;
+	for (let j = 0; j < CHUNK; j++)
+		for (let i = 0; i < CHUNK; i++) built[j * CHUNK + i] = classify(x0 + i, y0 + j);
+	if (chunks.size >= CHUNK_BUDGET) chunks.clear();
+	chunks.set(key, built);
+	return built;
 }
 
 // The meadow char. Named because the start rule is written in terms of it and 'nothing but "."'
 // reads like a typo.
 const GRASS = '.';
 // How much clear grass a new realm opens with around its buildings, on every side. Two, so the
-// hamlet has somewhere to grow into and nobody starts wedged against a lake — which is exactly
-// what the authored core did before this rule existed.
+// hamlet has somewhere to grow into and nobody starts wedged against a lake.
 const START_MARGIN = 2;
 
 // Forest and Stone, the two terrain chars `hasStartingResources` below is watching for.
@@ -703,16 +834,11 @@ const STONE = 's';
 // down — `seed.ts` gives it no capacity, so one is an endless supply and a second adds nothing.
 //
 // Forest is eight because a forest tile very much does run down, and "at least one" turned out to
-// be a guarantee in name only. A tile holds 25 Wood and takes thirty days to grow back; the seed's
-// own note calls that ~90x gap the mechanic that "pushes you outward to new ground" — but the reach
-// gates outward now, so a realm cannot answer a stripped forest by walking to the next one until
-// its population earns the next milestone. One tile is 25 Wood, stripped in about eight hours by
-// the three settlers a realm opens with, and then a month of nothing. Eight is 200, which is a
-// couple of days' gathering — comfortably longer than growing 3 people to the 8 that widen the
-// circle to where the real woodland is.
-//
-// Cheap, too, which is why it is eight and not one: on the shipped seed, 69 of the 1,430 legal
-// start blocks clear this bar, and insisting on it moves the opening hamlet a single tile.
+// be a guarantee in name only. A tile holds 25 Wood and takes thirty days to grow back; the reach
+// gates outward, so a realm cannot answer a stripped forest by walking to the next one until its
+// population earns the next milestone. One tile is 25 Wood, stripped in about eight hours by the
+// three settlers a realm opens with, and then a month of nothing. Eight is 200, which is a couple
+// of days' gathering — comfortably longer than growing 3 people to the 8 that widen the circle.
 const START_FOREST = 8;
 const START_STONE = 1;
 
@@ -720,12 +846,11 @@ const START_STONE = 1;
  * Does the *starting* reach — a `START_REACH_RADIUS` circle around where the Marketplace will
  * stand, one tile north of the hamlet — actually hold enough wood and stone to open with? The reach
  * gates gathering as well as building (it's a sphere of influence, not a building permit), so
- * "reachable" now means "in reach": a hamlet with a forest and an outcrop somewhere on the map but
- * outside its own opening circle is a rationing race nobody chose, not a playable start. Uses the
- * same Euclidean test the server gate and the drawn circle use, so the search and the rule it is
- * searching for can never quietly disagree about the shape of a circle.
+ * "reachable" now means "in reach". Uses the same Euclidean test the server gate and the drawn
+ * circle use, so the search and the rule it is searching for can never quietly disagree about the
+ * shape of a circle.
  */
-function hasStartingResources(hx: number, hy: number, charAt: (x: number, y: number) => string) {
+function hasStartingResources(hx: number, hy: number) {
 	const reach = { x: hx, y: hy - 1, radius: START_REACH_RADIUS };
 	let forest = 0;
 	let stone = 0;
@@ -733,7 +858,7 @@ function hasStartingResources(hx: number, hy: number, charAt: (x: number, y: num
 		for (let x = reach.x - reach.radius; x <= reach.x + reach.radius; x++) {
 			if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) continue;
 			if (!withinReach(x, y, reach)) continue;
-			const c = charAt(x, y);
+			const c = terrainCharAt(x, y);
 			if (c === FOREST) forest++;
 			else if (c === STONE) stone++;
 			if (forest >= START_FOREST && stone >= START_STONE) return true;
@@ -741,11 +866,24 @@ function hasStartingResources(hx: number, hy: number, charAt: (x: number, y: num
 	return false;
 }
 
-// Two mature reaches (MATURE_REACH_RADIUS each) just touching — the separation `findStarts`
-// enforces between the openings it accepts, so two realms can each grow their reach all the way to
-// the ladder's top rung without their spheres of influence ever overlapping. Derived rather than a
-// second magic number, so a retuned milestone ladder (seed.ts) can't quietly leave this stale.
-const MIN_START_SEPARATION = MATURE_REACH_RADIUS * 2;
+/**
+ * How far apart two accepted openings must sit.
+ *
+ * **Not "two mature reaches just touching" any more**, which is what this was and which produced a
+ * world with no wilderness in it at any size: the search accepts every candidate that clears the
+ * bar, so a separation of exactly `MATURE_REACH_RADIUS * 2` packs any map to roughly 68% claimed
+ * land, neighbours shoulder to shoulder. Lands of Lords — the north star — runs 113 domains over a
+ * continent that is 86% wild, and that ratio is the thing that makes travelling somewhere mean
+ * anything.
+ *
+ * `WILDERNESS_RATIO` is how many mature-reach diameters of empty ground sit between two realms'
+ * borders. 2.5 lands claimed land near LoL's own 14% at the grid size this world is built for; it
+ * is a game-feel number, tune it and the frontier gets wider or narrower without anything else
+ * moving. Derived from MATURE_REACH_RADIUS rather than written down separately, so a retuned
+ * milestone ladder (seed.ts) cannot leave it stale.
+ */
+const WILDERNESS_RATIO = 1.87;
+const MIN_START_SEPARATION = Math.round(MATURE_REACH_RADIUS * 2 * WILDERNESS_RATIO);
 
 /** The hamlet, its two flanking buildings, the Marketplace, and the settlers' row — everything a
  * fresh realm needs placed, derived from the one tile that anchors all of it. */
@@ -783,42 +921,57 @@ function startBlockFor(hx: number, hy: number): StartBlock {
 }
 
 /**
- * Every opening the generated map holds: legal by the same rule `findStart` used to search for
- * once (a `START_MARGIN`-clear block, `START_FOREST` Forest and `START_STONE` Stone inside its own
- * `START_REACH_RADIUS` circle) — plus one new rule, that no two accepted openings may sit closer
- * than `MIN_START_SEPARATION`, so two realms grown to the ladder's top rung never fight over reach.
+ * How far apart the candidate sweep steps. The search used to test *every* tile on the map, which
+ * at 47.8M tiles is 47.8M full classifications plus a 113-tile reach census on each survivor — the
+ * single most expensive thing in this file by a wide margin, and pure waste: accepted openings end
+ * up `MIN_START_SEPARATION` apart regardless, so all but a handful of those candidates were only
+ * ever going to be rejected for being too close to one already taken.
  *
- * Searched rather than declared, same reasoning as the old single `findStart`: a hand-placed
- * constant cannot notice when the ground under it moves.
+ * 10 tiles is fifty times finer than the separation the packer enforces, so the openings it finds
+ * sit within a few tiles of the ones an exhaustive sweep would have picked — and it is a hundredfold
+ * less work. It is a real trade against a perfect packing, bought for a search that costs seconds
+ * instead of an hour.
  *
- * Deterministic, and reproducible for the same map: every legal tile is found, ordered
- * closest-to-the-map's-centre first (ties broken by row-major scan order — the same tie-break the
- * old single-start search used), then accepted greedily, a candidate joining only if it is far
- * enough from every start already accepted. That is a real trade against a perfect packing (which
- * could seat a few more), bought for the property that actually matters here: the count and the
- * placement come out the same way every time this runs against the same map.
+ * It is not merely a speed dial: a legal opening needs clear meadow *and* wood *and* stone inside a
+ * six-tile circle, which is a rare conjunction, so the stride sets how many of them the map actually
+ * offers. At 24 this world yielded 35 openings against the ~110 it can hold. The cheap test (`clear`)
+ * runs first and rejects almost everything, so a finer sweep costs far less than the candidate count
+ * suggests.
  */
-function findStarts(charAt: (x: number, y: number) => string): { x: number; y: number }[] {
+const START_STRIDE = 10;
+
+/**
+ * Every opening the generated map holds: legal by the same rule as ever (a `START_MARGIN`-clear
+ * block of grass, `START_FOREST` Forest and `START_STONE` Stone inside its own
+ * `START_REACH_RADIUS` circle), no two closer than `MIN_START_SEPARATION`.
+ *
+ * Searched rather than declared: a hand-placed constant cannot notice when the ground under it
+ * moves.
+ *
+ * Deterministic, and reproducible for the same map: candidates are swept on a fixed stride, ordered
+ * closest-to-the-map's-centre first (ties broken by scan order), then accepted greedily, a
+ * candidate joining only if it is far enough from every start already accepted.
+ */
+function findStarts(): { x: number; y: number }[] {
 	// Buildings on `y`, settlers on `y + 1`, three wide and centred on the hamlet — then the margin
 	// around all of it. The Marketplace tile (hx, hy - 1) already sits inside this block, so a
-	// candidate that clears it needs no separate check to know the Marketplace's own tile is grass.
+	// candidate that clears it needs no separate check.
 	const clear = (hx: number, hy: number) => {
 		for (let x = hx - 1 - START_MARGIN; x <= hx + 1 + START_MARGIN; x++)
 			for (let y = hy - START_MARGIN; y <= hy + 1 + START_MARGIN; y++) {
 				if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) return false;
-				if (charAt(x, y) !== GRASS) return false;
+				if (terrainCharAt(x, y) !== GRASS) return false;
 			}
 		return true;
 	};
 	const mid = (GRID_SIZE - 1) / 2;
 	const candidates: { x: number; y: number; d: number }[] = [];
-	for (let y = 0; y < GRID_SIZE; y++)
-		for (let x = 0; x < GRID_SIZE; x++) {
-			if (!clear(x, y) || !hasStartingResources(x, y, charAt)) continue;
+	for (let y = 0; y < GRID_SIZE; y += START_STRIDE)
+		for (let x = 0; x < GRID_SIZE; x += START_STRIDE) {
+			if (!clear(x, y) || !hasStartingResources(x, y)) continue;
 			candidates.push({ x, y, d: Math.hypot(x - mid, y - mid) });
 		}
-	// A stable sort (guaranteed since ES2019) keeps same-distance candidates in the row-major scan
-	// order above, matching the old findStart's own tie-break.
+	// A stable sort (guaranteed since ES2019) keeps same-distance candidates in scan order.
 	candidates.sort((a, b) => a.d - b.d);
 
 	const accepted: { x: number; y: number }[] = [];
@@ -829,51 +982,105 @@ function findStarts(charAt: (x: number, y: number) => string): { x: number; y: n
 	return accepted;
 }
 
-// Roll until the world has somewhere to live. Every candidate is a *whole* different map, and the
-// seed that wins is the one the world is made of — so this is still one fixed world per WORLD_SEED,
-// just chosen rather than assumed.
-//
-// This used to be theoretical: a hand-authored core guaranteed a legal block, so the loop ran once
-// and never found a second candidate. Now that the whole map is generated it is load-bearing —
-// "no hamlet fits" is a real outcome for some seeds, not a hypothetical one — which is why it is
-// bounded rather than `while (true)`: a deploy that hangs looking for a world is worse than one
-// that fails saying so.
-const rolled = (() => {
-	for (let seed = WORLD_SEED; seed < WORLD_SEED + 50; seed++) {
-		const charAt = generator(seed);
-		const starts = findStarts(charAt);
-		if (starts.length > 0) return { seed, charAt, starts };
-	}
-	throw new Error(
-		`no map in 50 rolls from seed ${WORLD_SEED} has ${START_MARGIN} tiles of clear grass around a ` +
-			`hamlet with Forest and Stone within ${START_REACH_RADIUS} tiles of its Marketplace`
-	);
-})();
-
-/** The seed the world is actually made of — `WORLD_SEED` unless that roll had nowhere to live. */
-export const MAP_SEED = rolled.seed;
-
-/** The terrain char for one tile. */
-export const terrainCharAt = rolled.charAt;
+/**
+ * The seed the world is actually made of. It used to be possible for this to differ from
+ * `WORLD_SEED`: the generator rerolled until it found a map with somewhere to live. That loop is
+ * gone with the eager whole-grid build it depended on — rerolling now means rebuilding the coarse
+ * grid and re-sweeping for starts, and "no opening anywhere on a continent" is not a failure mode a
+ * 47.8M-tile map has. `findStarts` throwing is the honest report if it ever becomes one.
+ */
+export const MAP_SEED = WORLD_SEED;
 
 /**
- * Every realm-sized opening the map actually holds, closest-to-centre first and mutually
+ * Every realm-sized opening the map holds, closest-to-centre first and mutually
  * `MIN_START_SEPARATION` apart — see `findStarts`. `ensurePlayer` (world.server.ts) claims the
  * first unclaimed one from the `start_position` table the seed writes this into; once every row is
  * claimed the world is full, and it says so rather than stacking a second realm on one opening.
+ *
+ * Lazy, and deliberately: this is a multi-second sweep and only the seed and the tests ever want
+ * it. The server imports this module for `terrainCharAt` on every cold start and must not pay for a
+ * start search it never reads — which is exactly what a module-level `findStarts()` call did.
  */
-export const STARTS: StartBlock[] = rolled.starts.map((s) => startBlockFor(s.x, s.y));
+let startsCache: StartBlock[] | null = null;
+export function starts(): StartBlock[] {
+	if (!startsCache) {
+		const found = findStarts();
+		if (found.length === 0)
+			throw new Error(
+				`no opening on the map has ${START_MARGIN} tiles of clear grass around a hamlet with ` +
+					`${START_FOREST} Forest and ${START_STONE} Stone within ${START_REACH_RADIUS} tiles of ` +
+					`its Marketplace — swept every ${START_STRIDE} tiles from seed ${WORLD_SEED}`
+			);
+		startsCache = found.map((s) => startBlockFor(s.x, s.y));
+	}
+	return startsCache;
+}
 
 /**
- * The first opening — kept so every caller that only ever needed *a* legal start (the seed's own
- * sanity checks, `scripts/map.ts`, `scripts/rules-check.ts`, the tests) keeps working unchanged.
- * Not "where every realm opens" any more — see `STARTS` for that.
+ * A square window of the map, row-major, one string per row — for `npm run map`, the tests, and
+ * anything else that wants to look at a region rather than a tile.
+ *
+ * This replaced a `terrainMap()` that returned the *whole world* as an array of GRID_SIZE strings.
+ * That was a reasonable shape at 128x128 and is 47.8M characters at the continent — about 100 MB of
+ * JS strings to answer "what does the coastline look like". Every caller of it actually wanted
+ * either a downsampled overview or a neighbourhood, and both are windows.
  */
-export const START = STARTS[0];
+export function terrainWindow(x0: number, y0: number, size: number, stride = 1): string[] {
+	// Contiguous reads go through the chunk cache; anything sparser deliberately doesn't (see
+	// `terrainCharDirect`). The break-even is stride 1, not "narrower than a chunk": a chunk costs
+	// CHUNK^2 classifications and serves (CHUNK / stride)^2 samples, so the waste factor is exactly
+	// stride^2 — already 4x at stride 2. Getting this condition wrong is not subtle and was not
+	// theoretical: at `npm run map`'s whole-world stride of 35 it made the overview take 17 seconds
+	// to draw 39,204 tiles, by classifying 47.8 million of them.
+	const at = stride === 1 ? terrainCharAt : terrainCharDirect;
+	const rows: string[] = [];
+	for (let j = 0; j < size; j++) {
+		let row = '';
+		for (let i = 0; i < size; i++) {
+			const x = x0 + i * stride;
+			const y = y0 + j * stride;
+			row += x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE ? ' ' : at(x, y);
+		}
+		rows.push(row);
+	}
+	return rows;
+}
 
-/** The whole map, row-major, one string per row — for `npm run map` and the distribution test. */
-export function terrainMap(): string[] {
-	return Array.from({ length: GRID_SIZE }, (_, y) =>
-		Array.from({ length: GRID_SIZE }, (_, x) => terrainCharAt(x, y)).join('')
-	);
+/**
+ * How many tiles of each terrain the world holds, as a share of the whole — sampled on a stride
+ * rather than counted exhaustively, which is what makes it affordable to ask at all at continent
+ * scale. `stride` 8 is one tile in 64 and gives shares stable to well under a tenth of a percent
+ * for anything that covers more than a handful of tiles; the rarest terrain here is Stone at ~1%.
+ *
+ * Returned as counts of *samples*, not of tiles: callers want the shares, and multiplying back up
+ * would dress an estimate as an exact number.
+ */
+export function terrainCensus(stride = 8): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (let y = 0; y < GRID_SIZE; y += stride)
+		for (let x = 0; x < GRID_SIZE; x += stride) {
+			const c = terrainCharDirect(x, y);
+			counts.set(c, (counts.get(c) ?? 0) + 1);
+		}
+	return counts;
+}
+
+/**
+ * A stable, order-independent summary of the coarse hydrology grid — the drainage tree and its
+ * accumulation, which is where every non-local decision in this file lives.
+ *
+ * Exists so `worldgen.hash.ts` can fold the hydrology into the terrain hash without this module
+ * exporting its mutable internals, and without this module importing `node:crypto`. That import is
+ * why the split exists at all: the browser runs this generator now, and a `node:` builtin anywhere
+ * in the client's module graph is a bundling problem waiting to happen. Tree-shaking would probably
+ * have dropped it; "probably" is not a good property for a build to have.
+ *
+ * Accumulation is rounded because it is a float sum whose last bits are not a fact about the world —
+ * without that, a reordering inside the reduction would change the hash and read as a changed map.
+ */
+export function coarseFingerprint(): string {
+	let out = '';
+	for (let i = 0; i < coarse.downhill.length; i++)
+		out += `${coarse.downhill[i]}:${Math.round(coarse.acc[i])};`;
+	return out;
 }
