@@ -1,12 +1,18 @@
 // Client-safe: shared constants, wire types, and the position math. No db imports.
 
-// 1024×1024 — widened again from 256 so a mature realm can actually be a *city* (VISION's north
-// star, Lands of Lords, in its city view: hundreds of buildings on a street grid) rather than a
-// hamlet with fields. A tile is ~20 m, so 1024 tiles is ~20.5 km across; the reach ladder's top
-// rung (MATURE_REACH_RADIUS below) is sized to that, not the other way round. See WORLD_SEED in
+// 1448×1448 — widened again from 1024 to hold a *real* Lands of Lords domain rather than half of
+// one. Measured against LoL's own reported numbers (its tile-detail pages prove one coordinate is
+// one tile): continent Terra Borealis is 18,834 km² split across 113 domains, so one domain
+// averages ~9.2 mi² = ~23.8 km² of claimed land (confirmed against a named domain, Brame-Sur-Mer,
+// at 5,893 acres = 23.8 km²) out of a continent where claimed land is only ~14% of the total — the
+// rest is wilderness. A tile is 20 m (400 m²), so a domain that size is ~59,620 of our tiles — a
+// circle of radius 138 (MATURE_REACH_RADIUS below), sized to that, not the other way round. Six
+// domains at that radius on a 1448×1448 grid (2.10M tiles, ~29 km across) claim ~17% of the world,
+// the closest a `MATURE_REACH_RADIUS × 2`-separated packing gets to LoL's 14% without the start
+// count collapsing (see `findStarts` in worldgen.ts, MIN_START_SEPARATION). See WORLD_SEED in
 // worldgen.ts. The whole grid comes from worldgen.ts's generator; nothing here still names an
 // authored core.
-export const GRID_SIZE = 1024;
+export const GRID_SIZE = 1448;
 
 // START used to live here. It is derived from the terrain now — see `findStarts` in worldgen.ts —
 // because a written-down coordinate cannot notice that the ground under it has become a lake.
@@ -47,10 +53,11 @@ export const START_REACH_RADIUS = 6;
 // can derive its minimum separation from it rather than restating a magic number: two mature
 // reaches just touching is twice this — see MIN_START_SEPARATION there.
 //
-// 95 — city scale (radius 95 is ~190 tiles / ~3.8 km across, ~28,000 tiles of sphere of
-// influence), up from 24 when the world was a 256×256 hamlet-and-fields map. Moves with
+// 138 — a real Lands of Lords domain's worth of land (see GRID_SIZE's own comment for the
+// derivation): ~276 tiles / ~5.5 km across, ~59,820 tiles of sphere of influence, up from 95 when
+// the ladder's top rung was sized to "a city" rather than to a measured domain. Moves with
 // GRID_SIZE and seed.ts's MILESTONES; see the ladder there for the rungs beneath it.
-export const MATURE_REACH_RADIUS = 95;
+export const MATURE_REACH_RADIUS = 138;
 
 /**
  * The world coordinate (in cell units, fractional) under a pane-relative pixel — read the pane's

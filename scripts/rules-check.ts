@@ -351,10 +351,28 @@ check(
 //
 // Only the four cardinal offsets are tried: at the radii this map actually uses (6 and 7) they are
 // the only integer points on the circle at all — 6² and 7² have no other decomposition into two
-// squares — so there is nothing to gain from trying more, and the first one that is buildable,
-// unoccupied ground wins the same way `findMany` picks its first match.
-function reachEdge(dist: number): { x: number; y: number } {
+// squares — so there is nothing to gain from trying more, and the first tile that suits wins the
+// same way `findMany` picks its first match.
+//
+// "Suits" differs by verb, and conflating the two is a real trap: a build needs ground the build
+// gate will accept, a gather needs ground that actually *yields*, and Hills is the counter-example
+// that is both buildable and barren. Worse, the two gates run in opposite orders —
+// `planBuild` checks the reach before occupancy, while `assignWorker` checks that the tile yields
+// *before* it checks the reach — so a barren edge tile does not merely fail the gather case, it
+// answers TILE_YIELDS_NOTHING to the very case that means to prove OUTSIDE_REACH. Asking for the
+// right ground per verb is what keeps each case failing only for its own reason.
+type EdgeWants = 'buildable' | 'gatherable';
+function reachEdge(dist: number, wants: EdgeWants): { x: number; y: number } {
 	const { x: cx, y: cy } = world.body.reach;
+	// Gatherable means a body can walk out and work it with nothing built first — so the terrain has
+	// to yield a resource, and that resource must not require a structure on the tile (a Stone
+	// outcrop yields, but only through a Quarry, and would answer MISSING_REQUIRED_BUILDING).
+	const suits = (t: { buildableTypeIds: number[]; yieldsResourceId: number | null }) => {
+		if (wants === 'buildable') return t.buildableTypeIds.includes(free);
+		if (t.yieldsResourceId === null) return false;
+		const r = world.body.resources.find((res: { id: number }) => res.id === t.yieldsResourceId);
+		return !!r && r.requiresBuildingTypeId == null;
+	};
 	for (const [dx, dy] of [
 		[dist, 0],
 		[0, dist],
@@ -367,12 +385,16 @@ function reachEdge(dist: number): { x: number; y: number } {
 		const i = y * world.body.gridSize + x;
 		if (startBuildings.has(i)) continue;
 		const t = world.body.terrainTypes.find((tt: { id: number }) => tt.id === world.body.terrain[i]);
-		if (t?.buildableTypeIds.includes(free)) return { x, y };
+		if (t && suits(t)) return { x, y };
 	}
-	throw new Error(`no buildable, unoccupied tile exactly ${dist} tiles from the reach centre`);
+	throw new Error(
+		`no unoccupied ${wants} tile exactly ${dist} tiles from the reach centre — the start guarantee may have slipped`
+	);
 }
-const insideEdge = reachEdge(world.body.reach.radius);
-const outsideEdge = reachEdge(world.body.reach.radius + 1);
+const insideEdge = reachEdge(world.body.reach.radius, 'buildable');
+const outsideEdge = reachEdge(world.body.reach.radius + 1, 'buildable');
+const insideEdgeGather = reachEdge(world.body.reach.radius, 'gatherable');
+const outsideEdgeGather = reachEdge(world.body.reach.radius + 1, 'gatherable');
 
 await newRealm();
 const buildOutside = await order(outsideEdge.x, outsideEdge.y, free);
@@ -389,17 +411,17 @@ check(
 );
 
 await newRealm();
-const gatherOutside = await assign(outsideEdge.x, outsideEdge.y);
+const gatherOutside = await assign(outsideEdgeGather.x, outsideEdgeGather.y);
 check(
-	`(${outsideEdge.x},${outsideEdge.y}) one tile past the reach refuses a gather too — it's a` +
+	`(${outsideEdgeGather.x},${outsideEdgeGather.y}) one tile past the reach refuses a gather too — it's a` +
 		' sphere of influence, not a building permit',
 	[gatherOutside.status, gatherOutside.body.reason],
 	[400, 'OUTSIDE_REACH']
 );
 await newRealm();
 check(
-	`(${insideEdge.x},${insideEdge.y}) exactly on the reach's edge accepts the same gather`,
-	(await assign(insideEdge.x, insideEdge.y)).status,
+	`(${insideEdgeGather.x},${insideEdgeGather.y}) exactly on the reach's edge accepts the same gather`,
+	(await assign(insideEdgeGather.x, insideEdgeGather.y)).status,
 	200
 );
 

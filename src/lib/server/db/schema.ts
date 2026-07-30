@@ -385,7 +385,16 @@ export const gameConfig = pgTable(
 		// note. Nullable: a row seeded before this column existed has none, and world.server.ts
 		// throws on that the same way it throws on every other missing-catalog-row case in that
 		// file — `run npm run seed`, not a silent guess.
-		worldVersion: text('world_version')
+		worldVersion: text('world_version'),
+		// A hash of the *generated terrain data itself* — every tile's terrain char, not worldgen.ts's
+		// source text (that's world_version's job, above). This is the safety property that makes it
+		// safe for the read path to stop selecting the `tile` table and generate the grid instead: if
+		// worldgen.ts ever changes and nobody reseeds, the server would otherwise generate a *different*
+		// world than the one `tile_stock`, `building` and `settlement` rows refer to, silently. The seed
+		// writes this; world.server.ts's `loadStaticWorld` regenerates the grid, hashes it the same way,
+		// and throws rather than serving a world it can't prove matches the database. Nullable for the
+		// same reason `world_version` is — a row seeded before this column existed has none.
+		terrainHash: text('terrain_hash')
 	},
 	(t) => [check('game_config_singleton', sql`${t.id} = 1`)]
 );
@@ -474,7 +483,20 @@ export const terrainType = pgTable('terrain_type', {
 	// How long an emptied deposit takes to come back to full. Null means it never empties —
 	// a quarry does not run out on this timescale, a forest does. One nullable column rather
 	// than a flag plus a duration, so "infinite" cannot disagree with "regrows in 0s".
-	regrowSeconds: integer('regrow_seconds')
+	regrowSeconds: integer('regrow_seconds'),
+	// worldgen.ts's single-character terrain code ('.', 'f', 's', …) — what the generator's output
+	// maps onto to become a row. world.server.ts's read path no longer selects the `tile` table (see
+	// its own note), so this is how it turns a generated char back into a terrain_type id: a catalog
+	// lookup instead of a 2M-row join. Nullable, like world_version, for the same reason: a row
+	// seeded before this column existed has none, and the read path throws on that rather than
+	// guessing (`run npm run seed`).
+	char: text('char').unique(),
+	// The same fact `tile.quantity` holds per row, lifted onto the type: every tile of one terrain
+	// type is seeded with the identical capacity (seed.ts's own invariant), so storing it once here
+	// is what lets the read path answer "how much does a Forest tile hold" without reading a single
+	// `tile` row. Null where the deposit is infinite or the ground yields nothing — same reading as
+	// `tile.quantity`'s own null.
+	capacity: integer('capacity')
 });
 
 // Natural key, unlike `building`'s serial + unique index. The rule: surrogate key for rows
@@ -482,6 +504,15 @@ export const terrainType = pgTable('terrain_type', {
 // set. There are exactly GRID_SIZE² tiles forever, (x, y) *is* the identity, and nothing
 // references a tile — a serial would be a second identity with no reader. The composite PK
 // is also exactly the index the buildable lookup wants, so it costs one index fewer.
+//
+// **Not on the read path any more.** world.server.ts used to `SELECT *` this whole table (plus its
+// join to `terrain_type`/`resource`) on every world read — the egress problem CLAUDE.md and
+// world.server.ts's own `loadStaticWorld` describe. The terrain grid it holds is a pure function of
+// `WORLD_SEED` + `GRID_SIZE` + worldgen.ts's generator, so the read path generates it instead and
+// only trusts the result once its hash matches `game_config.terrain_hash` — see that column's own
+// comment. `npm run seed` still writes this table, and still must: `tile_stock.(x, y)` carries a
+// real foreign key into it (below), which is the one thing still keeping it around, and a live
+// database is more inspectable with the grid sitting in SQL than without it.
 export const tile = pgTable(
 	'tile',
 	{

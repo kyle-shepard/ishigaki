@@ -30,6 +30,7 @@ import {
 	contentVersion,
 	STARTS,
 	terrainCharAt,
+	terrainDataHash,
 	WORLD_SEED
 } from '../src/lib/features/world/worldgen.ts';
 
@@ -155,6 +156,11 @@ const worldgenPath = fileURLToPath(
 	new URL('../src/lib/features/world/worldgen.ts', import.meta.url)
 );
 const worldVersion = contentVersion(WORLD_SEED, GRID_SIZE, readFileSync(worldgenPath, 'utf8'));
+// The data-hash counterpart to worldVersion above — see game_config.terrain_hash's own comment.
+// world.server.ts recomputes this against whatever it generates and refuses to serve a mismatch,
+// so this is the one write that makes "the read path stopped selecting `tile`" safe rather than
+// merely fast.
+const terrainHash = terrainDataHash(GRID_SIZE, terrainCharAt);
 
 // The one global-scalar row. Upserted on the fixed id=1 so a live edit retunes the world in
 // place (VISION #10) rather than appending a second row the singleton CHECK would reject.
@@ -177,7 +183,8 @@ await db
 			starvePerHour: 1,
 			settlerBaseline: 0.15,
 			skillCurve: 0.3,
-			worldVersion
+			worldVersion,
+			terrainHash
 		}
 	])
 	.onConflictDoUpdate({
@@ -188,7 +195,8 @@ await db
 			starvePerHour: sql`excluded.starve_per_hour`,
 			settlerBaseline: sql`excluded.settler_baseline`,
 			skillCurve: sql`excluded.skill_curve`,
-			worldVersion: sql`excluded.world_version`
+			worldVersion: sql`excluded.world_version`,
+			terrainHash: sql`excluded.terrain_hash`
 		}
 	});
 
@@ -216,11 +224,24 @@ await db.execute(
 // head). Content, not code (VISION #10): retuning a threshold or its radius is an UPDATE against a
 // live world, same shape as building_cost below.
 //
-// Extended to city scale for the 1024×1024 map: the old ladder topped out at radius 24 (a hamlet
-// with fields, 1,810 tiles). This one keeps every rung below unchanged and adds five more, ending at
-// radius 95 — ~190 tiles / ~3.8 km across, ~28,000 tiles of sphere of influence, in the spirit of
-// Lands of Lords' city view (hundreds of buildings on a street grid). MATURE_REACH_RADIUS (world.ts)
-// must equal the top rung; the check below enforces it.
+// Extended to a real domain's scale for the 1448×1448 map (see GRID_SIZE's own comment in world.ts
+// for the LoL measurement this is sized against): the old ladder topped out at radius 95 (city
+// scale, ~28,000 tiles). This one keeps every rung below unchanged and adds one more, ending at
+// radius 138 — ~276 tiles / ~5.5 km across, ~59,820 tiles of sphere of influence, a measured LoL
+// domain rather than an eyeballed city. MATURE_REACH_RADIUS (world.ts) must equal the top rung; the
+// check below enforces it.
+//
+// Population arithmetic for the new top rung, honestly: 1,000 is capped by summed
+// housing_capacity (House 4, Longhouse 10) — reaching it needs ~100 Longhouses' worth of housing
+// (or a mix), which is a lot of buildings but is what "a domain, not a hamlet" costs in a game
+// where population is built, not spawned. growthPerHour is flat at 2/hour regardless of
+// settlement size, so climbing from the starting 3 to 1,000 takes (1,000 − 3) / 2 ≈ 499 hours ≈
+// 20.8 real-world days of continuous, never-blocked growth (enough spare housing and food the
+// whole way) — longer in practice, since housing has to be built ahead of the growth it enables.
+// That is roughly 1.7× the previous top rung's climb (600 population, ~12.4 days), consistent with
+// the ladder's own established population ratio (~1.7× per rung). The real domain this models
+// holds 55,912 people; ours holds hundreds. The area now matches Lands of Lords, the density does
+// not — that gap is VISION's deferred commoner-aggregate tier, not something this pass fixes.
 const MILESTONES = [
 	{ population: 3, radius: 6 },
 	{ population: 8, radius: 9 },
@@ -231,7 +252,8 @@ const MILESTONES = [
 	{ population: 120, radius: 42 },
 	{ population: 200, radius: 55 },
 	{ population: 350, radius: 72 },
-	{ population: 600, radius: 95 }
+	{ population: 600, radius: 95 },
+	{ population: 1000, radius: 138 }
 ];
 // The first rung has to be the same circle `findStarts` already searched the generated map for
 // (world.ts's START_REACH_RADIUS, consumed there and here) — a mismatch would mean the map's own
@@ -809,7 +831,13 @@ const terrainRows = await db
 			isDeposit: t.isDeposit ?? false,
 			movementCost: t.movementCost,
 			yieldsResourceId: t.yields ? res[t.yields] : null,
-			regrowSeconds: t.regrowSeconds ?? null
+			regrowSeconds: t.regrowSeconds ?? null,
+			// The two columns world.server.ts's read path leans on now that it generates the grid
+			// instead of selecting `tile`: `char` maps a generated tile back to this row, `capacity`
+			// is the one fact `tile.quantity` held per row that a terrain id alone doesn't (see both
+			// columns' own comments in schema.ts).
+			char: t.char,
+			capacity: t.capacity ?? null
 		}))
 	)
 	.onConflictDoUpdate({
@@ -821,7 +849,9 @@ const terrainRows = await db
 			isDeposit: sql`excluded.is_deposit`,
 			movementCost: sql`excluded.movement_cost`,
 			yieldsResourceId: sql`excluded.yields_resource_id`,
-			regrowSeconds: sql`excluded.regrow_seconds`
+			regrowSeconds: sql`excluded.regrow_seconds`,
+			char: sql`excluded.char`,
+			capacity: sql`excluded.capacity`
 		}
 	})
 	.returning();

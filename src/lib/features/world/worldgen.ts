@@ -58,6 +58,34 @@ export function contentVersion(seed: number, gridSize: number, generatorSource: 
 		.slice(0, 16);
 }
 
+/**
+ * A hash of the generated terrain grid's *data* — every tile's char — rather than of the source
+ * text that produced it (`contentVersion`'s job). The two answer different questions: `contentVersion`
+ * keys the CDN/in-process caches ("has anything about the generator changed"), while this is the load-
+ * bearing safety check world.server.ts's `loadStaticWorld` runs before it will serve a generated world
+ * in place of a database read — "is the world I would generate right now provably the one `tile_stock`,
+ * `building` and `settlement` rows already refer to". Hashing the *data* rather than the source text is
+ * what makes that a real proof: two generators with identical output but different comments or variable
+ * names would pass a data hash and rightly fail nothing, whereas `contentVersion` (correctly) treats
+ * that as a new version because it exists to invalidate caches on any change, not to prove equivalence.
+ *
+ * Row by row into one incremental hash rather than building a `gridSize`-length array of row strings
+ * first: at 1448×1448 that's the same 2,096,704-char pass either way, just without holding every row
+ * string alive at once for `Array.prototype.join` to concatenate afterward.
+ */
+export function terrainDataHash(
+	gridSize: number,
+	charAt: (x: number, y: number) => string
+): string {
+	const hash = createHash('sha256');
+	for (let y = 0; y < gridSize; y++) {
+		let row = '';
+		for (let x = 0; x < gridSize; x++) row += charAt(x, y);
+		hash.update(row);
+	}
+	return hash.digest('hex').slice(0, 16);
+}
+
 /** mulberry32 — a small, well-behaved PRNG. Seeded, so every field below is reproducible. */
 function mulberry32(seed: number): () => number {
 	let a = seed >>> 0;
@@ -422,8 +450,14 @@ function generator(seed: number): (x: number, y: number) => string {
 	// (mountain 8.3%, hills 5.0%, stone 1.2% — every floor still comfortably cleared), but a touch
 	// low against the 256×256 census this is meant to still read like (mountain ~9%, hills ~6%). Cut
 	// down to 0.68/0.79 to land mountain at 9% and hills at 6% almost exactly; census below.
-	const HILLS_T = 0.68;
-	const MOUNTAIN_T = 0.79;
+	//
+	// Retuned again for 1024→1448 (the domain-scale epic, MATURE_REACH_RADIUS 95→138): 0.68/0.79
+	// carried over unchanged read close but a touch flat again (mountain 7.5%, hills 5.4%) — the same
+	// story as every previous grid change, just smaller this time since 1024→1448 is a 1.4× linear
+	// move rather than 2× or 4×. Cut down to 0.65/0.755 to land mountain at 8.9% and hills at 6.4%,
+	// close to the 256×256/1024×1024 census this is meant to keep reading like.
+	const HILLS_T = 0.65;
+	const MOUNTAIN_T = 0.755;
 	// A tile over this many upstream tiles' worth of flow is a river. There's no natural absolute
 	// scale for accumulation — it depends on how the drainage tree happens to branch — so this is
 	// tuned against the printed map rather than derived, and tuned high: at 40 (this constant's
@@ -445,7 +479,17 @@ function generator(seed: number): (x: number, y: number) => string {
 	// over unchanged reproduced the exact 128→256 failure (90th-percentile width 3, a 25-tile straight
 	// run) for the same reason: far more upstream tiles now feed the same channel before it reaches
 	// the sea. Re-tune by eye against `npm run map` again the next time GRID_SIZE moves.
-	const RIVER_T = 60000;
+	//
+	// Retuned again to 400,000 for 1024→1448 (only a 1.4× linear / 2× area move, the smallest grid
+	// change yet, but 60,000 carried over unchanged still failed both river tests — width and
+	// straightness both got *worse*, not better, at the old threshold, because a wider catchment
+	// feeds more accumulation into the same channel before it reaches the cut). Landed jointly with
+	// `hydroNoise`'s own amplitude below rather than alone: at 60,000–320,000 with amplitude in
+	// [0.5, 3], either the width test or the straightness test failed depending on which specific
+	// channel the noise happened to route the flow through — the two constants trade off against each
+	// other on this seed, not just against grid size, so this pair is the first spot in the sweep that
+	// cleared both (90th-percentile width 2, longest straight run 13).
+	const RIVER_T = 400000;
 
 	// The ridge only piles onto land that already reads as high ground — gated smoothly between
 	// RIDGE_GATE_LOW and RIDGE_GATE_HIGH — rather than scaling every tile by however "tall" it is.
@@ -497,12 +541,20 @@ function generator(seed: number): (x: number, y: number) => string {
 	// `npm run map` drops from 38 tiles to single digits, without pushing width back out (there's a
 	// real trade — more noise breaks up straight runs but roughens the channel edge, so this is the
 	// smallest amplitude that gets both).
+	//
+	// Retuned to 1.1 for 1024→1448, alongside RIVER_T above (see its own comment): 0.5 carried over
+	// unchanged left a 30-tile straight run, and the amplitude/threshold pair turned out to be coupled
+	// on this seed rather than independent — a swept grid of both (0.5–3 amplitude × 60,000–500,000
+	// threshold) mostly traded one test's failure for the other's, because each combination routes the
+	// flow tree through a different specific channel on a map this size. 1.1/400,000 is the first pair
+	// in that sweep that cleared both invariants; re-sweep jointly, not each alone, the next time
+	// GRID_SIZE moves.
 	const hydroNoise = field(seed + 24, 1);
 	const hydroElevation = new Float64Array(n);
 	for (let y = 0; y < GRID_SIZE; y++)
 		for (let x = 0; x < GRID_SIZE; x++) {
 			const i = idx(x, y);
-			hydroElevation[i] = elevation[i] + 0.5 * (hydroNoise(x, y) - 0.5);
+			hydroElevation[i] = elevation[i] + 1.1 * (hydroNoise(x, y) - 0.5);
 		}
 
 	// Rivers drain only to the sea edge — see the doc comment on `priorityFlood` for why seeding

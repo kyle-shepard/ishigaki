@@ -19,7 +19,6 @@ import {
 	startPosition,
 	stock,
 	terrainType,
-	tile,
 	tileStock
 } from '$lib/server/db/schema';
 import {
@@ -42,6 +41,9 @@ import {
 	type WorldPayload,
 	type WorldStatic
 } from './world';
+// Generation, not a query — see `loadStaticWorld`'s own comment for why the read path now imports
+// the generator it used to deliberately avoid.
+import { terrainCharAt, terrainDataHash } from './worldgen';
 
 // How fast a starting settler walks, in tiles per second. Not part of the start block, which is
 // a placement and knows nothing about legs.
@@ -277,11 +279,18 @@ export async function loadWorldLive(playerId: number): Promise<WorldLive> {
  * `GET /api/world/static/[version]`'s own read. Null on a version that isn't current — a stale URL,
  * not a game rule — so the route 404s and the client falls back to whatever version its next
  * `/api/world` read reports, rather than ever serving one half against the other's terrain.
+ *
+ * The version check reads `game_config` directly rather than through `loadStaticWorld` — that used
+ * to call `loadStaticWorld` itself just to read `.version` off the result, then hand the same `tx`
+ * to `readWorldStatic`, which calls `loadStaticWorld` again to get the rest of it: two entries into
+ * the one function this memo exists to make expensive-only-once, for a fact (`game_config.world_version`)
+ * this function's own one-row read already has cheaper. See `loadStaticWorld`'s own comment for why
+ * that redundant second call mattered.
  */
 export async function loadWorldStaticFor(version: string): Promise<WorldStatic | null> {
 	return db.transaction(async (tx) => {
-		const current = await loadStaticWorld(tx);
-		if (current.version !== version) return null;
+		const [cfg] = await tx.select({ worldVersion: gameConfig.worldVersion }).from(gameConfig);
+		if (!cfg || cfg.worldVersion !== version) return null;
 		return readWorldStatic(tx);
 	});
 }
@@ -797,36 +806,54 @@ type TileYield = {
 
 /**
  * The two full-grid reads this project's egress problem was measured against (see the history in
- * CLAUDE.md and on readWorld below): the whole `tile` table, and its join to `resource` via
- * `terrainType` — 28,583 rows a read at the 128×128 map this was first measured against, ~1.3 MB of
- * Neon egress, against static content that only ever changes when `npm run seed` runs. Held in
- * process behind the content version the seed writes to `game_config`: the same version means the
- * same rows, so every call after the first is one tiny single-row read instead of the two heavy ones.
+ * CLAUDE.md and on readWorld below) used to be a database query: the whole `tile` table, and its
+ * join to `resource` via `terrainType` — 5,178,273 rows a read at 1448×1448 (238 MB, 67 seconds
+ * cold), up from 28,583 rows / ~1.3 MB at the 128×128 map this was first measured against. Static
+ * content that only ever changes when `npm run seed` runs was being paid for as if it were a query,
+ * every time a lambda instance's own memo was cold.
  *
- * Shared by every caller that used to run these queries itself — `tileYields`, `loadGrid`, and
- * `readWorldStatic` — so a build order's occupancy check and an estimate's re-quote stop paying
- * the full grid too, the same fix `readWorld`'s own read gets.
+ * **It isn't a query any more.** The terrain grid is a pure function of `WORLD_SEED` + `GRID_SIZE` +
+ * worldgen.ts's generator, so this generates it instead of selecting it, and only trusts the result
+ * once its hash matches `game_config.terrain_hash` (see `terrainDataHash`'s own comment for what that
+ * proves and why the seed writes it). world.server.ts deliberately did *not* import worldgen.ts for
+ * exactly this reason a few phases ago — importing it ran the generator's reroll loop at module
+ * import, regenerating the world on every cold start, at a cost the header comment there measured at
+ * ~34 ms against a much smaller grid. That reasoning is now inverted: generation at 1448×1448 was
+ * measured here (`node -e` timing a bare import of worldgen.ts, no DB) at ~2.4 seconds — real, and
+ * worth knowing about, but still the cheap side of the trade by more than an order of magnitude
+ * against 67 *seconds* of egress-bound query time, and by four orders of magnitude against the 238 MB
+ * that egress cost — a number generation doesn't move at all, since none of it leaves the process.
+ * Importing worldgen.ts here doesn't change *when* the reroll loop runs — it still fires exactly once
+ * per lambda instance, at import, the same cadence this memo already had — it changes what that one
+ * run is *for*: every request after the first on a given instance now finds the grid already sitting
+ * in memory rather than a memo waiting to be filled by a multi-second query.
+ *
+ * Only `terrain_type` and `resource` remain real database reads: dozens of rows each, the tuning
+ * data those tables actually exist to hold, read fresh rather than folded into this memo (same
+ * reasoning `loadGrid`'s and `readWorldStatic`'s own small-catalog reads already use).
+ *
+ * Shared by every caller that used to run the heavy queries itself — `tileYields`, `loadGrid`, and
+ * `readWorldStatic` — so a build order's occupancy check and an estimate's re-quote never regenerate
+ * the grid on their own either; they all read this one memo.
  *
  * `terrainIds` is the terrain grid held *compactly* — one `Uint16` per tile, row-major, rather than
- * the row objects (`{x, y, terrainTypeId, quantity}`) the DB read hands back. At GRID_SIZE² tiles
- * (1,048,576 at 1024×1024) an array of small objects is on the order of 100 MB of JS heap, held for
- * the life of the lambda instance — every field boxed, every row its own allocation with V8's
- * per-object overhead on top. The typed array is ~2 MB and holds everything any reader below
- * actually asks a tile for: which terrain it is. `capacityByType` carries the one other fact those
- * rows held that a terrain id alone doesn't — a deposit's capacity — as one number per *type*
- * (readWorldStatic's own comment: the seed writes the same quantity to every tile of a given
- * terrain), not one per tile, so it stays a handful of entries regardless of grid size.
+ * row objects. At GRID_SIZE² tiles (2,096,704 at 1448×1448) an array of small objects is on the
+ * order of 200 MB of JS heap, held for the life of the lambda instance — every field boxed, every
+ * row its own allocation with V8's per-object overhead on top. The typed array is ~4.2 MB and holds
+ * everything any reader below actually asks a tile for: which terrain it is. `capacityByType`
+ * carries the one other fact a terrain id alone doesn't — a deposit's capacity — as one number per
+ * *type* (terrain_type.capacity, seeded once per row, same value `tile.quantity` used to repeat once
+ * per tile of that type), so it stays a handful of entries regardless of grid size.
  *
- * ponytail: a per-lambda-instance memo — module state, not a shared cache. Every cold spin-up warms
- * it again — one grid-sized DB read, ~85 MB of egress at 1024×1024 by egress.ts's own 46-bytes/row
- * calibration (1,048,576 tile rows plus their resource join, up from 28,583 rows / ~1.3 MB at
- * 128×128), because the *read* is still the whole table — going compact only changed what's
- * *retained* in the module after it. Most cold instances should never reach this at all once the
- * edge is serving `/api/world/static`'s year-long, immutable CDN response, which is what actually
- * absorbs that cost across a fleet of instances. A blob/CDN artifact the seed writes directly
- * (architecture C on issue #21) is the upgrade the day per-instance warming is itself the cost — it
- * also takes terrain out of the database entirely, which is the only fix for the read itself rather
- * than for what's kept after it.
+ * ponytail: still a per-lambda-instance memo — module state, not a shared cache. Every cold spin-up
+ * pays the generation cost again at import (~2.4 s measured at 1448×1448 — see above), which is the
+ * whole point of this rewrite: that cost is CPU on the instance, not ~167 MB of egress leaving it, so
+ * paying it once per instance stopped being the problem worth solving. Most cold instances should
+ * still never reach even that, once the edge is serving
+ * `/api/world/static`'s year-long, immutable CDN response across a fleet of instances. A blob/CDN
+ * artifact the seed writes directly (architecture C on issue #21) remains the upgrade the day
+ * per-instance generation is itself the cost that matters — unlikely at 34 ms, but the grid only
+ * gets bigger from here.
  */
 type StaticWorld = {
 	version: string;
@@ -836,56 +863,97 @@ type StaticWorld = {
 };
 
 let staticWorldCache: StaticWorld | null = null;
-
-// No terrain_type id is ever this (ids are a small `serial`, starting at 1) — the sentinel that
-// makes a hole in the grid detectable in a typed array, which can't hold `undefined` the way the
-// old array of row objects could leave a gap in.
-const NO_TERRAIN = 0xffff;
+// The gap a value-only memo leaves open: `staticWorldCache` is only written *after* generation and
+// the two catalog reads finish, so any call that arrives while an earlier one is still in flight
+// sees the cache exactly as empty as the first call did, and would otherwise redo the same work.
+// That gap is exactly how `readWorldStatic` used to get called twice for one `/api/world/static`
+// request — once directly by `loadWorldStaticFor` to check the version, once again inside
+// `readWorldStatic` itself — each a fresh entry into this function with nothing to stop both from
+// racing past the cache check before either had set it. Fixed on both ends: `loadWorldStaticFor`
+// below no longer makes that redundant first call, and this in-flight promise makes the memo
+// single-flight regardless of who calls it or how many times — a second caller during a cold fill
+// (concurrent requests hitting the same warming instance, not just one function calling in twice)
+// now awaits the *same* computation instead of starting a second one.
+let staticWorldLoading: Promise<StaticWorld> | null = null;
 
 async function loadStaticWorld(tx: Tx): Promise<StaticWorld> {
-	const [cfg] = await tx.select({ worldVersion: gameConfig.worldVersion }).from(gameConfig);
+	const [cfg] = await tx
+		.select({ worldVersion: gameConfig.worldVersion, terrainHash: gameConfig.terrainHash })
+		.from(gameConfig);
 	if (!cfg || cfg.worldVersion === null)
 		throw new Error('no world_version in game_config — run `npm run seed` against this database');
 	if (staticWorldCache?.version === cfg.worldVersion) return staticWorldCache;
+	if (staticWorldLoading) return staticWorldLoading;
 
-	const rows = await tx.select().from(tile);
-	// One pass over the rows the DB read already paid for builds both compact structures; the rows
-	// themselves are never kept past this function, so they're eligible for GC the moment it returns.
-	const terrainIds = new Uint16Array(GRID_SIZE * GRID_SIZE).fill(NO_TERRAIN);
-	const capacityByType = new Map<number, number | null>();
-	for (const t of rows) {
-		terrainIds[t.y * GRID_SIZE + t.x] = t.terrainTypeId;
-		if (!capacityByType.has(t.terrainTypeId)) capacityByType.set(t.terrainTypeId, t.quantity);
-	}
-	// A hole is a corrupt world, not a game rule — the same reading `readWorld` gives one elsewhere.
-	// Checked here, once, rather than by every reader of `terrainIds` below.
-	for (let i = 0; i < terrainIds.length; i++) {
-		if (terrainIds[i] !== NO_TERRAIN) continue;
-		throw new Error(
-			rows.length === 0
-				? 'no tile rows — the grid is unseeded; run `npm run seed` against this database'
-				: `tile grid has a hole at (${i % GRID_SIZE}, ${Math.floor(i / GRID_SIZE)})`
-		);
-	}
+	staticWorldLoading = (async () => {
+		try {
+			if (!cfg.terrainHash)
+				throw new Error(
+					'no terrain_hash in game_config — run `npm run seed` against this database'
+				);
+			// The load-bearing check: what the generator produces right now, proven equal to what the
+			// seed generated and wrote catalogs and start positions against. A mismatch means
+			// worldgen.ts changed since `npm run seed` last ran — serving the newly generated grid
+			// would show a world that disagrees with every `tile_stock`, `building` and `settlement`
+			// row already on it, so this throws instead of guessing, the same shape as every other
+			// missing/stale-catalog throw in this file.
+			if (terrainDataHash(GRID_SIZE, terrainCharAt) !== cfg.terrainHash)
+				throw new Error(
+					'generated terrain does not match the seeded world (terrain_hash mismatch in ' +
+						'game_config) — worldgen.ts has changed since `npm run seed` last ran; run it again'
+				);
 
-	const depositRows = await tx
-		.select({
-			x: tile.x,
-			y: tile.y,
-			resourceId: resource.id,
-			unitsPerHour: resource.unitsPerHour,
-			skillId: resource.skillId,
-			requiresBuildingTypeId: resource.requiresBuildingTypeId,
-			capacity: tile.quantity,
-			regrowSeconds: terrainType.regrowSeconds
-		})
-		.from(tile)
-		.innerJoin(terrainType, eq(tile.terrainTypeId, terrainType.id))
-		.innerJoin(resource, eq(terrainType.yieldsResourceId, resource.id));
-	const deposits = new Map(depositRows.map((r) => [r.y * GRID_SIZE + r.x, r]));
+			const terrainTypes = await tx.select().from(terrainType);
+			const resources = await tx.select().from(resource);
+			const byChar = new Map(terrainTypes.map((t) => [t.char, t]));
+			const resourceById = new Map(resources.map((r) => [r.id, r]));
 
-	staticWorldCache = { version: cfg.worldVersion, terrainIds, capacityByType, deposits };
-	return staticWorldCache;
+			const terrainIds = new Uint16Array(GRID_SIZE * GRID_SIZE);
+			const deposits = new Map<number, TileYield>();
+			for (let y = 0; y < GRID_SIZE; y++)
+				for (let x = 0; x < GRID_SIZE; x++) {
+					const char = terrainCharAt(x, y);
+					const t = byChar.get(char);
+					// A char the generator produces but the catalog carries no row for — an unseeded or
+					// stale terrain_type table, not a game rule (the terrain-hash check above already
+					// catches a generator that disagrees with the seed; this catches a seed that never
+					// ran at all).
+					if (!t)
+						throw new Error(
+							`unknown terrain char '${char}' at (${x}, ${y}) — run \`npm run seed\` against this database`
+						);
+					const i = y * GRID_SIZE + x;
+					terrainIds[i] = t.id;
+					if (t.yieldsResourceId !== null) {
+						const r = resourceById.get(t.yieldsResourceId);
+						if (r)
+							deposits.set(i, {
+								resourceId: r.id,
+								unitsPerHour: r.unitsPerHour,
+								skillId: r.skillId,
+								requiresBuildingTypeId: r.requiresBuildingTypeId,
+								capacity: t.capacity,
+								regrowSeconds: t.regrowSeconds
+							});
+					}
+				}
+			const capacityByType = new Map(terrainTypes.map((t) => [t.id, t.capacity]));
+
+			const world: StaticWorld = {
+				version: cfg.worldVersion!,
+				terrainIds,
+				capacityByType,
+				deposits
+			};
+			staticWorldCache = world;
+			return world;
+		} finally {
+			// Cleared whether this attempt succeeded or threw — a failed fill (a stale seed, a missing
+			// catalog) must not wedge every later call into awaiting a promise that already rejected.
+			staticWorldLoading = null;
+		}
+	})();
+	return staticWorldLoading;
 }
 
 /** What each tile yields, how fast, and how much of it there is, keyed row-major. */
@@ -2055,10 +2123,10 @@ export async function restyleRoad(
 /** The world as stored, plus the DB's own `now` — the only clock anything trusts. */
 /**
  * The never-changing half of the wire payload — terrain, catalogs, costs and recipes, everything
- * that only moves when `npm run seed` runs. This is the half `readWorld`'s own long-standing note
- * named as the egress problem: the whole tile grid and its join to resources, 28,583 rows a read.
- * Both now come from the shared `loadStaticWorld` memo instead, so a cache hit costs one tiny
- * `game_config` read rather than 1.3 MB.
+ * that only moves when `npm run seed` runs. This is the half `loadStaticWorld`'s own comment names
+ * as the egress problem: what used to be a 5M-row database read is now generated, hash-verified
+ * against `game_config`, and held behind the shared memo — a cache hit here costs one tiny
+ * `game_config` read, not 238 MB.
  *
  * Two callers: folded into `readWorld` below for the mutation endpoints, which still return one
  * composed `WorldPayload` the client fully replaces its state with — and served standalone by
@@ -2066,9 +2134,10 @@ export async function restyleRoad(
  * fleet of lambda instances share one answer instead of each warming its own memo.
  */
 export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
-	// `terrainIds` is already dense and hole-checked by `loadStaticWorld` — one source of that
-	// invariant rather than a second copy of the check here. `Array.from` turns the compact typed
-	// array back into the plain `number[]` the wire type promises (JSON has no typed-array notion).
+	// `terrainIds` is already dense and terrain-hash-verified by `loadStaticWorld` — one source of
+	// that invariant rather than a second copy of the check here. `Array.from` turns the compact
+	// typed array back into the plain `number[]` the wire type promises (JSON has no typed-array
+	// notion).
 	const { terrainIds, capacityByType } = await loadStaticWorld(tx);
 	// Ordered, because the client picks a default from this list by position.
 	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
@@ -2077,7 +2146,7 @@ export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
 	const recipes = await tx.select().from(recipeInput);
 	// Terrain and resources are global catalogs, unfiltered by player — same split as
 	// buildingTypes. The ground is the world's, not yours. Small tables, so read fresh rather than
-	// folded into the memo — the memo exists for the two reads that are actually large.
+	// folded into the memo — the memo exists for the grid, which is the one thing here that's large.
 	const terrainTypes = await tx.select().from(terrainType);
 	const resources = await tx.select().from(resource);
 	// Professions the School offers — a global catalog like building types, ordered so the Train
