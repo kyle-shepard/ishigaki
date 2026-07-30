@@ -211,6 +211,13 @@
       "when": 1785383653935,
       "tag": "0029_open_sumo",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1785422917347,
+      "tag": "0030_amusing_scream",
+      "breakpoints": true
     }
   ]
 }

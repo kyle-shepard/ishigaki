@@ -215,12 +215,23 @@ await db.execute(
 // The tuning data behind the reach's growth (decision 8: LoL-style discrete steps, not a tile per
 // head). Content, not code (VISION #10): retuning a threshold or its radius is an UPDATE against a
 // live world, same shape as building_cost below.
+//
+// Extended to city scale for the 1024×1024 map: the old ladder topped out at radius 24 (a hamlet
+// with fields, 1,810 tiles). This one keeps every rung below unchanged and adds five more, ending at
+// radius 95 — ~190 tiles / ~3.8 km across, ~28,000 tiles of sphere of influence, in the spirit of
+// Lands of Lords' city view (hundreds of buildings on a street grid). MATURE_REACH_RADIUS (world.ts)
+// must equal the top rung; the check below enforces it.
 const MILESTONES = [
 	{ population: 3, radius: 6 },
 	{ population: 8, radius: 9 },
 	{ population: 15, radius: 13 },
 	{ population: 25, radius: 18 },
-	{ population: 40, radius: 24 }
+	{ population: 40, radius: 24 },
+	{ population: 70, radius: 32 },
+	{ population: 120, radius: 42 },
+	{ population: 200, radius: 55 },
+	{ population: 350, radius: 72 },
+	{ population: 600, radius: 95 }
 ];
 // The first rung has to be the same circle `findStarts` already searched the generated map for
 // (world.ts's START_REACH_RADIUS, consumed there and here) — a mismatch would mean the map's own
@@ -875,14 +886,16 @@ for (const name of Object.keys(REQUIRES)) {
 // reinserting the grid would take every player's harvested-forest record with it.
 //
 // Chunked, because one statement for the whole grid stopped fitting: `tile` has 4 columns
-// (x, y, terrainTypeId, quantity), so one INSERT for all of them at 128×128 binds
-// 16,384 × 4 = 65,536 parameters against Postgres's limit of 65,535 — over by exactly one row's
-// worth. 4,000 rows a batch keeps every batch to 16,000 params, comfortably clear, and the last
+// (x, y, terrainTypeId, quantity), so one INSERT for all of them binds `rows × 4` parameters
+// against Postgres's limit of 65,535. 65,535 / 4 = 16,383.75, so 16,000 rows a batch is the
+// largest round number that stays clear (16,000 × 4 = 64,000 params) — up from the 4,000 this
+// was tuned at for the 256×256 map. At 1,048,576 tiles (1024×1024) that keeps this a sane 66
+// batches instead of the 262 that leaving the old 4,000 unchanged would have needed. The last
 // batch is just whatever remains.
 function* chunks<T>(items: T[], size: number): Generator<T[]> {
 	for (let i = 0; i < items.length; i += size) yield items.slice(i, i + size);
 }
-for (const batch of chunks(tiles, 4000)) {
+for (const batch of chunks(tiles, 16000)) {
 	await db
 		.insert(tile)
 		.values(batch)

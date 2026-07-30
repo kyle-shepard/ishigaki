@@ -542,13 +542,21 @@
 	const buildingTypeById = $derived(new Map(world?.buildingTypes.map((t) => [t.id, t]) ?? []));
 	// The art carries what's on a tile for everyone who can see it. The label is the same
 	// information for everyone who can't — so it names the building too, not just the ground.
+	// How much a tile has left. Absent from `drawnTiles` means nobody here has touched it, so it
+	// still holds its terrain type's full capacity; a type with no capacity never runs down and has
+	// nothing to report. The payload went sparse when the dense version reached 4.6 MB a heartbeat at
+	// 1024×1024 — see WorldLive.drawnTiles — and this is the reconstruction that buys that back.
+	const drawnAt = $derived(new Map(world?.drawnTiles.map((d) => [d.i, d.quantity]) ?? []));
+	const quantityAt = (i: number, capacity: number | null) =>
+		capacity === null ? null : (drawnAt.get(i) ?? capacity);
+
 	function tileLabel(i: number, x: number, y: number) {
 		const t = terrainAt(i);
 		if (!t) return `Tile ${x}, ${y}`;
 		// Floored, so a tile reading "1 of 25" always has a whole unit in it and one reading
 		// "0 of 25" really is stripped.
-		const left = world!.tileQuantity[i];
 		const full = t.capacity;
+		const left = quantityAt(i, full);
 		const yield_ = t.yieldsResourceId
 			? ` — yields ${resourceName.get(t.yieldsResourceId)}` +
 				(left !== null && full !== null ? ` (${Math.floor(left)} of ${full} left)` : '')
@@ -1243,8 +1251,8 @@
 				{selTerrain?.displayName ?? 'Unknown ground'}
 				{#if selYields !== null}
 					— yields {resourceName.get(selYields)}
-					{#if selTerrain && world.tileQuantity[selIndex] !== null && selTerrain.capacity !== null}
-						({Math.floor(world.tileQuantity[selIndex]!)} of {selTerrain.capacity} left)
+					{#if selTerrain && selTerrain.capacity !== null}
+						({Math.floor(quantityAt(selIndex, selTerrain.capacity)!)} of {selTerrain.capacity} left)
 					{/if}
 				{/if}
 			</p>

@@ -18,22 +18,48 @@ const PAINT: Record<string, string> = {
 // Plain when piped or when NO_COLOR is set — 2304 escape sequences are unreadable in a file.
 const colour = !!process.stdout.isTTY && !process.env.NO_COLOR;
 const rows = terrainMap();
+
+// Downsampled for the terminal once the map genuinely stopped fitting one screen — printing the
+// world at native resolution was fine at 256×256 (a scrollback, but a readable one) and stopped
+// being fine at 1024×1024, where the grid itself no longer prints as a *shape* anybody's eye can
+// take in at once. DISPLAY_MAX is a terminal-sized cap, not a grid one: nearest-neighbour picks one
+// tile in every `stride`, which is a fair reading of the *coastline and ranges* — the features this
+// script exists to eyeball — even though it necessarily drops individual tiles (a single-tile Stone
+// outcrop can fall between samples). The census below is never downsampled — it walks the full
+// `rows` data regardless of `stride`, so what gets tuned against is always the real distribution,
+// only what gets *drawn* is thinned.
+const DISPLAY_MAX = 200;
+const stride = Math.max(1, Math.ceil(rows.length / DISPLAY_MAX));
+const sampledSize = Math.ceil(rows.length / stride);
+
 // One mark per opening `findStarts` found — base-36 so a two-digit start count still fits one
 // character (0-9 then a-z), closest-to-the-map's-centre first, so the numbering itself shows the
 // search order. Only the hamlet tile is marked, not its whole block (house2/barn/market): with
 // potentially dozens of openings on a big map, marking every tile of every start would bury the
-// terrain the census is about under its own overlay.
-const marks = new Map(STARTS.map((s, i) => [`${s.hamletX},${s.hamletY}`, i.toString(36)]));
-rows.forEach((row, y) =>
-	console.log(
-		[...row]
-			.map((c, x) => {
-				const mark = marks.get(`${x},${y}`);
-				return colour ? `${PAINT[c] ?? ''}${mark ?? c}\x1b[0m` : (mark ?? c);
-			})
-			.join('')
-	)
+// terrain the census is about under its own overlay. Keyed by *sampled* coordinate — the nearest
+// pixel this downsampling actually draws — so a start still shows up even when its exact tile isn't
+// one of the ones `stride` happens to land on.
+const marks = new Map(
+	STARTS.map((s, i) => [
+		`${Math.round(s.hamletX / stride)},${Math.round(s.hamletY / stride)}`,
+		i.toString(36)
+	])
 );
+for (let sy = 0; sy < sampledSize; sy++) {
+	const y = Math.min(rows.length - 1, sy * stride);
+	let line = '';
+	for (let sx = 0; sx < sampledSize; sx++) {
+		const x = Math.min(rows.length - 1, sx * stride);
+		const c = rows[y][x];
+		const mark = marks.get(`${sx},${sy}`);
+		line += colour ? `${PAINT[c] ?? ''}${mark ?? c}\x1b[0m` : (mark ?? c);
+	}
+	console.log(line);
+}
+if (stride > 1)
+	console.log(
+		`\n(downsampled ${stride}:1 for the terminal, nearest-neighbour — the census below is exact, over the full ${rows.length}×${rows.length} grid)`
+	);
 
 const total = rows.length * rows.length;
 const census = [...rows.join('')].reduce<Record<string, number>>(

@@ -94,6 +94,18 @@ async function newRealm() {
 	return w;
 }
 
+// What a tile has left, rebuilt the way the client rebuilds it: `drawnTiles` carries only the
+// tiles somebody has actually cut into, and anything absent is still at its terrain type's full
+// capacity. The payload went sparse when the dense array reached 4.6 MB a heartbeat at 1024×1024.
+const quantityAt = (
+	body: { drawnTiles: { i: number; quantity: number }[] },
+	i: number,
+	terrainName: string
+) => {
+	const drawn = body.drawnTiles.find((d) => d.i === i);
+	return drawn ? drawn.quantity : terrainCapacity(terrainName);
+};
+
 // Orders and assignments take world coordinates straight through now — there's no authored
 // frame to convert out of.
 const order = (x: number, y: number, buildingTypeId: number, crewSize?: number) =>
@@ -567,17 +579,20 @@ const terrainCapacity = (name: string) =>
 	map.body.terrainTypes.find((t: { displayName: string }) => t.displayName === name).capacity;
 check(
 	'an untouched forest tile reports full',
-	[map.body.tileQuantity[at(forest.x, forest.y)], terrainCapacity('Forest')],
+	[quantityAt(map.body, at(forest.x, forest.y), 'Forest'), terrainCapacity('Forest')],
 	[terrainCapacity('Forest'), terrainCapacity('Forest')]
 );
 check(
 	'a stone outcrop never runs down, so it counts nothing',
-	[map.body.tileQuantity[at(stoneOutcrop.x, stoneOutcrop.y)], terrainCapacity('Stone outcrop')],
+	[
+		quantityAt(map.body, at(stoneOutcrop.x, stoneOutcrop.y), 'Stone outcrop'),
+		terrainCapacity('Stone outcrop')
+	],
 	[null, null]
 );
 check(
 	'ground that yields nothing counts nothing',
-	[map.body.tileQuantity[at(mountain.x, mountain.y)], terrainCapacity('Mountain')],
+	[quantityAt(map.body, at(mountain.x, mountain.y), 'Mountain'), terrainCapacity('Mountain')],
 	[null, null]
 );
 

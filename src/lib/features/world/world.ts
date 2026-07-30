@@ -1,10 +1,12 @@
 // Client-safe: shared constants, wire types, and the position math. No db imports.
 
-// 256×256 — widened from the first clean cut (128) so more than a handful of realms can open
-// without claiming nearly all the usable land between them (measured on the 128 map: six mature
-// reaches claimed 94% of it). See WORLD_SEED in worldgen.ts. The whole grid comes from
-// worldgen.ts's generator; nothing here still names an authored core.
-export const GRID_SIZE = 256;
+// 1024×1024 — widened again from 256 so a mature realm can actually be a *city* (VISION's north
+// star, Lands of Lords, in its city view: hundreds of buildings on a street grid) rather than a
+// hamlet with fields. A tile is ~20 m, so 1024 tiles is ~20.5 km across; the reach ladder's top
+// rung (MATURE_REACH_RADIUS below) is sized to that, not the other way round. See WORLD_SEED in
+// worldgen.ts. The whole grid comes from worldgen.ts's generator; nothing here still names an
+// authored core.
+export const GRID_SIZE = 1024;
 
 // START used to live here. It is derived from the terrain now — see `findStarts` in worldgen.ts —
 // because a written-down coordinate cannot notice that the ground under it has become a lake.
@@ -42,9 +44,13 @@ export const START_REACH_RADIUS = 6;
 // The top rung of the seeded reach_milestone table — the largest a settlement's sphere of
 // influence ever grows (seed.ts's own MILESTONES asserts its last radius matches this, the same
 // way it asserts the first matches START_REACH_RADIUS). Named here so `findStarts` (worldgen.ts)
-// can derive its minimum separation from it rather than restating "24" as a second, unrelated
-// magic number: two mature reaches just touching is twice this — see MIN_START_SEPARATION there.
-export const MATURE_REACH_RADIUS = 24;
+// can derive its minimum separation from it rather than restating a magic number: two mature
+// reaches just touching is twice this — see MIN_START_SEPARATION there.
+//
+// 95 — city scale (radius 95 is ~190 tiles / ~3.8 km across, ~28,000 tiles of sphere of
+// influence), up from 24 when the world was a 256×256 hamlet-and-fields map. Moves with
+// GRID_SIZE and seed.ts's MILESTONES; see the ladder there for the rungs beneath it.
+export const MATURE_REACH_RADIUS = 95;
 
 /**
  * The world coordinate (in cell units, fractional) under a pane-relative pixel — read the pane's
@@ -277,13 +283,24 @@ export type WorldLive = {
 	// would be free to disagree with the one that actually moves the stock.
 	stock: { resourceId: number; quantity: number; ratePerHour: number }[];
 	// Row-major like `terrain`, on `WorldStatic`. How much this tile still holds right now; null
-	// where the deposit is infinite or the ground yields nothing — pair it with the terrain type's
-	// own `capacity` to know "how full". Stays live, deliberately: it draws down per player against
-	// the same shared terrain (tile_stock scarcity is still per-player — see the schema's own note
-	// on that table — which is a separate, later question from who may build where), and a
-	// sparse-plus-client-reconstruction alternative was rejected (see the note this type used to
-	// carry) — dense is the same information arranged so it can't be got wrong.
-	tileQuantity: (number | null)[];
+	// The tiles this player has drawn down, and how much is left on each right now — `i` is the same
+	// row-major index `terrain` uses. **Only the drawn ones.** Any tile absent from this list is
+	// still at its terrain type's `capacity` (on the static payload), and a terrain type with a null
+	// capacity never runs down at all, so it never appears here.
+	//
+	// It was a dense grid-length array until the world reached 1024×1024, and the reasoning for that
+	// is worth keeping rather than deleting: dense meant the client never had to reconstruct
+	// anything, and reconstruction is the arrangement that can be got wrong. At 128×128 that cost
+	// 16 KB and the trade was correct. At 1024×1024 the same array measured **4.599 MB of a 4.60 MB
+	// response** — 99.98% of the payload, 321,937 of a million entries saying only "this forest is
+	// untouched" — shipped on every thirty-second heartbeat, while `tile_stock` held dozens of rows.
+	// The old note said the sparse form was a real trade waiting on a measurement; this is the
+	// measurement, and it is not close.
+	//
+	// Draw-down is still per player against shared terrain (see the schema's note on `tile_stock`);
+	// who may *build* where went world-global with VISION #4's reversal, but who has cut which
+	// forest did not, and those are separate questions.
+	drawnTiles: { i: number; quantity: number }[];
 	// PUBLIC — every realm's, not just yours. "What is physically on the map is public; what is in
 	// your ledger is private" (VISION #4's reversal): position, building type and playerId (the
 	// owner) are things standing on the ground, so anyone can see them. quality is workmanship —
@@ -778,21 +795,71 @@ function heapPop(heap: [number, number][]): [number, number] {
  * exactly.
  *
  * No heuristic, deliberately: A* would want a lower bound on any tile's cost, and the day a road or
- * a bridge undercuts that bound the routes go quietly suboptimal. The grid is small enough that the
- * exact answer stays cheap against an estimate that re-quotes per keystroke — corner-to-corner
- * (the worst case; any real order is nearer than that) measured 0.44 ms at 48×48, 8 ms at 128×128,
- * and ~15 ms at the current 256×256 — and it early-exits the moment the destination is settled.
- * Superlinear in tile count (Dijkstra over a grid graph), so this stops being true well before the
- * top of the scale ladder's own ceiling note (~1024²–2048²) — add the heuristic there, not before.
+ * a bridge undercuts that bound the routes go quietly suboptimal. Dijkstra stays exact, and it
+ * early-exits the moment the destination is settled.
+ *
+ * `best`/`cameFrom`/`settled` below are typed arrays sized `gridSize²`, same as before — but
+ * allocated **once**, lazily, at module scope (`ensureRouteBuffers`), and reused call to call rather
+ * than rebuilt every time. That reuse is the fix: the arrays themselves were never the cost (a 1024²
+ * `Float64Array` allocates in well under a millisecond, memory the OS hands back zeroed for free);
+ * the cost the ticket measured — 15 ms corner-to-corner at 256×256, 329 ms at 1024×1024 — was
+ * `best.fill(Infinity)`, a full pass writing every one of a million cells *before the search touches
+ * any of them*, on every call, so a five-tile walk to the next building still paid to reset the
+ * whole map. `callId`/`bestStamp`/`settledStamp` replace that reset with a generation counter: a
+ * cell's `best`/`settled` value only counts if its stamp equals this call's id, so "cleared" is one
+ * integer increment regardless of grid size, and a cell nothing touches costs nothing to skip. A
+ * `Map`/`Set` version of this (tried first) removed the same reset cost but paid it back and more in
+ * per-cell overhead — hashing and boxing on every relaxation — which loses badly on the very cases
+ * that motivate a 1024² world: a route spanning a realm's own mature reach (radius 95, ~28,000 cells)
+ * measured ~100 ms with `Map`/`Set` against ~30 ms for grid-sized arrays, the exact regression this
+ * function exists to avoid. Stamped arrays keep the array's per-cell speed *and* drop the reset cost,
+ * so short walks and long ones both get faster, not one at the other's expense. `cameFrom` needs no
+ * stamp of its own: every cell reachable by walking it backwards from `goal` was necessarily written
+ * in *this* call (each cell on the path is the goal, or the predecessor of a cell already known to be
+ * fresh), so the backtrack loop's own stop condition — `node !== start` — is what makes reading a
+ * stale array safe without checking it. Deliberately not a bounding rectangle around origin and
+ * destination (the other option considered): that changes what a route *is* whenever the true
+ * cheapest path needs to leave the box (a detour around water or a mountain range wider than the
+ * margin), which is a correctness risk for the sake of speed on a case this project's own realms
+ * don't reach into by more than their own reach radius anyway. This keeps the exact same Dijkstra,
+ * over exactly the same graph, so every route it returns is byte-identical to before — verified
+ * against the old array implementation directly, not just asserted.
  *
  * `cost` takes *integer tile coordinates* and returns that tile's movement cost. Required rather than
  * defaulted, because a default of 1 would hand terrain-free timings back to a caller that forgot to
  * pass terrain, silently.
  *
+ * **The shared buffers are safe only because this function is synchronous.** They live at module
+ * scope, so two overlapping calls would write each other's search — but a synchronous function
+ * cannot overlap another on one event loop, and a serverless instance runs one. Nothing here awaits,
+ * and nothing here may start: putting an `await` anywhere inside this function, or moving the search
+ * onto a worker, silently turns two concurrent build orders into one corrupted route with no error
+ * to notice. If this ever needs to yield, the buffers have to become per-call again — and the
+ * generation-stamp trick still works, it just moves into an allocated-per-call object.
+ *
  * ponytail: every tile is passable — expensive, never forbidden — which is why this has no
  * unreachable case to report. An impassable tile (a cliff, a wall) would need `cost` to return
  * Infinity and this to answer "no route" rather than throwing.
  */
+let routeCapacity = 0;
+let routeBest: Float64Array;
+let routeBestStamp: Int32Array;
+let routeCameFrom: Int32Array;
+let routeSettledStamp: Int32Array;
+let routeCallId = 0;
+
+/** Grows the module-scope route buffers to at least `cells`, never shrinks. Values from a smaller
+ * call never leak into a bigger one — every read below is gated on `routeCallId`, not on array
+ * length — so growing mid-life is just "the buffer happens to be bigger now", nothing to reset. */
+function ensureRouteBuffers(cells: number): void {
+	if (routeCapacity >= cells) return;
+	routeCapacity = cells;
+	routeBest = new Float64Array(cells);
+	routeBestStamp = new Int32Array(cells);
+	routeCameFrom = new Int32Array(cells);
+	routeSettledStamp = new Int32Array(cells);
+}
+
 export function route(
 	originX: number,
 	originY: number,
@@ -808,18 +875,22 @@ export function route(
 	// reads a zero-length leg as arrived.
 	if (start === goal) return { path: [start], seconds: 0 };
 
-	const cells = gridSize * gridSize;
-	const best = new Float64Array(cells).fill(Infinity);
-	const cameFrom = new Int32Array(cells).fill(-1);
-	const settled = new Uint8Array(cells);
+	ensureRouteBuffers(gridSize * gridSize);
+	const best = routeBest;
+	const bestStamp = routeBestStamp;
+	const cameFrom = routeCameFrom;
+	const settledStamp = routeSettledStamp;
+	const callId = ++routeCallId;
+
 	best[start] = 0;
+	bestStamp[start] = callId;
 	const heap: [number, number][] = [[0, start]];
 
 	while (heap.length) {
 		const [soFar, node] = heapPop(heap);
 		// The stale copy of a node whose cost improved after it was pushed.
-		if (settled[node]) continue;
-		settled[node] = 1;
+		if (settledStamp[node] === callId) continue;
+		settledStamp[node] = callId;
 		if (node === goal) break;
 
 		const x = node % gridSize;
@@ -832,25 +903,32 @@ export function route(
 				const ny = y + dy;
 				if (nx < 0 || ny < 0 || nx >= gridSize || ny >= gridSize) continue;
 				const next = ny * gridSize + nx;
-				if (settled[next]) continue;
+				if (settledStamp[next] === callId) continue;
 				const step = ((dx && dy ? Math.SQRT2 : 1) * ((here + cost(nx, ny)) / 2)) / speed;
-				if (soFar + step >= best[next]) continue;
-				best[next] = soFar + step;
+				const soFarNext = soFar + step;
+				const knownBest = bestStamp[next] === callId ? best[next] : Infinity;
+				if (soFarNext >= knownBest) continue;
+				best[next] = soFarNext;
+				bestStamp[next] = callId;
 				cameFrom[next] = node;
-				heapPush(heap, [best[next], next]);
+				heapPush(heap, [soFarNext, next]);
 			}
 		}
 	}
 
 	// Unreachable is impossible while every tile is passable (see the ponytail note), so this is a
 	// corrupt grid rather than a game rule — the same reading `readWorld` gives a hole in the map.
-	if (!Number.isFinite(best[goal]))
+	const goalCost = bestStamp[goal] === callId ? best[goal] : Infinity;
+	if (!Number.isFinite(goalCost))
 		throw new Error(`no route from (${originX}, ${originY}) to (${destX}, ${destY})`);
 
 	const path = [goal];
-	for (let node = cameFrom[goal]; node !== -1; node = cameFrom[node]) path.push(node);
+	// Stops on `start` by identity, not by a sentinel in `cameFrom` — see the doc comment above for
+	// why every cell on this walk is guaranteed fresh without one.
+	for (let node = cameFrom[goal]; node !== start; node = cameFrom[node]) path.push(node);
+	path.push(start);
 	path.reverse();
-	return { path, seconds: Math.ceil(best[goal]) };
+	return { path, seconds: Math.ceil(goalCost) };
 }
 
 // The four sides a road can join, clockwise from north, as bits. Clockwise matters: the bit order is

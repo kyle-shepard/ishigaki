@@ -417,8 +417,13 @@ function generator(seed: number): (x: number, y: number) => string {
 	// 0.4%: the same seed, a flatter, blander world, and every automated bound still green because
 	// they were all upper bounds. The lower bounds in worldgen.test.ts exist so the next size change
 	// fails loudly instead of quietly flattening the map. Re-tune against `npm run map`'s census.
-	const HILLS_T = 0.7;
-	const MOUNTAIN_T = 0.8;
+	//
+	// Retuned again for 256→1024 (VISION's city-scale epic): 0.7/0.8 unchanged already landed close
+	// (mountain 8.3%, hills 5.0%, stone 1.2% — every floor still comfortably cleared), but a touch
+	// low against the 256×256 census this is meant to still read like (mountain ~9%, hills ~6%). Cut
+	// down to 0.68/0.79 to land mountain at 9% and hills at 6% almost exactly; census below.
+	const HILLS_T = 0.68;
+	const MOUNTAIN_T = 0.79;
 	// A tile over this many upstream tiles' worth of flow is a river. There's no natural absolute
 	// scale for accumulation — it depends on how the drainage tree happens to branch — so this is
 	// tuned against the printed map rather than derived, and tuned high: at 40 (this constant's
@@ -432,9 +437,15 @@ function generator(seed: number): (x: number, y: number) => string {
 	// any GRID_SIZE (`field`'s wavelength is in absolute tiles, not a fraction of the grid), but a
 	// bigger canvas gives real drainage basins more room to actually grow before they hit the
 	// map's edge or another basin — 1800 carried over unchanged left the 90th-percentile river
-	// width at 3 tiles (worldgen.test.ts's own budget is 2). Re-tune by eye against `npm run map`
-	// again the next time GRID_SIZE moves.
-	const RIVER_T = 4500;
+	// width at 3 tiles (worldgen.test.ts's own budget is 2).
+	//
+	// Retuned again to 60,000 for 1024×1024 — the jump is much steeper than 128→256's (2.5×) because
+	// this is a 4× *linear* / 16× *area* change rather than 2×/4×, and drainage basin size scales with
+	// the catchment area a basin can actually draw from, not with the map's edge length. 4,500 carried
+	// over unchanged reproduced the exact 128→256 failure (90th-percentile width 3, a 25-tile straight
+	// run) for the same reason: far more upstream tiles now feed the same channel before it reaches
+	// the sea. Re-tune by eye against `npm run map` again the next time GRID_SIZE moves.
+	const RIVER_T = 60000;
 
 	// The ridge only piles onto land that already reads as high ground — gated smoothly between
 	// RIDGE_GATE_LOW and RIDGE_GATE_HIGH — rather than scaling every tile by however "tall" it is.
@@ -513,6 +524,48 @@ function generator(seed: number): (x: number, y: number) => string {
 			const i = idx(x, y);
 			isWater[i] = elevation[i] < WATER_T || acc[i] > RIVER_T ? 1 : 0;
 		}
+
+	// A tile can read as Water purely from the sea-band elevation cut without ever being downhill of
+	// the sea or of a river. A river tile can't do this — priorityFlood's own doc comment is that
+	// accumulation is monotonic along a D4 chain rooted at `outlets`, so a river tile's whole path to
+	// the sea is water too — but the raw `elevation[i] < WATER_T` cut has no such guarantee: it's a
+	// per-tile threshold with no notion of what's between here and open water. `SEA_BAND` scales with
+	// GRID_SIZE (`* 0.18`) so the coastal shelf stays a constant *fraction* of the map, but the noise
+	// driving `elevation` does not — its wavelength is fixed in absolute tiles (`fbm(seed, 4, 40)`) —
+	// so a wide enough band gives that noise several full wavelengths of room to fold the shelf in on
+	// itself and seal off a lagoon that never actually reaches open water. Invisible at 256×256, where
+	// the band (46 tiles) was narrower than the noise's own wavelength; real at 1024×1024, where the
+	// band (184 tiles) is four-plus wavelengths wide.
+	//
+	// Pruned the same way the hydrology above already reasons about reachability, rather than by
+	// shrinking `SEA_BAND` (tried first — it also shrinks total water share, which is the fraction
+	// this constant's whole job is to hold steady): flood outward from the same sea outlets,
+	// 4-connected, and dry out any Water tile never reached. A pocket nothing can walk to from the sea
+	// was never really *part of* the sea — this is worldgen.test.ts's own "one connected sea" and
+	// "every Water tile connects to the sea" invariants, enforced here at generation time instead of
+	// left as a coin flip a wide coastal band can lose. A dried tile falls through to the ordinary
+	// terrain classification below on its own (real, undepressed-for-classification) elevation, same
+	// as any other tile — a sealed-off basin reads as low, damp ground, not a special case.
+	const reachedSea = new Uint8Array(n);
+	{
+		const stack = outlets.filter((i) => isWater[i]);
+		for (const i of stack) reachedSea[i] = 1;
+		while (stack.length) {
+			const i = stack.pop()!;
+			const x = i % GRID_SIZE;
+			const y = (i / GRID_SIZE) | 0;
+			for (const [dx, dy] of NEIGHBORS4) {
+				const nx = x + dx;
+				const ny = y + dy;
+				if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
+				const j = ny * GRID_SIZE + nx;
+				if (!isWater[j] || reachedSea[j]) continue;
+				reachedSea[j] = 1;
+				stack.push(j);
+			}
+		}
+	}
+	for (let i = 0; i < n; i++) if (isWater[i] && !reachedSea[i]) isWater[i] = 0;
 
 	// Moisture's water-proximity term: a breadth-first distance transform from every Water tile.
 	// Eight-connected on purpose, unlike the hydrology above — this is a soft "how close is damp

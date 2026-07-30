@@ -798,34 +798,76 @@ type TileYield = {
 /**
  * The two full-grid reads this project's egress problem was measured against (see the history in
  * CLAUDE.md and on readWorld below): the whole `tile` table, and its join to `resource` via
- * `terrainType` — 28,583 rows a read, ~1.3 MB of Neon egress, against static content that only
- * ever changes when `npm run seed` runs. Held in process behind the content version the seed
- * writes to `game_config`: the same version means the same rows, so every call after the first is
- * one tiny single-row read instead of the two heavy ones.
+ * `terrainType` — 28,583 rows a read at the 128×128 map this was first measured against, ~1.3 MB of
+ * Neon egress, against static content that only ever changes when `npm run seed` runs. Held in
+ * process behind the content version the seed writes to `game_config`: the same version means the
+ * same rows, so every call after the first is one tiny single-row read instead of the two heavy ones.
  *
  * Shared by every caller that used to run these queries itself — `tileYields`, `loadGrid`, and
  * `readWorldStatic` — so a build order's occupancy check and an estimate's re-quote stop paying
- * 16,384 rows too, the same fix `readWorld`'s own read gets.
+ * the full grid too, the same fix `readWorld`'s own read gets.
  *
- * ponytail: a per-lambda-instance memo — module state, not a shared cache. Every cold spin-up
- * warms it again (one ~1.3 MB DB read), which is exactly what `/api/world/static`'s year-long,
- * immutable CDN response exists to avoid paying a second way — most cold instances should never
- * reach this at all once the edge is serving statics. A blob/CDN artifact the seed writes directly
- * (architecture C on issue #21) is the upgrade the day per-instance warming is itself the cost.
+ * `terrainIds` is the terrain grid held *compactly* — one `Uint16` per tile, row-major, rather than
+ * the row objects (`{x, y, terrainTypeId, quantity}`) the DB read hands back. At GRID_SIZE² tiles
+ * (1,048,576 at 1024×1024) an array of small objects is on the order of 100 MB of JS heap, held for
+ * the life of the lambda instance — every field boxed, every row its own allocation with V8's
+ * per-object overhead on top. The typed array is ~2 MB and holds everything any reader below
+ * actually asks a tile for: which terrain it is. `capacityByType` carries the one other fact those
+ * rows held that a terrain id alone doesn't — a deposit's capacity — as one number per *type*
+ * (readWorldStatic's own comment: the seed writes the same quantity to every tile of a given
+ * terrain), not one per tile, so it stays a handful of entries regardless of grid size.
+ *
+ * ponytail: a per-lambda-instance memo — module state, not a shared cache. Every cold spin-up warms
+ * it again — one grid-sized DB read, ~85 MB of egress at 1024×1024 by egress.ts's own 46-bytes/row
+ * calibration (1,048,576 tile rows plus their resource join, up from 28,583 rows / ~1.3 MB at
+ * 128×128), because the *read* is still the whole table — going compact only changed what's
+ * *retained* in the module after it. Most cold instances should never reach this at all once the
+ * edge is serving `/api/world/static`'s year-long, immutable CDN response, which is what actually
+ * absorbs that cost across a fleet of instances. A blob/CDN artifact the seed writes directly
+ * (architecture C on issue #21) is the upgrade the day per-instance warming is itself the cost — it
+ * also takes terrain out of the database entirely, which is the only fix for the read itself rather
+ * than for what's kept after it.
  */
-let staticWorldCache: {
+type StaticWorld = {
 	version: string;
-	tiles: (typeof tile.$inferSelect)[];
+	terrainIds: Uint16Array;
+	capacityByType: Map<number, number | null>;
 	deposits: Map<number, TileYield>;
-} | null = null;
+};
 
-async function loadStaticWorld(tx: Tx) {
+let staticWorldCache: StaticWorld | null = null;
+
+// No terrain_type id is ever this (ids are a small `serial`, starting at 1) — the sentinel that
+// makes a hole in the grid detectable in a typed array, which can't hold `undefined` the way the
+// old array of row objects could leave a gap in.
+const NO_TERRAIN = 0xffff;
+
+async function loadStaticWorld(tx: Tx): Promise<StaticWorld> {
 	const [cfg] = await tx.select({ worldVersion: gameConfig.worldVersion }).from(gameConfig);
 	if (!cfg || cfg.worldVersion === null)
 		throw new Error('no world_version in game_config — run `npm run seed` against this database');
 	if (staticWorldCache?.version === cfg.worldVersion) return staticWorldCache;
 
-	const tiles = await tx.select().from(tile);
+	const rows = await tx.select().from(tile);
+	// One pass over the rows the DB read already paid for builds both compact structures; the rows
+	// themselves are never kept past this function, so they're eligible for GC the moment it returns.
+	const terrainIds = new Uint16Array(GRID_SIZE * GRID_SIZE).fill(NO_TERRAIN);
+	const capacityByType = new Map<number, number | null>();
+	for (const t of rows) {
+		terrainIds[t.y * GRID_SIZE + t.x] = t.terrainTypeId;
+		if (!capacityByType.has(t.terrainTypeId)) capacityByType.set(t.terrainTypeId, t.quantity);
+	}
+	// A hole is a corrupt world, not a game rule — the same reading `readWorld` gives one elsewhere.
+	// Checked here, once, rather than by every reader of `terrainIds` below.
+	for (let i = 0; i < terrainIds.length; i++) {
+		if (terrainIds[i] !== NO_TERRAIN) continue;
+		throw new Error(
+			rows.length === 0
+				? 'no tile rows — the grid is unseeded; run `npm run seed` against this database'
+				: `tile grid has a hole at (${i % GRID_SIZE}, ${Math.floor(i / GRID_SIZE)})`
+		);
+	}
+
 	const depositRows = await tx
 		.select({
 			x: tile.x,
@@ -842,7 +884,7 @@ async function loadStaticWorld(tx: Tx) {
 		.innerJoin(resource, eq(terrainType.yieldsResourceId, resource.id));
 	const deposits = new Map(depositRows.map((r) => [r.y * GRID_SIZE + r.x, r]));
 
-	staticWorldCache = { version: cfg.worldVersion, tiles, deposits };
+	staticWorldCache = { version: cfg.worldVersion, terrainIds, capacityByType, deposits };
 	return staticWorldCache;
 }
 
@@ -1050,22 +1092,30 @@ export type EstimateResult =
  * the read path, not routing), and it touches `route`'s cost function on every order and estimate —
  * a bigger, more careful change than dropping a WHERE clause. Un-scope the buildings read in this
  * function (and its "own roads only" framing above) the day shared roads matter.
+ *
+ * Returns a lookup, not a prebuilt `Map` any more — a `new Map(tiles.map(...))` over every tile in
+ * the world used to run on *every call* (an order, an estimate, a gather, a training), which is the
+ * exact shape of bug `route`'s own doc comment names: cost that scales with the grid rather than
+ * with the work. Measured at 1024×1024 it was ~150 ms of pure Map-construction overhead — bigger
+ * than `route` itself pays for a real in-reach walk — to answer what a single order ever asks more
+ * than a few dozen times. `terrainById` and `overrides` are both small (a handful of terrain types,
+ * this player's own roads), so a closure over them costs nothing to build and O(1) per tile it is
+ * actually asked about, same as `movementCostIn`'s own contract.
  */
 async function loadGrid(
 	tx: Tx,
 	playerId: number
-): Promise<
-	Map<
-		number,
-		{
-			buildable: boolean;
-			isDeposit: boolean;
-			yieldsResourceId: number | null;
-			movementCost: number;
-		}
-	>
-> {
-	const { tiles } = await loadStaticWorld(tx);
+): Promise<{
+	get(key: number):
+		| {
+				buildable: boolean;
+				isDeposit: boolean;
+				yieldsResourceId: number | null;
+				movementCost: number;
+		  }
+		| undefined;
+}> {
+	const { terrainIds } = await loadStaticWorld(tx);
 	// A small catalog, not the grid — cheap to read fresh rather than folding into the memo.
 	const terrainById = new Map((await tx.select().from(terrainType)).map((t) => [t.id, t]));
 	// This player's own movement-cost overrides only (their roads) — the COALESCE the old single
@@ -1080,21 +1130,18 @@ async function loadGrid(
 				.where(and(eq(building.playerId, playerId), sql`${buildingType.movementCost} IS NOT NULL`))
 		).map((b) => [b.y * GRID_SIZE + b.x, b.movementCost as number])
 	);
-	return new Map(
-		tiles.map((t) => {
-			const tt = terrainById.get(t.terrainTypeId)!;
-			const key = t.y * GRID_SIZE + t.x;
-			return [
-				key,
-				{
-					buildable: tt.buildable,
-					isDeposit: tt.isDeposit,
-					yieldsResourceId: tt.yieldsResourceId,
-					movementCost: overrides.get(key) ?? tt.movementCost
-				}
-			];
-		})
-	);
+	return {
+		get(key: number) {
+			const tt = terrainById.get(terrainIds[key]);
+			if (!tt) return undefined;
+			return {
+				buildable: tt.buildable,
+				isDeposit: tt.isDeposit,
+				yieldsResourceId: tt.yieldsResourceId,
+				movementCost: overrides.get(key) ?? tt.movementCost
+			};
+		}
+	};
 }
 
 /**
@@ -2019,7 +2066,10 @@ export async function restyleRoad(
  * fleet of lambda instances share one answer instead of each warming its own memo.
  */
 export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
-	const { tiles } = await loadStaticWorld(tx);
+	// `terrainIds` is already dense and hole-checked by `loadStaticWorld` — one source of that
+	// invariant rather than a second copy of the check here. `Array.from` turns the compact typed
+	// array back into the plain `number[]` the wire type promises (JSON has no typed-array notion).
+	const { terrainIds, capacityByType } = await loadStaticWorld(tx);
 	// Ordered, because the client picks a default from this list by position.
 	const types = await tx.select().from(buildingType).orderBy(asc(buildingType.id));
 	const costs = await tx.select().from(buildingCost);
@@ -2034,28 +2084,7 @@ export async function readWorldStatic(tx: Tx): Promise<WorldStatic> {
 	// picker doesn't reshuffle between reads.
 	const professions = await tx.select().from(profession).orderBy(asc(profession.id));
 
-	// Built by index, not by sort order: `terrain` is positional, so one missing row would
-	// shift every tile after it and render a wrong-but-plausible map. The check is that the
-	// array we send is dense — a row *count* would pass on 256 rows with out-of-range
-	// coordinates and still leave holes. A hole is a corrupt world, not a game rule, so it
-	// throws rather than degrading.
-	const terrain: number[] = new Array(GRID_SIZE * GRID_SIZE);
-	for (const t of tiles) terrain[t.y * GRID_SIZE + t.x] = t.terrainTypeId;
-	for (let i = 0; i < terrain.length; i++) {
-		if (terrain[i] !== undefined) continue;
-		throw new Error(
-			tiles.length === 0
-				? 'no tile rows — the grid is unseeded; run `npm run seed` against this database'
-				: `tile grid has a hole at (${i % GRID_SIZE}, ${Math.floor(i / GRID_SIZE)})`
-		);
-	}
-
-	// Capacity is a pure function of terrain type — the seed writes the same quantity to every
-	// tile of a given type — so it rides the catalog below (one value per type) rather than a
-	// second dense per-tile array shipping the identical fact 16,384 times.
-	const capacityByType = new Map<number, number | null>();
-	for (const t of tiles)
-		if (!capacityByType.has(t.terrainTypeId)) capacityByType.set(t.terrainTypeId, t.quantity);
+	const terrain: number[] = Array.from(terrainIds);
 
 	return {
 		gridSize: GRID_SIZE,
@@ -2183,11 +2212,23 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 			return [r.y * GRID_SIZE + r.x, quantity!];
 		})
 	);
-	const tileQuantity: (number | null)[] = new Array(GRID_SIZE * GRID_SIZE).fill(null);
-	for (const [i, d] of deposits) {
-		// Only finite deposits get a number. An infinite one has nothing to count down.
-		if (d.capacity === null || d.regrowSeconds === null) continue;
-		tileQuantity[i] = live.get(i) ?? d.capacity;
+	// Only the tiles this player has actually drawn from. Everything else is still at its terrain
+	// type's capacity, which the client already holds on the static payload, so saying so per tile
+	// is saying the same thing hundreds of thousands of times.
+	//
+	// This used to be a dense grid-length array, and the comment on `WorldLive.drawnTiles` explains
+	// why that was the right call when the world was 128×128 — 16 KB, and dense is the arrangement
+	// that cannot be got wrong. At 1024×1024 the same array measured **4.599 MB of a 4.60 MB
+	// response**, 99.98% of the payload, 321,937 of its million entries saying nothing but "this
+	// forest is untouched", on every thirty-second heartbeat. `tile_stock` holds dozens of rows.
+	// That is the measurement the old note said to wait for.
+	const drawnTiles: { i: number; quantity: number }[] = [];
+	for (const [i, quantity] of live) {
+		const d = deposits.get(i);
+		// Only finite deposits count down. An infinite one has nothing to report, and a drawn row
+		// against one would be a tile_stock entry the gather path should never have written.
+		if (!d || d.capacity === null || d.regrowSeconds === null) continue;
+		drawnTiles.push({ i, quantity });
 	}
 
 	// Which way each stock is moving. Every input is already in hand except the per-capita food
@@ -2225,7 +2266,7 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 		worldVersion: cfg.worldVersion,
 		playerId,
 		reach,
-		tileQuantity,
+		drawnTiles,
 		stock: held.map((s) => ({ ...s, ratePerHour: rates.get(s.resourceId) ?? 0 })),
 		buildings: buildings.map((b) => ({
 			id: b.id,
