@@ -23,7 +23,8 @@
 		"seed": "node --env-file=.env scripts/seed.ts",
 		"map": "node scripts/map.ts",
 		"test": "node --test src/**/*.test.ts",
-		"check:rules": "node scripts/rules-check.ts"
+		"check:rules": "node scripts/rules-check.ts",
+		"egress": "node --env-file=.env scripts/egress.ts"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-vercel": "^6.3.4",
