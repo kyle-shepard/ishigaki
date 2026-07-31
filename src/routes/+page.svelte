@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	// SvelteKit polls its own version manifest (interval set in vite.config.ts) and flips this
 	// when the deployed build changes. Rolling our own version field on the world payload
 	// would have been the same feature, written twice.
@@ -154,18 +154,89 @@
 		hover = x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE ? { x, y } : null;
 	}
 
+	// The scroll offset and scale a zoom gesture started from, held for the whole gesture so every
+	// notch solves for scroll from the *same* origin instead of from wherever the last notch landed.
+	//
+	// That difference is the whole fix. `scrollLeft` is not a variable we own — the browser clamps it
+	// to [0, scrollWidth - clientWidth], so near a map edge `zoomAbout` asks for a scroll the pane
+	// cannot give, the pane silently gives the nearest one it can, and the next notch reads that back
+	// as if it were where we meant to be. The error compounds per notch. Measured at the world's
+	// corner before this: twelve notches out and back in landed 40 tiles away, 2,574 screen pixels at
+	// that zoom. At the middle of the map, where nothing clamps, the same trip drifted 0.27 tiles —
+	// which is why this reads as "fine until you go near an edge, then it jerks all over the place".
+	//
+	// Anchored, a clamped notch is just a notch that couldn't go where it wanted: nothing downstream
+	// inherits the error, and coming back in re-derives the original scroll exactly.
+	let zoomAnchor: {
+		scrollX: number;
+		scrollY: number;
+		cell: number;
+		px: number;
+		py: number;
+	} | null = null;
+	let zoomAnchorTimer: ReturnType<typeof setTimeout> | undefined;
+	// How long a gesture stays latched after the last notch. Long enough to hold a wheel gesture
+	// together (notches arrive 50-100ms apart, and a trackpad's far closer than that), short enough
+	// that a pause and a fresh scroll somewhere else zooms about the new place rather than the old.
+	const ZOOM_ANCHOR_MS = 400;
+	// Any scroll we didn't perform ourselves invalidates the latch — otherwise a drag followed
+	// straight away by a wheel would zoom about where the map used to be and yank it back.
+	function releaseZoomAnchor() {
+		clearTimeout(zoomAnchorTimer);
+		zoomAnchor = null;
+	}
+	// What `zoomAt` last wrote, read back after the write so it carries whatever rounding and edge
+	// clamping the pane applied. `zoomAt` compares against it before reusing a latch: if the pane has
+	// moved since, somebody else scrolled it and the latched origin no longer describes where the map
+	// is. Checked at the point of use rather than from a 'scroll' listener, which would be both
+	// asynchronous and, in a tab that isn't compositing, never dispatched at all.
+	//
+	// This is what covers the scroll paths nothing here calls — a touch drag pans this pane
+	// *natively* (see panMove, where touch is deliberately not handled), so a finger-pan followed by
+	// a pinch would otherwise zoom about wherever the map used to be.
+	let zoomWroteX = -1;
+	let zoomWroteY = -1;
+
 	// Zoom about a point: the world coordinate under (px, py) is read before the scale changes and
 	// re-planted under that same pixel after. Wheel notches, pinch steps and the +/- buttons all
 	// funnel through this one function, so "zoom" has exactly one implementation to get right.
-	function zoomAt(px: number, py: number, factor: number) {
+	async function zoomAt(px: number, py: number, factor: number) {
 		if (!pane) return;
 		const next = clampCell(cell * factor, pane);
 		if (next === cell) return;
-		const left = zoomAbout(pane.scrollLeft, px, cell, next);
-		const top = zoomAbout(pane.scrollTop, py, cell, next);
+		// A latch only survives while the pane is still where we left it — see `zoomWroteX`.
+		if (zoomAnchor && (pane.scrollLeft !== zoomWroteX || pane.scrollTop !== zoomWroteY))
+			releaseZoomAnchor();
+		// Latched on the first notch of a gesture, reused by every notch after it. The pointer's own
+		// position is latched too: holding the *starting* point still is what "zoom out and back in on
+		// the same thing" means, and re-reading the cursor each notch would let a drifting hand walk
+		// the map sideways during a zoom.
+		const a = (zoomAnchor ??= {
+			scrollX: pane.scrollLeft,
+			scrollY: pane.scrollTop,
+			cell,
+			px,
+			py
+		});
+		clearTimeout(zoomAnchorTimer);
+		zoomAnchorTimer = setTimeout(releaseZoomAnchor, ZOOM_ANCHOR_MS);
 		cell = next;
-		pane.scrollLeft = left;
-		pane.scrollTop = top;
+		// The `.grid` div is `cell * GRID_SIZE` across and Svelte resizes it on the next microtask, so
+		// assigning scroll before that lets the browser clamp against the *old* scrollWidth — the pane
+		// cannot scroll somewhere its content doesn't reach yet. Harmless zoomed in, where the grid
+		// dwarfs the pane at either scale; the whole story at the far tier, where the fitted floor
+		// leaves the grid barely larger than the pane and every zoom-in clamps.
+		await tick();
+		// Re-read `cell` rather than closing over `next`: notches can interleave across the await, and
+		// the last one to resume must write the scroll that matches the scale actually on screen.
+		// Deliberately not guarded on the latch still being live — `a` is self-contained, so writing
+		// from a released anchor is still correct, whereas skipping the write would leave the scale
+		// changed and the scroll unadjusted, which is the jump this whole function exists to stop.
+		if (!pane) return;
+		pane.scrollLeft = zoomAbout(a.scrollX, a.px, a.cell, cell);
+		pane.scrollTop = zoomAbout(a.scrollY, a.py, a.cell, cell);
+		zoomWroteX = pane.scrollLeft;
+		zoomWroteY = pane.scrollTop;
 	}
 	// The topbar buttons and the keyboard's +/- zoom about the pane's own centre — there is no
 	// cursor position to hold still for either of them.
