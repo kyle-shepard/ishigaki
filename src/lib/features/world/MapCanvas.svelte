@@ -65,6 +65,42 @@
 	// `player_buildable` already is.
 	const GROUND_COVER = new Set(['meadow', 'forest']);
 
+	// ---- Shading ---------------------------------------------------------------------------------
+	// One flat colour per terrain meant every tile edge was a colour boundary, so the map drew its own
+	// grid whether or not it drew a grid — a checkerboard of two greens across the ~70% of the world
+	// that is meadow and forest. A few pre-shaded variants per terrain, picked per tile, breaks that up
+	// without touching the sprites, the atlas or the payload.
+	//
+	// Precomputed rather than mixed per tile: this loop runs over every visible tile every frame, and
+	// building an `rgb(...)` string per tile per frame is exactly the kind of allocation that shows up
+	// as jank while scrolling at close zoom.
+	const SHADES = 5;
+	const SHADE_RANGE = 0.06;
+
+	function shadesOf(hex: string): string[] {
+		const n = Number.parseInt(hex.slice(1), 16);
+		// Anything that isn't `#rrggbb` keeps its colour rather than painting NaN — the seed writes six
+		// hex digits for every terrain, so this is a guard against a future catalog, not a live case.
+		if (hex.length !== 7 || Number.isNaN(n)) return [hex];
+		const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+		return Array.from({ length: SHADES }, (_, i) => {
+			const f = 1 + SHADE_RANGE * ((i / (SHADES - 1)) * 2 - 1);
+			const c = (v: number) => Math.min(255, Math.round(v * f));
+			return `rgb(${c(r)} ${c(g)} ${c(b)})`;
+		});
+	}
+	const shadesById = $derived(new Map(world.terrainTypes.map((t) => [t.id, shadesOf(t.color)])));
+
+	// A local hash rather than worldgen's `hashNoise`. That module is the client/server bit-compatible
+	// contract, and its *source text* keys `world_version` — rolling that for a purely visual tweak the
+	// server has no opinion about would be the tail wagging the dog. Nothing here has to agree with
+	// anything; it only has to be stable per tile so a tile doesn't shimmer as you scroll past it.
+	const shadeAt = (x: number, y: number) => {
+		let h = (Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1)) >>> 0;
+		h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+		return ((h ^ (h >>> 16)) >>> 0) % SHADES;
+	};
+
 	// ---- The atlas ----------------------------------------------------------------------------
 	// Three fixed rasterisations of each terrain symbol, quantised rather than keyed on the live
 	// cell size: zoom is continuous, so a cache keyed on it would grow without bound as a player
@@ -233,7 +269,8 @@
 					const y0 = snappedEdge(y, cell, scrollTop);
 					const x1 = snappedEdge(x + 1, cell, scrollLeft);
 					const y1 = snappedEdge(y + 1, cell, scrollTop);
-					ctx.fillStyle = t.color;
+					const shades = shadesById.get(t.id) ?? [t.color];
+					ctx.fillStyle = shades[shadeAt(x, y) % shades.length];
 					ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
 					if (!t.icon) continue;
 					// The ground you walk on gives up its art first; the things you navigate by keep theirs.
