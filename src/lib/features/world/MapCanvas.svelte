@@ -13,6 +13,7 @@
 <script lang="ts">
 	import {
 		GRID_SIZE,
+		parchmentAlpha,
 		snappedEdge,
 		TIER_CLOSE_MIN,
 		TIER_DETAIL_MIN,
@@ -253,6 +254,28 @@
 				dx1 - dx0,
 				dy1 - dy0
 			);
+			// The parchment wide zoom (#21's locked decision Q3): the further back you pull, the more
+			// the ground gives way to the sheet it is drawn on, until what is left is the marks — realm
+			// pins today, borders and heraldry when the political overlay lands. One translucent rect
+			// over the blit, in the same colour already painted beyond the world's edge, so at the
+			// widest zoom the map and the space around it read as one page.
+			//
+			// Washed over the terrain rect only, not the whole pane: outside the world the background
+			// fill above is already this colour at full strength, and laying a second coat over it
+			// would do nothing except make the world's own edge disappear at exactly the zoom where
+			// the shape of the continent is the thing worth seeing.
+			//
+			// Here and not in overview.ts, so the minimap keeps its saturated terrain: the two draw the
+			// same bitmap for different jobs. This one is the map you read; that one is the instrument
+			// you locate yourself on, at 200px, where washing out the coast would cost it the only
+			// thing it has to say.
+			const wash = parchmentAlpha(cell);
+			if (wash > 0) {
+				ctx.globalAlpha = wash;
+				ctx.fillStyle = EDGE_OF_WORLD;
+				ctx.fillRect(dx0, dy0, dx1 - dx0, dy1 - dy0);
+				ctx.globalAlpha = 1;
+			}
 		} else {
 			// Ground cover goes flat before landmarks do — see TIER_DETAIL_MIN. Pulled out of the loop
 			// because it is the same answer for all 16,384 tiles.

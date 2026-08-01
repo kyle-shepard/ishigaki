@@ -10,6 +10,8 @@ import {
 	minimapToWorld,
 	NAME_POOL,
 	netRates,
+	parchmentAlpha,
+	PARCHMENT_MAX,
 	pickName,
 	population,
 	positionAt,
@@ -24,6 +26,7 @@ import {
 	STAT_MIN,
 	route,
 	tileAt,
+	TIER_MIDDLE_MIN,
 	travelFraction,
 	withinReach,
 	worldToMinimap,
@@ -795,4 +798,44 @@ test('a click lands on the tile the viewport rectangle says it should', () => {
 	const rectY = worldToMinimap(viewportY, size);
 	assert.ok(Math.abs(minimapToWorld(rectX, size) - viewportX) < 1e-9);
 	assert.ok(Math.abs(minimapToWorld(rectY, size) - viewportY) < 1e-9);
+});
+
+// ---- The parchment wide zoom ------------------------------------------------------------------
+
+test('parchment is absent where the middle tier takes over, and full at country zoom', () => {
+	// Zero at the tier boundary and anywhere above it: the middle tier paints terrain plainly, so a
+	// non-zero wash on the far side of that threshold would show as a step the moment a wheel notch
+	// crossed it.
+	assert.equal(parchmentAlpha(TIER_MIDDLE_MIN), 0);
+	assert.equal(parchmentAlpha(TIER_MIDDLE_MIN + 4), 0);
+	assert.equal(parchmentAlpha(64), 0);
+	// Full wash at one pixel per tile and beyond — including the fitted floor of a continent-sized
+	// world, which is well under a fifth of a pixel per tile.
+	assert.equal(parchmentAlpha(1), PARCHMENT_MAX);
+	assert.equal(parchmentAlpha(0.17), PARCHMENT_MAX);
+	// Never opaque: the coast and the ranges have to survive as a wash under the pins.
+	assert.ok(PARCHMENT_MAX < 1);
+});
+
+test('every wheel notch out fades by the same amount, which is why the ramp is logarithmic', () => {
+	// Zoom is multiplicative — MapCanvas's wheel handler multiplies the cell size by 1.15 a notch —
+	// so equal *steps* of fade mean equal steps in log space, not in cell size. Walk the notches from
+	// the tier boundary down to one pixel per tile and assert the increments agree.
+	const NOTCH = 1.15;
+	const steps: number[] = [];
+	for (let cell = TIER_MIDDLE_MIN; cell > 1; cell /= NOTCH) {
+		steps.push(parchmentAlpha(Math.max(1, cell / NOTCH)) - parchmentAlpha(cell));
+	}
+	// Monotonic first: pulling back can never make the ground *less* faded.
+	assert.ok(
+		steps.every((s) => s >= 0),
+		`a notch out reduced the fade: ${JSON.stringify(steps)}`
+	);
+	// Every step but the last is the same size (the last is clipped by the floor at cell 1).
+	const even = steps.slice(0, -1);
+	const first = even[0];
+	assert.ok(
+		even.every((s) => Math.abs(s - first) < 1e-12),
+		`uneven fade per notch: ${JSON.stringify(even)}`
+	);
 });

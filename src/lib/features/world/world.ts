@@ -50,6 +50,42 @@ export const TIER_CLOSE_MIN = 24; // at or above this: full art, and buildings/p
 // further out. At or above TIER_CLOSE_MIN it stops meaning anything, because everything draws there.
 export const TIER_DETAIL_MIN = 18;
 
+// ---- The parchment wide zoom (#21, locked decision Q3) ----------------------------------------
+// Pull back past the far tier and terrain fades toward parchment, so that what survives the fade is
+// the political layer — realm pins now, borders and heraldry when they land. The colour is the same
+// EDGE_OF_WORLD parchment MapCanvas already paints beyond the world's bounds, which is the point:
+// zoomed all the way out, the map and the space around it become one sheet, and the marks on it are
+// the content.
+//
+// Terrain never goes *fully* to parchment. At PARCHMENT_MAX the coast and the ranges are still
+// legible as a wash under the pins — a country map you can find a place on, rather than a blank
+// page. Tune this by eye against the real map; it is a look, not a derivation.
+export const PARCHMENT_MAX = 0.78;
+
+// The cell size at which the fade reaches PARCHMENT_MAX. Below one pixel per tile there is no
+// terrain detail left to protect — a tile isn't even a pixel — so this is where "country zoom"
+// begins regardless of how big the world is.
+const PARCHMENT_FULL_CELL = 1;
+
+/**
+ * How much parchment washes over the terrain at this zoom: 0 at and above `TIER_MIDDLE_MIN` (the
+ * middle tier paints terrain plainly, so the fade must be gone by the time the tiers swap or the
+ * boundary would show as a step), rising to `PARCHMENT_MAX` at and below one pixel per tile.
+ *
+ * Ramped in log space, not linearly in `cell`, because zoom itself is multiplicative — every wheel
+ * notch multiplies the cell size by a constant. Log spacing makes one notch one equal step of fade
+ * the whole way out; a linear ramp would dump most of the change into the first few notches and
+ * then creep.
+ */
+export function parchmentAlpha(cell: number): number {
+	if (cell >= TIER_MIDDLE_MIN) return 0;
+	if (cell <= PARCHMENT_FULL_CELL) return PARCHMENT_MAX;
+	return (
+		PARCHMENT_MAX *
+		(Math.log(TIER_MIDDLE_MIN / cell) / Math.log(TIER_MIDDLE_MIN / PARCHMENT_FULL_CELL))
+	);
+}
+
 // The opening reach radius — one number, two jobs. It is the first rung of the seeded
 // reach_milestone table, and it is the circle `findStarts` (worldgen.ts) must guarantee holds a
 // Forest and a Stone outcrop before it will settle on a hamlet: the sphere of influence gates
