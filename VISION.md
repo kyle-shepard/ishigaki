@@ -45,6 +45,16 @@ crises is the most attractive _fork_ on the table — but it is a fork, and it c
 economy it would generate crises against. Ishigaki already has Rimworld's assignment model
 (locked decision #7); it does not need Rimworld's psychology to be a game.
 
+**Reaffirmed 2026-08-07, after drifting from it.** The map work that followed the shared-world
+reversal was good and is finished, but four consecutive epics went into what the world _is_ and
+none into what a player _does_ — and the honest read of the result is that the loop still is not
+fun. Everything multiplayer-shaped that had crept back onto the board went back off it: the
+political overlay ([#21](https://github.com/kyle-shepard/ishigaki/issues/21)) and session-scoped
+realms ([#27](https://github.com/kyle-shepard/ishigaki/issues/27)) were both closed unbuilt. The
+rule above was right the first time; the failure mode it guards against is that world-building is
+easier and more legible than game design, so it is what gets done when nobody is watching the
+scope.
+
 ---
 
 ## Locked decisions (Session 0)
@@ -251,34 +261,57 @@ API, SvelteKit render-and-order, and the travel primitive.
    starvation.
 6. **Labor & crews** ([#9](https://github.com/kyle-shepard/ishigaki/issues/9)) — crews, the
    speed-vs-quality curve, the live pre-commit estimate.
+7. **Production buildings & recipes** ([#14](https://github.com/kyle-shepard/ishigaki/issues/14)) —
+   a staffed building that consumes inputs and emits outputs over time. The keystone that had to
+   land before tools, second needs, or a reason for a catalog.
+8. **Map depth** ([#10](https://github.com/kyle-shepard/ishigaki/issues/10)) — zoom/LOD tiers and
+   world generation, merged.
+9. **The map at world scale** ([#22](https://github.com/kyle-shepard/ishigaki/issues/22),
+   [#21](https://github.com/kyle-shepard/ishigaki/issues/21),
+   [#24](https://github.com/kyle-shepard/ishigaki/issues/24)) — scattered starts on shared ground,
+   a 6912² continent generated as a pure function and stored nowhere, the parchment wide zoom, and
+   a name on every place. This is where the egress emergency was solved for good; see CLAUDE.md.
 
-Between them these four already stand up the Banished spine: extract → eat → grow → house →
-more hands. What they do not have is anything **made**, anything **needed but food**, anything
-that **wears out**, or any reason the quality already being recorded should matter.
+The economy spine stands up: extract → eat → grow → house → more hands → **make something out of
+something**. What it still does not have is anything **needed but food**, anything that **wears
+out**, or any reason the quality already being recorded should matter.
+
+**And that is the problem worth naming.** The loop is not yet fun, and the reason is specific:
+with one need there is one right answer every turn. Nothing on the map, however large, fixes that.
+The next epics are the ones that put a second thing on the other side of the scale.
 
 ### The village ladder (current target)
 
-Ordered. Unlike the deepening epics, these do have a dependency shape — each one is what makes
-the next worth having.
+All four are what turn a working economy into a game with a decision in it. **The keystone they
+all waited on (#14) has shipped, so none of them is blocked by another** — the order below is a
+preference, not a dependency chain, and the one that most directly answers "there is only ever one
+right answer" is Needs beyond food.
 
-7. **Production buildings & recipes** ([#14](https://github.com/kyle-shepard/ishigaki/issues/14)) — a staffed building that consumes inputs and emits
-   outputs over time. **The keystone.** Every resource today is dug out of the ground; nothing
-   is made from anything. Without this there is no chain for quality to travel down, no tools,
-   no second need to satisfy, and no reason for a catalog.
-8. **Tools & the quality loop** ([#15](https://github.com/kyle-shepard/ishigaki/issues/15)) — tools as produced goods, and effective skill computed live
-   from base skill, tool quality, the building worked in, and the land. This is LoL's actual
-   mechanic (_"skills … calculated in real time depending on the context of the unit: its level
-   of fatigue, the quality of its equipment, the building or the land where it is located"_) and
-   it is what closes the loop: better tools make better tools. Quality stops being a scoreboard.
-9. **Needs beyond food** ([#16](https://github.com/kyle-shepard/ishigaki/issues/16)) — heating and clothing alongside food. One need is a dial; three needs
-   are a decision. `resource.is_food` generalises to a needs table.
-10. **Seasons** ([#17](https://github.com/kyle-shepard/ishigaki/issues/17)) — a year that swings yields and consumption, so the same numbers become a
-    stockpile-or-die rhythm rather than a flat drain.
-11. **Decay, repair & storage limits** ([#18](https://github.com/kyle-shepard/ishigaki/issues/18)) — buildings wear out (quality's second consumer, already
-    promised in the schema), and stock stops being unbounded so a barn has a job.
-12. **Map depth** ([#10](https://github.com/kyle-shepard/ishigaki/issues/10)) — zoom/LOD tiers
-    and world generation, **merged**: a far view of noise is a smaller picture of nothing, and
-    geography you only ever see fifteen tiles at a time is geography nobody looks at.
+1. **Needs beyond food** ([#16](https://github.com/kyle-shepard/ishigaki/issues/16)) — heating and
+   clothing alongside food. One need is a dial; two are a decision, because the same finite pool of
+   villagers has to serve both. `resource.is_food` generalises to a needs table.
+2. **Tools & the quality loop** ([#15](https://github.com/kyle-shepard/ishigaki/issues/15)) — tools
+   as produced goods, and effective skill computed live from base skill, tool quality, the building
+   worked in, and the land. This is LoL's actual mechanic (_"skills … calculated in real time
+   depending on the context of the unit: its level of fatigue, the quality of its equipment, the
+   building or the land where it is located"_) and it is what closes the loop: better tools make
+   better tools. Quality stops being a scoreboard.
+3. **Seasons** ([#17](https://github.com/kyle-shepard/ishigaki/issues/17)) — a year that swings
+   yields and consumption, so the same numbers become a stockpile-or-die rhythm rather than a flat
+   drain.
+4. **Decay, repair & storage limits** ([#18](https://github.com/kyle-shepard/ishigaki/issues/18)) —
+   buildings wear out (quality's second consumer, already promised in the schema), and stock stops
+   being unbounded so a barn has a job.
+
+One hole in what already ships, sized to run on its own: **clay and iron are seeded across the map
+and cannot be touched** ([#20](https://github.com/kyle-shepard/ishigaki/issues/20)) — with them,
+the Digger and Miner professions are unreachable too. Stone is the worked example to copy.
+
+**A note on testing these.** All four are slow-clock mechanics: a food crisis, a season, a
+building wearing out. Judging whether any of them is _fun_ means reaching a grown settlement, and
+today that has to be played into existence. The admin back door
+([#11](https://github.com/kyle-shepard/ishigaki/issues/11)) is what makes the question answerable
+in less than real-world days.
 
 ### Parked until the village works
 
@@ -291,25 +324,20 @@ multiplayer-shaped, scale-shaped, or both.
 - **The era system** — LoL gates content globally by week, medieval through automata. A genuine
   fork in the content model, and an open product question rather than an epic.
 - **Expansion & borders** — how a settlement claims more than the tile it started on.
-- **Shared-world reversal** — see locked decision #4.
-- **The scale ladder** — zooming out past the local view: county, region, state, country. The
-  intent is that pulling back keeps changing _what kind of place_ you are looking at, the way
-  [#10](https://github.com/kyle-shepard/ishigaki/issues/10) made it change what the map tells
-  you. Two things to know before planning it:
+- ~~**Shared-world reversal**~~ — **done** (locked decision #4,
+  [#22](https://github.com/kyle-shepard/ishigaki/issues/22)). Starts are scattered across shared
+  ground, and buildings and settlements are public facts about the map.
+- ~~**The scale ladder**~~ — **the rendering half is done, the content half is what's parked.**
+  The world is 6912² (47.8M tiles) generated as a pure function, the zoom runs from a single tile
+  to the whole continent, and pulling back fades the ground to parchment so that what survives is
+  the marks on it. What does _not_ exist is anything to mark: the far view draws one pin and one
+  name per realm and stops there.
 
-  _A dense grid cannot get there._ A tile is about 20 m, so today's 128×128 is 2.56 km — a
-  village and its fields, not yet a city. A ~50 km county is 2,500 tiles a side (6.25M tiles);
-  a ~500 km region is 625M; a country is billions. 16,384 tiles already costs ~1.3 MB of
-  database egress per read. So the far tiers stop being tiles: close tiers read real ground
-  culled to the viewport, and distant ones read summaries **pre-aggregated at seed time**, one
-  cell standing for many — the pyramid every web map is built on. It also retires the property
-  that makes today's far tier work, that the whole world fits one screen.
-
-  _And it is gated on neighbours, not on rendering._ Past a certain distance the interesting
-  content is not terrain but settlements, borders, roads and rivers — and #10's Q step rejected
-  exactly that view on the grounds that with one player and expansion parked it draws a single
-  dot on an empty field. It was right. So this sequences behind the **shared-world reversal**
-  and **expansion & borders**; the rendering is the easier half.
+  The rest — county borders, seats, heraldry, labels per zoom band — is the **political overlay**,
+  and it stays parked for the reason #10's Q step first gave and #21 closed on: with one player and
+  expansion parked it draws an empty legend. It sequences behind **expansion & borders** and a
+  reason for players to have a relationship. The rendering was always the easier half, and it is
+  the half that got built.
 
 - **Logistics, trade, military, politics** — in that order, and all after the reversal.
 - **Premium currency & rush**, **time/progression hardening**, **character autonomy**.

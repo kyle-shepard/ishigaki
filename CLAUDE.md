@@ -38,7 +38,8 @@ Do **not** name code identifiers in Japanese now.
 | Peasant / common labor                      | _heimin_ / _hyakushō_                                         | Economic population                                                  |
 | Rice as core resource/currency              | _koku_ (石)                                                   | Historical unit of land yield — note it's the same 石 as in ishigaki |
 
-Settlement scale, title ladder, and resource model are all still open — see below.
+The resource model is settled (see the schema); settlement scale and the title ladder are not — see
+"Open decisions" below.
 
 ## Public repo hygiene
 
@@ -66,40 +67,84 @@ mid-work, while compute sat at 23 of 100 CU-hours. Every `/api/world` read was p
 — the 16,384-tile grid plus its 12,199-row join to resources — ~1.3 MB per request to deliver ~6 KB
 to the browser, ~156 MB/hour per idle open tab.
 
-**Largely fixed** ([#21](https://github.com/kyle-shepard/ishigaki/issues/21) architecture A): terrain
-and the catalogs are static between seeds, so they are memoized in-process behind a **content-derived
-`world_version`** (a hash of `WORLD_SEED`, `GRID_SIZE` and `worldgen.ts`'s own source — never a
-timestamp, because `vercel-build` runs the seed on every deploy) and served separately from
-`/api/world/static/[version]` under an immutable cache. A read now pulls **~52 rows**, measured.
-The heartbeat also pauses on `document.hidden`.
+**Fixed, and then fixed harder.** Three changes retired it, in order:
+
+1. **Content-versioned static payload** ([#21](https://github.com/kyle-shepard/ishigaki/issues/21)
+   architecture A) — terrain and the catalogs never change between seeds, so they are served from
+   `/api/world/static/[version]` under an immutable cache, keyed on a **content-derived
+   `world_version`** (a hash of `WORLD_SEED`, `GRID_SIZE` and `worldgen.ts`'s own source — never a
+   timestamp, because `vercel-build` runs the seed on every deploy). The heartbeat also pauses on
+   `document.hidden`.
+2. **Terrain stopped being rows.** It is a pure function of the seed, generated in-process and
+   trusted only once its hash matches `game_config.terrain_hash`. The `tile` table is **deleted**.
+3. **Terrain stopped being shipped.** The generator runs in the browser too, so the client builds
+   the grid itself. The static payload is **4,786 bytes** for a 47.8M-tile world, measured on
+   production.
+
+A cold `/api/world` went from 67 s / 5,178,273 rows / 238 MB to **2.5 s / ~110 rows / ~0**. A
+heartbeat is **2,158 bytes**. `npm run seed` went from two minutes to about six seconds.
 
 Still worth your attention:
 
 - **`npm run egress`** reports rows sent and what they cost. Run it after any work that touches the
   database, and report the number. It exists because nothing warned us the first time.
-- The memo is **per lambda instance** — each spin-up re-pays one grid read, ~1.3 MB at the
-  128×128 grid this was measured against. The grid moved to 256×256 (65,536 tiles) for the
-  shared-world reversal (VISION #4), which roughly quadruples that to ~5 MB — still two orders of
-  magnitude under the old per-hour cost, and most cold instances should never reach it at all once
-  the edge is serving `/api/world/static/[version]`. Re-measure with `npm run egress` the next
-  time this number matters; the upgrade path is a blob/CDN artifact (#21 architecture C), which
-  also takes distant terrain out of the database entirely.
-- **`route()` and `loadGrid` still scale with world area**, so the ceiling is ~1024²–2048² tiles.
-  Past that the terrain artifact must go chunked and routing viewport-scoped.
+- **Terrain is off the meter, the rest is not.** Everything still read per request — buildings,
+  settlements, characters, operations, stock — scales with how much the world holds, and
+  `buildings` and `settlements` are full reads, not viewport-scoped. That is cheap at a handful of
+  realms and is the next thing to cull if it ever isn't.
 - Beware anything that loops HTTP requests (`npm run check:rules` is ~110 calls a run) and beware
   leaving a dev server with a tab open — much cheaper than it was, not free.
 
+**Ceilings, current.** `route()` searches a window around the journey rather than allocating
+`gridSize²` buffers, and the overview bitmap is a fixed 1024² regardless of world size, so neither
+scales with world area any more. What is left is CPU, not egress: the coarse hydrology grid is built
+eagerly at import (1.1 s for 6912², server _and_ browser), and building the overview bitmap samples
+the generator 1,048,576 times. Both are paid once per process per world version, and both scale with
+world area — so a world much larger than this one needs the terrain artifact chunked, which is where
+[#21](https://github.com/kyle-shepard/ishigaki/issues/21)'s architecture C would come back.
+
+## Decisions already made
+
+Don't reopen these casually — each is load-bearing and most have code shaped around them.
+
+- **Tech stack** — TypeScript, SvelteKit (Svelte 5 runes), Postgres on Neon via Drizzle, hosted on
+  Vercel. No real-time transport: the client polls `GET /api/world` on a heartbeat that pauses on
+  `document.hidden`.
+- **World model** — a dense tile grid, 6912 × 6912 (47.8M tiles, ~20 m a tile), generated as a pure
+  function of the seed and stored nowhere. Settlements sit on seeded `start_position` rows with
+  wilderness between them.
+- **Time model** — no ticks. Everything is **integrated on read** from a stored timestamp, which is
+  why a week away equals a hundred visits and why the economy can run slowly without a scheduler.
+- **Persistence & concurrency** — Postgres, with the settlement row locked for the duration of a
+  world resolve and `FOR UPDATE SKIP LOCKED` where two visitors can race for the same ground.
+- **Testing** — `node --test`, no framework. Pure functions carry the arithmetic so the slow
+  mechanics can be pinned without playing them.
+
 ## Open decisions (not yet made)
 
-These are deliberately unresolved. Don't assume an answer — raise them for the human.
+Deliberately unresolved. Don't assume an answer — raise them for the human.
 
-- **Tech stack** — language, web framework, DB, real-time transport, hosting. Nothing
-  chosen yet. This is the immediate next fork.
-- **World model** — tile grid vs. region graph; map scale; how adjacency/expansion works.
-- **Time model** — tick cadence, offline progression, how "slow" the economy runs.
-- **Settlement & title ladder** — exact stages from hamlet to realm, and the thresholds.
-- **Multiplayer/political layer** — vassalage, alliances, war, player governance.
-- **Persistence & concurrency** — how shared world state is stored and updated safely.
+- **Settlement & title ladder** — reach radius steps at population milestones today; the stages
+  from hamlet to realm and their thresholds are not settled.
+- **Multiplayer/political layer** — vassalage, alliances, war, player governance. Parked, not
+  designed. See "Where the focus is" below.
+- **Tile size and the population ceiling** —
+  [#25](https://github.com/kyle-shepard/ishigaki/issues/25). A continent-sized world with a
+  1,000-person cap gives sparse cities; a smaller tile would buy the city look and multiply the
+  tile count again. Both are game-feel calls.
+
+## Where the focus is
+
+**The single-city loop, until it is fun.** The map is finished for that purpose — it renders a
+continent, costs nearly nothing to serve, fades to parchment when you pull back, and names every
+place on it. Multiplayer-shaped work is parked _again_, on purpose: politics, borders, heraldry,
+accounts and session lifetime were all closed unbuilt because there is nothing to be political
+about yet.
+
+The open question is not "how does the world scale" — it is **"is there a decision worth making
+on any given turn."** Today there is one need (food) and therefore one right answer. That is the
+thing to fix. See VISION's village ladder, and prefer tickets that change what a player _does_
+over tickets that change what the world _is_.
 
 ## Repo
 
