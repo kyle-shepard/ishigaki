@@ -871,6 +871,11 @@
 	// walking specialist.
 	const specialists = $derived(world?.characters.filter((c) => c.professionId !== null) ?? []);
 
+	// Your own realm out of the public list — `settlements` carries every realm on the map now, and
+	// this is the one whose name goes in the top bar. Undefined only in the instant before the first
+	// payload lands. (`home` above is a different thing: the tile the map opens centred on.)
+	const ownRealm = $derived(world?.settlements.find((s) => s.playerId === world?.playerId));
+
 	// ---- Roads -----------------------------------------------------------------------------------
 	// A type that changes the ground's movement cost is drawn as linear infrastructure — a hub and
 	// arms joining its own kind — rather than as one building sprite. Keyed on that rather than on the
@@ -1074,6 +1079,11 @@
      Fixed, because the map beneath it is the whole window now and nothing scrolls the page. -->
 <header class="topbar">
 	<h1>石垣</h1>
+	<!-- Which place this is. The far tier labels every realm on the map; this is the one you are
+	     standing in, named in the one band that is always on screen. -->
+	{#if ownRealm}
+		<p class="realm">{ownRealm.name}</p>
+	{/if}
 	{#if world}
 		<!-- Stellaris-style: the icon *is* the label, the number is what you hold, and the rate beside
 		     it is where it's going. Floored, not rounded: showing 5 Wood when you hold 4.9 and then
@@ -1260,6 +1270,23 @@
 							cell / 2 -
 							5}px)"
 					></div>
+					<!-- The name beside the mark, which is the whole point of the far tier now that the
+					     ground has faded to parchment behind it (#21's Q3): pulled back, the map stops
+					     being terrain and becomes a list of places.
+
+					     ponytail: every settlement labels itself, with no collision handling. Three realms
+					     today and 79 openings on the map — when a crowded region turns this into a pile of
+					     overlapping text, the fix is to drop labels below a zoom threshold or to thin them
+					     by realm size, not to lay out a label engine. -->
+					<div
+						class="pinlabel"
+						class:foreign={s.playerId !== world.playerId}
+						style="transform: translate({s.x * cell + cell / 2 + 8}px, {s.y * cell +
+							cell / 2 -
+							8}px)"
+					>
+						{s.name}
+					</div>
 				{/each}
 			{/if}
 			<!-- The selection ring: a div rather than an outline on a button, now that a tile is a
@@ -1615,6 +1642,17 @@
 		font-size: 1.35rem;
 		flex: none;
 	}
+	/* Quieter than the title and louder than the resource strip: the title says what game this is,
+	   this says where you are. `flex: none` for the same reason the h1 has it — the stock strip is
+	   what gives way when the window narrows. */
+	.realm {
+		margin: 0;
+		flex: none;
+		font-size: 0.95rem;
+		font-weight: 600;
+		letter-spacing: 0.01em;
+		opacity: 0.85;
+	}
 	/* The resource strip. Scrolls itself rather than wrapping or squeezing the title out — the
 	   header is one line tall and has to stay that way. */
 	.stock {
@@ -1801,6 +1839,38 @@
 	}
 	.pin.foreign {
 		background: #8a8a8a;
+	}
+	/* Paper-map lettering: the label is drawn *on* the parchment, so it takes the ink colour rather
+	   than the accent the pin uses, and leans on a halo instead of a box — a filled chip at this zoom
+	   would read as UI sitting above the map instead of a name written on it. */
+	.pinlabel {
+		position: absolute;
+		top: 0;
+		left: 0;
+		z-index: 2;
+		pointer-events: none;
+		white-space: nowrap;
+		font-size: 0.75rem;
+		font-weight: 600;
+		letter-spacing: 0.01em;
+		color: #3a3128;
+		/* Stacked rather than one soft glow, and it is doing real work: labels draw across the whole
+		   far tier, and at the top of that range the parchment wash is still near zero, so the ink can
+		   land on saturated water or forest. The repeated tight shadows build a near-solid light
+		   outline that carries the glyphs over any terrain; the wide one softens its edge. */
+		text-shadow:
+			0 0 2px #f0e7d2,
+			0 0 2px #f0e7d2,
+			0 0 2px #f0e7d2,
+			0 0 3px #f0e7d2,
+			0 0 7px #f0e7d2;
+	}
+	/* Lighter than your own, but only as far as contrast allows: #6b6153 read as 3.4:1 against the
+	   washed parchment, under AA. This is 5.0:1. Whose realm it is was never carried by the label
+	   anyway — the pin beside it is accent blue or grey, and the weight differs. */
+	.pinlabel.foreign {
+		font-weight: 500;
+		color: #4e473e;
 	}
 	/* Pinned to the window's right edge rather than laid out beside the map.
 

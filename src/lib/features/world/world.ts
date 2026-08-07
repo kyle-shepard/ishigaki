@@ -409,7 +409,11 @@ export type WorldLive = {
 	}[];
 	// PUBLIC, same reasoning as `buildings`: every realm's anchor and whose it is, so a pulled-back
 	// view can mark more than just your own hamlet. Cheap — one row per realm, not per building.
-	settlements: { x: number; y: number; playerId: number }[];
+	// `name` is resolved server-side from the start position this realm claimed, not stored — see
+	// `settlementName`. It rides the wire rather than being recomputed on the client because the
+	// client has no way to know which start position a settlement sits on; the string is a dozen
+	// bytes against a payload already carrying the realm's coordinates.
+	settlements: { x: number; y: number; playerId: number; name: string }[];
 	// PRIVATE — yours only. Unlike buildings, a body is not a fact standing on the ground; it is
 	// what you are doing with your own people, which stays in your ledger.
 	//
@@ -702,6 +706,150 @@ export function pickName(rng: () => number, taken: Set<string> = new Set()): str
 	const free = NAME_POOL.filter((n) => !taken.has(n));
 	const pool = free.length ? free : NAME_POOL;
 	return pool[Math.floor(rng() * pool.length)];
+}
+
+// ---- Place names (#26) -------------------------------------------------------------------------
+// A settlement's name belongs to the *ground*, not to whoever currently holds it: it is derived from
+// the start position, so a realm that is abandoned and reclaimed comes back as the same place under a
+// new lord. Nothing is stored — there is no name column, no migration and no backfill, because a
+// deterministic function of a stable id is cheaper than a string nobody edits.
+//
+// Person names (NAME_POOL above) are a fixed list with a `taken` set. That cannot work here: a
+// continent has thousands of settlements and a list would run out and start repeating. Place names
+// compound instead — a modifier, a stem and an ending — which is also how the real ones were built.
+const PLACE_STEMS = [
+	'Ash',
+	'Bram',
+	'Brack',
+	'Cald',
+	'Corn',
+	'Crow',
+	'Dun',
+	'Elm',
+	'Fal',
+	'Fen',
+	'Gars',
+	'Glen',
+	'Hal',
+	'Har',
+	'Haw',
+	'Hay',
+	'Hazel',
+	'Holm',
+	'Ing',
+	'Kest',
+	'Kirk',
+	'Lang',
+	'Lark',
+	'Ley',
+	'Lin',
+	'Marl',
+	'Mel',
+	'Mor',
+	'Oak',
+	'Ot',
+	'Pen',
+	'Quar',
+	'Rav',
+	'Red',
+	'Ridge',
+	'Row',
+	'Rush',
+	'Sal',
+	'Sedge',
+	'Shel',
+	'Skel',
+	'Stan',
+	'Stock',
+	'Stone',
+	'Thorn',
+	'Thrush',
+	'Til',
+	'Wal',
+	'Wan',
+	'Weald',
+	'Wen',
+	'Wend',
+	'Whit',
+	'Wil',
+	'Win',
+	'Wroth',
+	'Wray',
+	'Wyn',
+	'Yar',
+	'Bark',
+	'Cress',
+	'Dern',
+	'Frith',
+	'Nor'
+];
+const PLACE_ENDINGS = [
+	'ton',
+	'ford',
+	'bury',
+	'wick',
+	'ham',
+	'field',
+	'combe',
+	'dale',
+	'mere',
+	'stead',
+	'worth',
+	'thorpe',
+	'by',
+	'leigh',
+	'shaw',
+	'moor',
+	'brook',
+	'cote',
+	'den',
+	'gate',
+	'hurst',
+	'well',
+	'wold',
+	'church'
+];
+// Empty first, and that position is load-bearing: modifiers are how the *second* place with a name
+// gets distinguished from the first, which is why real maps have one Missenden and then Great and
+// Little Missenden. Drawing one uniformly per settlement instead would leave nine names in ten
+// carrying a "Great" or a "North" and the whole map reading as machine output.
+const PLACE_MODIFIERS = [
+	'',
+	'Upper ',
+	'Lower ',
+	'Great ',
+	'Little ',
+	'North ',
+	'South ',
+	'East ',
+	'West ',
+	'Old ',
+	'New '
+];
+
+// 64 × 24 = 1,536 plain names, exhausted before any modifier is spent — so every settlement on a map
+// with fewer than 1,536 realms is called something plain. 79 openings exist today.
+const PLAIN_SPACE = PLACE_STEMS.length * PLACE_ENDINGS.length;
+
+// Coprime with PLAIN_SPACE (= 2^9 · 3), which is the whole reason this is collision-free rather than
+// merely unlikely to collide: multiplying by a unit modulo the space is a *bijection*, so two
+// different start positions cannot land on the same name. A plain hash would have been a coin flip —
+// 79 starts drawn from 1,536 names collide essentially always by the birthday bound. Scattering
+// matters too: start ids are seeded outward from the map centre, and without the multiply the middle
+// of the world would be one alphabetical run.
+const PLACE_STRIDE = 7919;
+
+/**
+ * The name of the settlement standing on start position `startId` — stable for that ground forever,
+ * whoever holds it. Unique across 16,896 openings; past that it repeats, which is 200× more ground
+ * than the world currently offers.
+ */
+export function settlementName(startId: number): string {
+	// Which pass through the plain names this id falls in. Pass 0 spends no modifier at all.
+	const pass = Math.floor(startId / PLAIN_SPACE) % PLACE_MODIFIERS.length;
+	const n = ((startId % PLAIN_SPACE) * PLACE_STRIDE) % PLAIN_SPACE;
+	const stem = PLACE_STEMS[Math.floor(n / PLACE_ENDINGS.length)];
+	return PLACE_MODIFIERS[pass] + stem + PLACE_ENDINGS[n % PLACE_ENDINGS.length];
 }
 
 export type SkillConfig = {

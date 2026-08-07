@@ -25,6 +25,7 @@ import {
 	STAT_MAX,
 	STAT_MIN,
 	route,
+	settlementName,
 	tileAt,
 	TIER_MIDDLE_MIN,
 	travelFraction,
@@ -838,4 +839,54 @@ test('every wheel notch out fades by the same amount, which is why the ramp is l
 		even.every((s) => Math.abs(s - first) < 1e-12),
 		`uneven fade per notch: ${JSON.stringify(even)}`
 	);
+});
+
+// ---- Place names -------------------------------------------------------------------------------
+
+test('no two start positions can ever share a name', () => {
+	// The load-bearing property, and the reason the stride is coprime with the plain-name space
+	// rather than an arbitrary hash: multiplying by a unit modulo the space is a bijection, so this
+	// holds for *every* id, not merely for the 79 openings that exist today — which a hash would
+	// have collided on essentially always, 79 draws from 1,536 names by the birthday bound.
+	//
+	// Walking the whole space also catches the other way two ids could collide: a modifier plus one
+	// stem-and-ending concatenating to the same string as a different combination.
+	const seen = new Map<string, number>();
+	for (let id = 0; id < 16896; id++) {
+		const name = settlementName(id);
+		const prior = seen.get(name);
+		assert.equal(prior, undefined, `${id} and ${prior} both name themselves ${name}`);
+		seen.set(name, id);
+	}
+	assert.equal(seen.size, 16896);
+});
+
+test('a modifier is what the second place gets, not what every place gets', () => {
+	// Real maps hold one Missenden before they hold a Great and a Little one. Every opening on any
+	// world this size is called something plain; modifiers only start once 1,536 names are spent.
+	for (let id = 0; id < 1536; id++)
+		assert.doesNotMatch(settlementName(id), / /, `${id} spent a modifier before it had to`);
+	assert.match(settlementName(1536), /^Upper /);
+});
+
+test('a name is the ground, so the same start is the same place forever', () => {
+	// The realm standing here can be deleted and the opening handed to somebody else; what comes
+	// back has to be the same place under a new lord.
+	assert.equal(settlementName(7), settlementName(7));
+	assert.notEqual(settlementName(7), settlementName(8));
+});
+
+test('names read as places, not as people or as machinery', () => {
+	// Adjacent start ids must not produce adjacent-sounding names: starts are seeded outward from
+	// the map centre, so without the stride the middle of the world would be an alphabetical run.
+	const first = [0, 1, 2, 3, 4].map(settlementName);
+	assert.equal(
+		new Set(first.map((n) => n.replace(/[a-z].*/, ''))).size > 1,
+		true,
+		first.join(', ')
+	);
+	// No digits, no underscores — nothing that reads as a generated identifier.
+	for (const n of first) assert.match(n, /^[A-Z][a-zA-Z]*( [A-Z][a-zA-Z]*)?$/);
+	// And not one of the *person* names, which is the pool this deliberately does not draw from.
+	for (const n of first) assert.ok(!NAME_POOL.includes(n), `${n} is a person's name`);
 });

@@ -32,6 +32,7 @@ import {
 	reachFor,
 	rollStats,
 	route,
+	settlementName,
 	skillValue,
 	withinReach,
 	type EstimateResponse,
@@ -2254,9 +2255,28 @@ export async function readWorldLive(tx: Tx, playerId: number): Promise<WorldLive
 	// to the client's visible tiles the day the building count actually makes this read heavy.
 	const buildings = await tx.select().from(building);
 	// PUBLIC, same reasoning: every realm's anchor and whose it is.
-	const settlements = await tx
-		.select({ x: settlement.x, y: settlement.y, playerId: settlement.playerId })
-		.from(settlement);
+	//
+	// The join is what makes a name belong to the ground: `start_position.id` outlives the realm
+	// standing on it, so an opening that is abandoned and handed to the next visitor comes back as
+	// the same place. The settlement's own id would not — a new realm is a new row.
+	const settlementRows = await tx
+		.select({
+			x: settlement.x,
+			y: settlement.y,
+			playerId: settlement.playerId,
+			startId: startPosition.id
+		})
+		.from(settlement)
+		.leftJoin(startPosition, eq(startPosition.claimedByPlayerId, settlement.playerId));
+	// The fallback is unreachable through app code — a settlement exists because a start was claimed
+	// — but it stays derived from the tile rather than a constant, so even a realm whose start row
+	// went missing keeps a stable name of its own instead of every such realm sharing one.
+	const settlements = settlementRows.map(({ x, y, playerId, startId }) => ({
+		x,
+		y,
+		playerId,
+		name: settlementName(startId ?? y * GRID_SIZE + x)
+	}));
 	const characters = await tx.select().from(character).where(eq(character.playerId, playerId));
 	const operations = await tx
 		.select()
